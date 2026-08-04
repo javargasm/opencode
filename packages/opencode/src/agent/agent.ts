@@ -118,6 +118,7 @@ const layer = Layer.effect(
 
         const defaults = Permission.fromConfig({
           "*": "allow",
+          model_override: "ask",
           doom_loop: "ask",
           external_directory: {
             "*": "ask",

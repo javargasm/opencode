@@ -20,6 +20,7 @@ import { TaskStopTool, TaskTool, type TaskPromptOps } from "../../src/tool/task"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { Permission } from "@/permission"
 import { disposeAllInstances } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -197,9 +198,7 @@ describe("tool.task", () => {
           run: Effect.never,
         })
 
-        expect((yield* registry.tools({ ...ref, agent: omni })).some((tool) => tool.id === TaskStopTool.id)).toBe(
-          true,
-        )
+        expect((yield* registry.tools({ ...ref, agent: omni })).some((tool) => tool.id === TaskStopTool.id)).toBe(true)
 
         const stop = yield* TaskStopTool
         const def = yield* stop.init()
@@ -222,10 +221,7 @@ describe("tool.task", () => {
           run: Effect.never,
         })
         const nested = yield* def
-          .execute(
-            { task_ids: [grandchild.id] },
-            { ...taskContext(child.id, assistant.id, promptOps), agent: "omni" },
-          )
+          .execute({ task_ids: [grandchild.id] }, { ...taskContext(child.id, assistant.id, promptOps), agent: "omni" })
           .pipe(Effect.exit)
 
         expect(Exit.isFailure(nested)).toBe(true)
@@ -355,6 +351,7 @@ describe("tool.task", () => {
       expect(result.metadata.sessionId).toBe(child.id)
       expect(result.output).toContain(`<task id="${child.id}" state="completed">`)
       expect(seen?.sessionID).toBe(child.id)
+      expect(seen?.model).toEqual(ref)
       expect(seen?.variant).toBe("xhigh")
     }),
   )
@@ -428,6 +425,158 @@ describe("tool.task", () => {
           subagent_type: "general",
         },
       })
+    }),
+  )
+
+  it.instance("defaults model overrides to ask", () =>
+    Effect.gen(function* () {
+      const agents = yield* Agent.Service
+      const build = yield* agents.get("build")
+      expect(Permission.evaluate("model_override", "test/override", build!.permission).action).toBe("ask")
+    }),
+  )
+
+  background.instance(
+    "uses an explicit model override in background after requesting permission before task permission",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const calls: unknown[] = []
+        const ready = defer<SessionPrompt.PromptInput>()
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            model: "test/override",
+            background: true,
+          },
+          {
+            ...taskContext(
+              chat.id,
+              assistant.id,
+              stubOps({
+                onPrompt: (input) => {
+                  ready.resolve(input)
+                },
+              }),
+            ),
+            ask: (input) =>
+              Effect.sync(() => {
+                calls.push(input)
+              }),
+          },
+        )
+
+        expect(`${result.metadata.model.providerID}/${result.metadata.model.modelID}`).toBe("test/override")
+        const prompt = yield* Effect.promise(() => ready.promise)
+        expect((yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })).info?.status).toBe("completed")
+
+        expect(calls).toEqual([
+          {
+            permission: "model_override",
+            patterns: ["test/override"],
+            always: ["test/override"],
+            metadata: { model: "test/override" },
+          },
+          {
+            permission: "task",
+            patterns: ["general"],
+            always: ["*"],
+            metadata: {
+              description: "inspect bug",
+              subagent_type: "general",
+            },
+          },
+        ])
+        expect(`${prompt.model?.providerID}/${prompt.model?.modelID}`).toBe("test/override")
+        expect(prompt.variant).toBeUndefined()
+      }),
+  )
+
+  it.instance("requests model override permission even when task permission is bypassed", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const calls: unknown[] = []
+
+      yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          model: "test/override",
+        },
+        {
+          ...taskContext(chat.id, assistant.id, stubOps()),
+          extra: { bypassAgentCheck: true, promptOps: stubOps() },
+          ask: (input) =>
+            Effect.sync(() => {
+              calls.push(input)
+            }),
+        },
+      )
+
+      expect(calls).toEqual([
+        {
+          permission: "model_override",
+          patterns: ["test/override"],
+          always: ["test/override"],
+          metadata: { model: "test/override" },
+        },
+      ])
+    }),
+  )
+
+  it.instance(
+    "uses the configured subagent model when an explicit override is omitted",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+
+        yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          taskContext(chat.id, assistant.id, stubOps({ onPrompt: (input) => (seen = input) })),
+        )
+
+        expect(`${seen?.model?.providerID}/${seen?.model?.modelID}`).toBe("test/configured")
+        expect(seen?.variant).toBeUndefined()
+      }),
+    { config: { agent: { general: { model: "test/configured" } } } },
+  )
+
+  it.instance("rejects empty and invalid models before requesting permissions", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let asked = false
+
+      const input = {
+        description: "inspect bug",
+        prompt: "look into the cache key path",
+        subagent_type: "general",
+      }
+      const context = {
+        ...taskContext(chat.id, assistant.id, stubOps()),
+        ask: () => Effect.sync(() => (asked = true)),
+      }
+
+      expect(Exit.isFailure(yield* def.execute({ ...input, model: "" }, context).pipe(Effect.exit))).toBe(true)
+      expect(Exit.isFailure(yield* def.execute({ ...input, model: "invalid" }, context).pipe(Effect.exit))).toBe(true)
+      expect(asked).toBe(false)
     }),
   )
 
@@ -995,9 +1144,7 @@ describe("tool.task", () => {
       })
       expect(notifications).toHaveLength(2)
       expect(acknowledgements).toHaveLength(2)
-      expect(
-        acknowledgements.map((message) => message.parts.find((part) => part.type === "text")),
-      ).toEqual(
+      expect(acknowledgements.map((message) => message.parts.find((part) => part.type === "text"))).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             text: "Background task completed: subagent A. Still running: subagent B.",
@@ -1064,9 +1211,9 @@ describe("tool.task", () => {
       second.resolve()
       yield* Effect.promise(() => firstWoke.promise).pipe(Effect.timeout("1 second"))
 
-      expect(
-        (yield* Effect.promise(() => secondAdmitted.promise).pipe(Effect.timeoutOption("10 millis")))._tag,
-      ).toBe("None")
+      expect((yield* Effect.promise(() => secondAdmitted.promise).pipe(Effect.timeoutOption("10 millis")))._tag).toBe(
+        "None",
+      )
       expect(admissions).toBe(1)
 
       releaseFirstWake.resolve()
@@ -1093,9 +1240,7 @@ describe("tool.task", () => {
             return Effect.succeed(reply(input, "notified"))
           }
           if (input.parts[0]?.type === "text" && input.parts[0].text === "fail A") {
-            return Effect.promise(() => fail.promise).pipe(
-              Effect.flatMap(() => Effect.die(new Error("A exploded"))),
-            )
+            return Effect.promise(() => fail.promise).pipe(Effect.flatMap(() => Effect.die(new Error("A exploded"))))
           }
           return Effect.never
         },
@@ -1156,9 +1301,7 @@ describe("tool.task", () => {
             return Effect.succeed(reply(input, "notified"))
           }
           if (input.parts[0]?.type === "text" && input.parts[0].text === "fail A") {
-            return Effect.promise(() => fail.promise).pipe(
-              Effect.flatMap(() => Effect.die(new Error("A exploded"))),
-            )
+            return Effect.promise(() => fail.promise).pipe(Effect.flatMap(() => Effect.die(new Error("A exploded"))))
           }
           if (input.parts[0]?.type === "text" && input.parts[0].text === "retry A") {
             return Effect.promise(() => retry.promise).pipe(Effect.as(reply(input, "A recovered")))
@@ -1209,10 +1352,7 @@ describe("tool.task", () => {
         (message) =>
           message.parts.filter(
             (part) =>
-              part.type === "text" &&
-              part.synthetic &&
-              part.ignored &&
-              part.text.startsWith("Background task failed:"),
+              part.type === "text" && part.synthetic && part.ignored && part.text.startsWith("Background task failed:"),
           ),
       )
       expect(failedAcknowledgements).toEqual([
@@ -1243,8 +1383,7 @@ describe("tool.task", () => {
       expect(completed.noReply).toBe(true)
       yield* Effect.promise(() => secondWoke.promise).pipe(Effect.timeout("1 second"))
       const acknowledgements = (yield* sessions.messages({ sessionID: chat.id }).pipe(Effect.orDie)).flatMap(
-        (message) =>
-          message.parts.filter((part) => part.type === "text" && part.synthetic && part.ignored),
+        (message) => message.parts.filter((part) => part.type === "text" && part.synthetic && part.ignored),
       )
       expect(acknowledgements).toHaveLength(2)
       expect(acknowledgements).toContainEqual(
