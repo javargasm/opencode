@@ -19,6 +19,7 @@ import { tint, useTheme } from "../../context/theme"
 import { EmptyBorder, SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { useClipboard } from "../../context/clipboard"
+import { isSessionInterruptible } from "../../util/session"
 import { Spinner } from "../spinner"
 import { useSDK } from "../../context/sdk"
 import { useRoute } from "../../context/route"
@@ -161,6 +162,9 @@ export function Prompt(props: PromptProps) {
   const dialog = useDialog()
   const toast = useToast()
   const status = createMemo(() => sync.data.session_status?.[props.sessionID ?? ""] ?? { type: "idle" })
+  const interruptible = createMemo(() =>
+    isSessionInterruptible(props.sessionID, sync.data.session, sync.data.session_status),
+  )
   const history = usePromptHistory()
   const stash = usePromptStash()
   const keymap = useOpencodeKeymap()
@@ -393,7 +397,7 @@ export function Prompt(props: PromptProps) {
         name: "session.interrupt",
         category: "Session",
         hidden: true,
-        enabled: status().type !== "idle",
+        enabled: interruptible(),
         run: () => {
           if (auto()?.visible) return
           if (!input.focused) return
@@ -1509,7 +1513,7 @@ export function Prompt(props: PromptProps) {
         </box>
         <box width="100%" flexDirection="row" justifyContent="space-between">
           <Switch>
-            <Match when={status().type !== "idle"}>
+            <Match when={interruptible()}>
               <box
                 flexDirection="row"
                 gap={1}

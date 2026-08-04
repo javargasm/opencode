@@ -146,6 +146,14 @@ const layer = Layer.effect(
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        wake: <E>(sessionID: SessionID, admission: Effect.Effect<void, E>) =>
+          state
+            .wake(
+              sessionID,
+              lastAssistant(sessionID),
+              admission.pipe(Effect.catch(Effect.die), Effect.andThen(runLoop(sessionID))),
+            )
+            .pipe(Effect.asVoid),
       } satisfies TaskPromptOps
     })
 
@@ -294,6 +302,7 @@ const layer = Layer.effect(
             description: task.description,
             subagent_type: task.agent,
             command: task.command,
+            background: false,
           },
           time: { start: Date.now() },
         },
@@ -303,6 +312,7 @@ const layer = Layer.effect(
         description: task.description,
         subagent_type: task.agent,
         command: task.command,
+        background: false,
       }
       yield* plugin.trigger(
         "tool.execute.before",
@@ -1067,7 +1077,7 @@ const layer = Layer.effect(
       }
 
       if (input.noReply === true) return message
-      return yield* loop({ sessionID: input.sessionID })
+      return yield* state.wake(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
     })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {

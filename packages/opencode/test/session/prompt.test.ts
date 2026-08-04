@@ -1003,6 +1003,7 @@ it.instance(
       expect(typeof tool.state.metadata?.sessionId).toBe("string")
       expect(tool.state.title).toBeDefined()
       expect(tool.state.metadata?.model).toBeDefined()
+      expect(tool.state.input.background).toBe(false)
 
       yield* prompt.cancel(chat.id)
       yield* Fiber.await(fiber)

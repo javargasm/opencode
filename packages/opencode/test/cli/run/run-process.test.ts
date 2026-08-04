@@ -4,7 +4,7 @@
 // `opencode.run(message, opts?)` to spawn `bun src/index.ts run ...` with
 // `OPENCODE_CONFIG_CONTENT` providing the test provider config inline.
 import { describe, expect } from "bun:test"
-import { Effect } from "effect"
+import { Effect, Fiber } from "effect"
 import { reply } from "../../lib/llm-server"
 import { cliIt } from "../../lib/cli-process"
 
@@ -41,6 +41,75 @@ describe("opencode run (non-interactive subprocess)", () => {
 
         opencode.expectExit(result, 0)
         expect(result.stdout).toBe("before tool\nafter tool\n")
+      }),
+    60_000,
+  )
+
+  cliIt.concurrent(
+    "keeps the process alive until a background task notifies the parent",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        const child = Promise.withResolvers<void>()
+        const continued = Promise.withResolvers<void>()
+        const notified = Promise.withResolvers<void>()
+        const prompt = "HEADLESS_BACKGROUND_DRAIN"
+        const childPrompt = "Return exactly CHILD_DONE"
+
+        yield* llm.pushMatch(
+          (hit) => JSON.stringify(hit.body).includes(prompt),
+          reply().tool("task", {
+            description: "held child",
+            prompt: childPrompt,
+            subagent_type: "general",
+            background: true,
+          }),
+        )
+        yield* llm.pushMatch(
+          (hit) => {
+            const body = JSON.stringify(hit.body)
+            return body.includes(childPrompt) && !body.includes(prompt)
+          },
+          reply().wait(child.promise).text("CHILD_DONE").stop(),
+        )
+        yield* llm.pushMatch(
+          (hit) => {
+            const body = JSON.stringify(hit.body)
+            const matches = body.includes(prompt) && body.includes("Background task started")
+            if (matches) continued.resolve()
+            return matches
+          },
+          reply().text("Background task is still running.").stop(),
+        )
+        yield* llm.pushMatch(
+          (hit) => {
+            const body = JSON.stringify(hit.body)
+            const matches = body.includes(prompt) && body.includes("CHILD_DONE")
+            if (matches) notified.resolve()
+            return matches
+          },
+          reply().text("ALL_DONE").stop(),
+        )
+
+        const handle = yield* opencode.startRun(prompt, {
+          env: { OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS: "true" },
+          extraArgs: ["--dangerously-skip-permissions"],
+          timeoutMs: 30_000,
+        })
+        const running = yield* handle.result.pipe(Effect.forkScoped)
+
+        yield* Effect.promise(() => continued.promise)
+        yield* Effect.yieldNow
+        child.resolve()
+
+        const first = yield* Effect.race(
+          Fiber.await(running).pipe(Effect.as("exited" as const)),
+          Effect.promise(() => notified.promise).pipe(Effect.as("notified" as const)),
+        )
+        expect(first).toBe("notified")
+
+        const result = yield* Fiber.join(running)
+        opencode.expectExit(result, 0)
+        expect(result.stdout).toContain("ALL_DONE\n")
       }),
     60_000,
   )

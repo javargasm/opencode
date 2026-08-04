@@ -4,7 +4,7 @@ import { ToolJsonSchema } from "./json-schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "@/session/session"
-import { SessionID, MessageID } from "../session/schema"
+import { SessionID, MessageID, PartID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
@@ -14,19 +14,21 @@ import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
+import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
+  wake<E>(sessionID: SessionID, admission: Effect.Effect<void, E>): Effect.Effect<void, E>
 }
 
 const id = "task"
 const BACKGROUND_DESCRIPTION = [
-  "Background mode: background=true launches the subagent asynchronously and returns immediately.",
-  "Foreground is the default; use it when you need the result before continuing.",
-  "Use background only for independent work that can run while you continue elsewhere.",
-  "You will be notified automatically when it finishes.",
+  "Background mode: Omitting background launches the subagent asynchronously and returns immediately.",
+  "Set background=false only when you need the result before continuing.",
+  "Use background execution for independent parallel subagents when you must react to each completion or error while the others keep running.",
+  "React to each notification immediately; retry a recoverable failure with the same task_id, and do not poll active tasks.",
 ].join(" ")
 const BACKGROUND_STARTED = [
   "The task is working in the background. You will be notified automatically when it finishes.",
@@ -57,7 +59,13 @@ export const Parameters = Schema.Struct({
   ...BaseParameterFields,
   background: Schema.optional(Schema.Boolean).annotate({
     description:
-      "Run the agent in the background. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress",
+      "Run the agent in the background (default: true). Set false to wait synchronously. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress",
+  }),
+})
+
+const TaskStopParameters = Schema.Struct({
+  task_ids: Schema.NonEmptyArray(Schema.String).annotate({
+    description: "One or more background task IDs owned by the current primary session",
   }),
 })
 
@@ -88,13 +96,15 @@ export const TaskTool = Tool.define(
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const reactions = KeyedMutex.makeUnsafe<SessionID>()
+    const deliveries = new Map<SessionID, Map<PartID, { task_id: SessionID; description: string }>>()
 
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
       ctx: Tool.Context,
     ) {
       const cfg = yield* config.get()
-      const runInBackground = params.background === true
+      const runInBackground = params.background ?? flags.experimentalBackgroundSubagents
       if (runInBackground && !flags.experimentalBackgroundSubagents) {
         return yield* Effect.fail(
           new Error("Background subagents require OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true"),
@@ -136,6 +146,9 @@ export const TaskTool = Tool.define(
       const session = params.task_id
         ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
         : undefined
+      if (session && session.parentID !== ctx.sessionID) {
+        return yield* Effect.fail(new Error("Task not found"))
+      }
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
         subagent: next,
@@ -175,12 +188,13 @@ export const TaskTool = Tool.define(
         Effect.provideService(Database.Service, database),
         Effect.orDie,
       )
-      if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
-      const variant = msg.info.variant
+      const parentMessage = msg.info
+      if (parentMessage.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
+      const variant = parentMessage.variant
 
       const model = next.model ?? {
-        modelID: msg.info.modelID,
-        providerID: msg.info.providerID,
+        modelID: parentMessage.modelID,
+        providerID: parentMessage.providerID,
       }
       const metadata = {
         parentSessionId: ctx.sessionID,
@@ -214,20 +228,30 @@ export const TaskTool = Tool.define(
       })
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
+        token: PartID,
         state: "completed" | "error",
         text: string,
       ) {
         const currentParent = yield* sessions.get(ctx.sessionID)
-        yield* ops
-          .prompt({
-            sessionID: ctx.sessionID,
-            agent: currentParent.agent ?? ctx.agent,
-            variant,
-            parts: [
-              {
-                type: "text",
-                synthetic: true,
-                text: renderOutput({
+        const parentAgent = currentParent.agent ?? ctx.agent
+        const activeTasks = [...(deliveries.get(ctx.sessionID)?.entries() ?? [])]
+          .filter(([candidate]) => candidate !== token)
+          .map(([, task]) => task)
+        const event = yield* ops.prompt({
+          sessionID: ctx.sessionID,
+          agent: parentAgent,
+          variant,
+          noReply: true,
+          parts: [
+            {
+              type: "text",
+              synthetic: true,
+              metadata: {
+                backgroundTaskID: nextSession.id,
+                backgroundTaskState: state,
+              },
+              text: [
+                renderOutput({
                   sessionID: nextSession.id,
                   state,
                   summary:
@@ -236,19 +260,67 @@ export const TaskTool = Tool.define(
                       : `Background task failed: ${params.description}`,
                   text,
                 }),
-              },
-            ],
-          })
-          .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+                `<active_tasks>${JSON.stringify(activeTasks)}</active_tasks>`,
+                `React to this event now. If it failed and retry is appropriate, relaunch it with task_id="${nextSession.id}". Do not poll the active tasks.`,
+              ].join("\n"),
+            },
+          ],
+        })
+        const time = Date.now()
+        const acknowledgement = yield* sessions.updateMessage({
+          id: MessageID.ascending(),
+          role: "assistant",
+          parentID: event.info.id,
+          sessionID: ctx.sessionID,
+          mode: parentAgent,
+          agent: parentAgent,
+          variant,
+          path: parentMessage.path,
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: parentMessage.modelID,
+          providerID: parentMessage.providerID,
+          time: { created: time, completed: time },
+        })
+        yield* sessions.updatePart({
+          id: PartID.ascending(),
+          messageID: acknowledgement.id,
+          sessionID: ctx.sessionID,
+          type: "text",
+          synthetic: true,
+          ignored: true,
+          text: [
+            `Background task ${state === "completed" ? "completed" : "failed"}: ${params.description}.`,
+            activeTasks.length > 0
+              ? `Still running: ${activeTasks.map((task) => task.description).join(", ")}.`
+              : "No background tasks remain.",
+          ].join(" "),
+        })
       })
 
       const notify = Effect.fn("TaskTool.notifyBackgroundResult")(function* (jobID: string) {
+        const token = PartID.ascending()
+        const delivery = { task_id: nextSession.id, description: params.description }
+        const pending = deliveries.get(ctx.sessionID) ?? new Map<PartID, typeof delivery>()
+        pending.set(token, delivery)
+        deliveries.set(ctx.sessionID, pending)
+        const cleanup = Effect.sync(() => {
+          const registered = deliveries.get(ctx.sessionID)
+          registered?.delete(token)
+          if (registered?.size === 0) deliveries.delete(ctx.sessionID)
+        })
         yield* background.wait({ id: jobID }).pipe(
           Effect.flatMap((result) => {
-            if (result.info?.status === "completed") return inject("completed", result.info.output ?? "")
-            if (result.info?.status === "error") return inject("error", result.info.error ?? "")
-            return Effect.void
+            const admission =
+              result.info?.status === "completed"
+                ? inject(token, "completed", result.info.output ?? "")
+                : result.info?.status === "error"
+                  ? inject(token, "error", result.info.error ?? "")
+                  : undefined
+            if (!admission) return Effect.void
+            return reactions.withLock(ctx.sessionID)(ops.wake(ctx.sessionID, admission).pipe(Effect.ensuring(cleanup)))
           }),
+          Effect.ensuring(cleanup),
           Effect.forkIn(scope, { startImmediately: true }),
         )
       })
@@ -355,6 +427,83 @@ export const TaskTool = Tool.define(
       jsonSchema: flags.experimentalBackgroundSubagents ? undefined : ToolJsonSchema.fromSchema(BaseParameters),
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         run(params, ctx).pipe(Effect.orDie),
+    }
+  }),
+)
+
+export const TaskStopTool = Tool.define(
+  "task_stop",
+  Effect.gen(function* () {
+    const background = yield* BackgroundJob.Service
+    const sessions = yield* Session.Service
+    const flags = yield* RuntimeFlags.Service
+
+    return {
+      description: "Stop one or more running background subagents owned by the current primary session.",
+      parameters: TaskStopParameters,
+      execute: (params: Schema.Schema.Type<typeof TaskStopParameters>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const parent = yield* sessions.get(ctx.sessionID)
+          if (!flags.experimentalBackgroundSubagents || parent.parentID) {
+            return yield* Effect.fail(new Error("Unable to stop one or more tasks"))
+          }
+
+          const ops = ctx.extra?.promptOps as TaskPromptOps
+          if (!ops) return yield* Effect.fail(new Error("TaskStopTool requires promptOps in ctx.extra"))
+
+          const taskIDs = [...new Set(params.task_ids.map((taskID) => SessionID.make(taskID)))]
+          const targets = yield* Effect.forEach(
+            taskIDs,
+            Effect.fnUntraced(function* (taskID) {
+              const session = yield* sessions
+                .get(taskID)
+                .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+              const job = yield* background.get(taskID)
+              const valid =
+                session?.parentID === ctx.sessionID &&
+                job?.type === id &&
+                job.metadata?.parentSessionId === ctx.sessionID &&
+                job.metadata?.sessionId === taskID &&
+                job.metadata?.background === true
+              if (!valid) return { valid: false as const }
+              return { valid: true as const, taskID, job }
+            }),
+          )
+          if (targets.some((target) => !target.valid)) {
+            return yield* Effect.fail(new Error("Unable to stop one or more tasks"))
+          }
+
+          const statuses = yield* Effect.forEach(
+            targets.flatMap((target) => (target.valid ? [target] : [])),
+            Effect.fnUntraced(function* (target) {
+              if (target.job.status === "running") yield* ops.cancel(target.taskID)
+              return {
+                task_id: target.taskID,
+                status: (yield* background.get(target.taskID))?.status ?? target.job.status,
+              }
+            }),
+            { concurrency: "unbounded" },
+          )
+          const active_tasks = (yield* background.list())
+            .filter(
+              (job) =>
+                job.type === id &&
+                job.status === "running" &&
+                job.metadata?.background === true &&
+                job.metadata?.parentSessionId === ctx.sessionID &&
+                job.metadata?.sessionId === job.id,
+            )
+            .map((job) => ({ task_id: job.id, description: job.title ?? job.id }))
+
+          return {
+            title: "Stopped background tasks",
+            metadata: { statuses, active_tasks },
+            output: [
+              `<task_statuses>${JSON.stringify(statuses)}</task_statuses>`,
+              `<active_tasks>${JSON.stringify(active_tasks)}</active_tasks>`,
+            ].join("\n"),
+          }
+        }).pipe(Effect.orDie),
     }
   }),
 )

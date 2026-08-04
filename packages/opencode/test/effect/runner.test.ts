@@ -113,6 +113,96 @@ describe("Runner", () => {
     }),
   )
 
+  // --- wake semantics ---
+
+  it.live(
+    "wake schedules one coalesced run after current work",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const ran = yield* Ref.make<string[]>([])
+      const idle = yield* Ref.make(0)
+      const runner = Runner.make<string>(s, { onIdle: Ref.update(idle, (count) => count + 1) })
+      const started = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      const current = yield* runner
+        .ensureRunning(
+          Effect.gen(function* () {
+            yield* Ref.update(ran, (items) => [...items, "current"])
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(finish)
+            return "current-result"
+          }),
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Deferred.await(started)
+      const joined = yield* runner
+        .ensureRunning(Ref.update(ran, (items) => [...items, "ignored-join"]).pipe(Effect.as("ignored-result")))
+        .pipe(Effect.forkChild)
+      const firstWake = yield* runner
+        .wake(Ref.update(ran, (items) => [...items, "wake"]).pipe(Effect.as("wake-result")))
+        .pipe(Effect.forkChild)
+      yield* waitForState(runner, "RunningThenRun")
+      const secondWake = yield* runner
+        .wake(Ref.update(ran, (items) => [...items, "ignored-wake"]).pipe(Effect.as("ignored-result")))
+        .pipe(Effect.forkChild)
+
+      yield* Effect.yieldNow
+      yield* Deferred.succeed(finish, undefined)
+      const results = yield* Effect.all(
+        [Fiber.join(current), Fiber.join(joined), Fiber.join(firstWake), Fiber.join(secondWake)],
+        { concurrency: "unbounded" },
+      )
+
+      expect(results).toEqual(["current-result", "current-result", "wake-result", "wake-result"])
+      expect(yield* Ref.get(ran)).toEqual(["current", "wake"])
+      expect(yield* Ref.get(idle)).toBe(1)
+      expect(runner.state._tag).toBe("Idle")
+    }),
+  )
+
+  it.live(
+    "cancel discards a pending wake",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s, { onInterrupt: Effect.succeed("cancelled") })
+      const started = yield* Deferred.make<void>()
+      const interrupted = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const calls = yield* Ref.make(0)
+      const current = yield* runner
+        .ensureRunning(
+          Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            return yield* Effect.never
+          }).pipe(
+            Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+            Effect.ensuring(Deferred.await(release)),
+          ),
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Deferred.await(started)
+      const wake = yield* runner
+        .wake(Ref.update(calls, (count) => count + 1).pipe(Effect.as("wake-result")))
+        .pipe(Effect.forkChild)
+      yield* waitForState(runner, "RunningThenRun")
+      const cancel = yield* runner.cancel.pipe(Effect.forkChild)
+      yield* Deferred.await(interrupted)
+
+      expect(runner.state._tag).toBe("Idle")
+      expect(yield* Ref.get(calls)).toBe(0)
+      const pendingWake = yield* Fiber.await(wake).pipe(Effect.timeoutOption("10 millis"))
+      yield* Deferred.succeed(release, undefined)
+      expect(pendingWake._tag).toBe("None")
+      yield* Fiber.join(cancel)
+      expect(yield* Fiber.join(current)).toBe("cancelled")
+      expect(yield* Fiber.join(wake)).toBe("cancelled")
+      expect(yield* Ref.get(calls)).toBe(0)
+      expect(yield* runner.ensureRunning(Effect.succeed("after-cancel"))).toBe("after-cancel")
+    }),
+  )
+
   // --- cancel semantics ---
 
   it.live(

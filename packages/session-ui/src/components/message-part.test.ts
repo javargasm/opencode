@@ -1,5 +1,16 @@
 import { describe, expect, test } from "bun:test"
 import { readPartText } from "./message-part-text"
+import { taskRunning } from "./task-tool"
+
+describe("taskRunning", () => {
+  test("uses the child session status for detached background tasks", () => {
+    expect(taskRunning("running", false, undefined)).toBe(true)
+    expect(taskRunning("completed", true, "busy")).toBe(true)
+    expect(taskRunning("completed", true, "idle")).toBe(false)
+    expect(taskRunning("completed", true, undefined)).toBe(false)
+    expect(taskRunning("completed", false, "busy")).toBe(false)
+  })
+})
 
 describe("readPartText", () => {
   test("returns empty string when accum is undefined and part text is undefined", () => {

@@ -65,6 +65,7 @@ import { animate } from "motion"
 import { attached, inline, kind, typeLabel } from "./message-file"
 import { readPartText } from "./message-part-text"
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
+import { taskRunning } from "./task-tool"
 
 async function writeClipboard(text: string): Promise<boolean> {
   const body = typeof document === "undefined" ? undefined : document.body
@@ -2008,7 +2009,13 @@ ToolRegistry.register({
       if (props.metadata.background === true) return `${value} (background)`
       return value
     })
-    const running = createMemo(() => props.status === "pending" || props.status === "running")
+    const running = createMemo(() =>
+      taskRunning(
+        props.status,
+        props.metadata.background === true,
+        data.store.session_status[childSessionId() ?? ""]?.type,
+      ),
+    )
 
     const href = createMemo(() => sessionLink(childSessionId(), data.sessionHref))
     const clickable = createMemo(() => !!(childSessionId() && (data.navigateToSession || href())))

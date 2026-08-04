@@ -696,6 +696,7 @@ export const RunCommand = effectCmd({
         // created, and replies issued from inside the loop must use that client.
         async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
           const toggles = new Map<string, boolean>()
+          const backgroundTasks = new Set<string>()
           let error: string | undefined
 
           for await (const event of events.stream) {
@@ -715,6 +716,25 @@ export const RunCommand = effectCmd({
             if (event.type === "message.part.updated") {
               const part = event.properties.part
               if (part.sessionID !== sessionID) continue
+
+              if (part.type === "tool" && part.tool === "task" && "metadata" in part.state) {
+                const taskID = part.state.metadata?.sessionId
+                if (part.state.metadata?.background === true && typeof taskID === "string") {
+                  if (part.state.status === "error") backgroundTasks.delete(taskID)
+                  if (part.state.status === "running" || part.state.status === "completed") {
+                    backgroundTasks.add(taskID)
+                  }
+                }
+              }
+
+              if (
+                part.type === "text" &&
+                part.synthetic &&
+                typeof part.metadata?.backgroundTaskID === "string" &&
+                (part.metadata.backgroundTaskState === "completed" || part.metadata.backgroundTaskState === "error")
+              ) {
+                backgroundTasks.delete(part.metadata.backgroundTaskID)
+              }
 
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
                 if (emit("tool_use", { part })) continue
@@ -790,6 +810,8 @@ export const RunCommand = effectCmd({
               event.properties.sessionID === sessionID &&
               event.properties.status.type === "idle"
             ) {
+              // Parent idle is a provider boundary, not proof that background Tasks have delivered their terminal events.
+              if (backgroundTasks.size > 0) continue
               break
             }
 
