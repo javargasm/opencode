@@ -4,6 +4,7 @@ import { SessionID } from "./schema"
 import { Effect, Layer, Context } from "effect"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
+import { BackgroundTaskExecution } from "@/background/task-execution"
 
 export const Info = SessionStatusEvent.Info
 export type Info = SessionStatusEvent.Info
@@ -22,6 +23,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const executions = yield* BackgroundTaskExecution.Service
 
     const state = yield* InstanceState.make(
       Effect.fn("SessionStatus.state")(() => Effect.succeed(new Map<SessionID, Info>())),
@@ -29,11 +31,26 @@ const layer = Layer.effect(
 
     const get = Effect.fn("SessionStatus.get")(function* (sessionID: SessionID) {
       const data = yield* InstanceState.get(state)
-      return data.get(sessionID) ?? { type: "idle" as const }
+      const current = data.get(sessionID)
+      const execution = yield* executions.get(sessionID)
+      if (execution && (execution.state !== "running" || execution.cancelRequestedAt !== undefined)) {
+        return { type: "idle" as const }
+      }
+      if (current) return current
+      return execution ? { type: "busy" as const } : { type: "idle" as const }
     })
 
     const list = Effect.fn("SessionStatus.list")(function* () {
-      return new Map(yield* InstanceState.get(state))
+      const result = new Map(yield* InstanceState.get(state))
+      const ctx = yield* InstanceState.context
+      for (const execution of yield* executions.list({ projectID: ctx.project.id, directory: ctx.directory })) {
+        if (execution.state !== "running" || execution.cancelRequestedAt !== undefined) {
+          result.delete(execution.sessionID)
+          continue
+        }
+        if (!result.has(execution.sessionID)) result.set(execution.sessionID, { type: "busy" })
+      }
+      return result
     })
 
     const set = Effect.fn("SessionStatus.set")(function* (sessionID: SessionID, status: Info) {
@@ -51,6 +68,10 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [EventV2Bridge.node, BackgroundTaskExecution.node],
+})
 
 export * as SessionStatus from "./status"

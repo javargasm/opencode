@@ -7,6 +7,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Deferred, Effect, Exit, Fiber, Layer, Schema, Scope } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
+import { BackgroundTaskExecution } from "@/background/task-execution"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Config } from "@/config/config"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -17,18 +18,27 @@ import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
-import { TaskStopTool, TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import {
+  TaskStopTool,
+  TaskTool,
+  deliverBackgroundTerminal,
+  startBackgroundTerminalPump,
+  type TaskPromptOps,
+} from "../../src/tool/task"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Permission } from "@/permission"
+import { Provider } from "@/provider/provider"
 import { disposeAllInstances } from "../fixture/fixture"
+import { ProviderTest } from "../fake/provider"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Runner } from "@/effect/runner"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { eq } from "drizzle-orm"
+import { projectBackgroundTasks } from "@/cli/cmd/run/background-tasks"
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -39,11 +49,21 @@ const ref = {
   modelID: ModelV2.ID.make("test-model"),
 }
 
+const provider = ProviderTest.fake({
+  model: ProviderTest.model({
+    providerID: ref.providerID,
+    id: ref.modelID,
+    variants: { high: {}, max: {} },
+  }),
+})
+
 const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   LayerNode.compile(
     LayerNode.group([
       Agent.node,
+      Provider.node,
       BackgroundJob.node,
+      BackgroundTaskExecution.node,
       EventV2Bridge.node,
       Config.node,
       CrossSpawnSpawner.node,
@@ -58,7 +78,10 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       RuntimeFlags.node,
       Ripgrep.node,
     ]),
-    [[RuntimeFlags.node, RuntimeFlags.layer(flags)]],
+    [
+      [Provider.node, provider.layer],
+      [RuntimeFlags.node, RuntimeFlags.layer(flags)],
+    ],
   )
 
 const it = testEffect(layer())
@@ -105,6 +128,7 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
 function stubOps(opts?: { onPrompt?: (input: SessionPrompt.PromptInput) => void; text?: string }): TaskPromptOps {
   return {
     cancel: () => Effect.void,
+    interrupt: () => Effect.void,
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
     prompt: (input) =>
       Effect.sync(() => {
@@ -367,7 +391,8 @@ describe("tool.task", () => {
       expect(kids).toHaveLength(1)
       expect(kids[0]?.id).toBe(child.id)
       expect(result.metadata.sessionId).toBe(child.id)
-      expect(result.output).toContain(`<task id="${child.id}" state="completed">`)
+      expect(result.output).toContain(`<task state="completed">`)
+      expect(result.output).not.toContain(`<task id=`)
       expect(seen?.sessionID).toBe(child.id)
       expect(seen?.model).toEqual({
         providerID: ProviderV2.ID.make("openrouter"),
@@ -532,6 +557,123 @@ describe("tool.task", () => {
         expect(`${prompt.model?.providerID}/${prompt.model?.modelID}`).toBe("test/override")
         expect(prompt.variant).toBe("default")
       }),
+  )
+
+  background.instance("propagates an explicit model variant to the child session and prompt", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const ready = defer<SessionPrompt.PromptInput>()
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          model: "test/test-model",
+          variant: "high",
+          background: true,
+        },
+        taskContext(
+          chat.id,
+          assistant.id,
+          stubOps({
+            onPrompt: (input) => ready.resolve(input),
+          }),
+        ),
+      )
+
+      const prompt = yield* Effect.promise(() => ready.promise)
+      yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+      const child = yield* sessions.get(result.metadata.sessionId)
+
+      expect(child?.model?.variant).toBe("high")
+      expect(prompt.variant).toBe("high")
+    }),
+  )
+
+  it.instance("propagates an explicit variant when resuming a task session", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({
+        parentID: chat.id,
+        title: "Existing child",
+        agent: "general",
+        model: { providerID: ref.providerID, id: ref.modelID, variant: "high" },
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let seen: SessionPrompt.PromptInput | undefined
+      const calls: unknown[] = []
+      const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+      yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "resume with max effort",
+          subagent_type: "general",
+          task_id: child.id,
+          variant: "max",
+        },
+        {
+          ...taskContext(chat.id, assistant.id, promptOps),
+          extra: { promptOps, bypassAgentCheck: true },
+          ask: (input) =>
+            Effect.sync(() => {
+              calls.push(input)
+            }),
+        },
+      )
+
+      expect(seen?.variant).toBe("max")
+      expect(calls).toEqual([
+        {
+          permission: "model_override",
+          patterns: ["test/test-model"],
+          always: ["test/test-model"],
+          metadata: {
+            description: "inspect bug",
+            subagent_type: "general",
+            model: "test/test-model",
+            variant: "max",
+          },
+        },
+      ])
+    }),
+  )
+
+  it.instance("rejects an explicit variant that the selected model does not provide", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let asked = false
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            model: "test/test-model",
+            variant: "unsupported",
+          },
+          {
+            ...taskContext(chat.id, assistant.id, stubOps()),
+            ask: () => Effect.sync(() => (asked = true)),
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(asked).toBe(false)
+      expect(yield* sessions.children(chat.id)).toHaveLength(0)
+    }),
   )
 
   it.instance("requests model override permission even when task permission is bypassed", () =>
@@ -947,6 +1089,7 @@ describe("tool.task", () => {
           Effect.sync(() => {
             cancelled.resolve(sessionID)
           }),
+        interrupt: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.promise(() => {
@@ -988,6 +1131,7 @@ describe("tool.task", () => {
   it.instance("cancels the child session when foreground task execution fails", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -1025,6 +1169,7 @@ describe("tool.task", () => {
       expect(cancelled).toBe(childID)
       if (!childID) throw new Error("child session metadata was not captured")
       expect((yield* jobs.get(childID))?.status).not.toBe("running")
+      expect((yield* sessions.get(childID)).parentID).toBe(chat.id)
     }),
   )
 
@@ -1060,7 +1205,8 @@ describe("tool.task", () => {
       expect(kids).toHaveLength(1)
       expect(kids[0]?.id).toBe(result.metadata.sessionId)
       expect(result.metadata.sessionId).not.toBe("ses_missing")
-      expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="completed">`)
+      expect(result.output).toContain(`<task state="completed">`)
+      expect(result.output).not.toContain(`<task id=`)
       expect(seen?.sessionID).toBe(result.metadata.sessionId)
     }),
   )
@@ -1213,6 +1359,7 @@ describe("tool.task", () => {
 
         const child = yield* sessions.get(result.metadata.sessionId)
         expect(child.parentID).toBe(chat.id)
+        expect(child.title).toBe("(subagente) Pinned")
         expect(child.agent).toBe("reviewer")
         expect(child.permission).toEqual([
           {
@@ -1293,6 +1440,7 @@ describe("tool.task", () => {
       let runs = 0
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
+        interrupt: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) => {
           if (input.sessionID === chat.id) {
@@ -1390,6 +1538,7 @@ describe("tool.task", () => {
 
   background.instance("explicit background false stays foreground", () =>
     Effect.gen(function* () {
+      const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -1431,11 +1580,13 @@ describe("tool.task", () => {
       const result = yield* Fiber.join(fiber)
       expect(result.metadata.background).toBeUndefined()
       expect(result.output).toContain(`state="completed"`)
+      expect((yield* sessions.get(result.metadata.sessionId)).parentID).toBe(chat.id)
     }),
   )
 
   background.instance("completed background tasks notify with the remaining parallel tasks", () =>
     Effect.gen(function* () {
+      const executions = yield* BackgroundTaskExecution.Service
       const jobs = yield* BackgroundJob.Service
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
@@ -1447,6 +1598,8 @@ describe("tool.task", () => {
       )
       const completed = defer<void>()
       const notification = defer<SessionPrompt.PromptInput>()
+      const wakeStarted = defer<void>()
+      const releaseWake = defer<void>()
       const promptOps: TaskPromptOps = {
         ...stubOps(),
         prompt: (input) => {
@@ -1459,6 +1612,11 @@ describe("tool.task", () => {
           }
           return Effect.never
         },
+        wake: () =>
+          Effect.promise(() => {
+            wakeStarted.resolve()
+            return releaseWake.promise
+          }),
       }
       const context = taskContext(chat.id, assistant.id, promptOps)
       const launch = (description: string, prompt: string) =>
@@ -1467,6 +1625,38 @@ describe("tool.task", () => {
       const a = yield* launch("subagent A", "run A")
       const b = yield* launch("subagent B", "hold B")
       const d = yield* launch("subagent D", "hold D")
+      const detail: SessionV1.Assistant = {
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: a.metadata.sessionId,
+        agent: "general",
+        mode: "general",
+      }
+      yield* sessions.updateMessage(detail)
+      const detailPart = yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: detail.id,
+        sessionID: detail.sessionID,
+        type: "text",
+        text: "retained child detail",
+      })
+      const launchPart = yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        callID: "launch-a",
+        tool: "task",
+        state: {
+          status: "completed",
+          input: { description: "subagent A" },
+          title: a.title,
+          output: a.output,
+          metadata: a.metadata,
+          time: { start: Date.now(), end: Date.now() },
+        },
+      })
       yield* jobs.start({
         id: "other-parent-task",
         type: "task",
@@ -1477,9 +1667,13 @@ describe("tool.task", () => {
 
       completed.resolve()
       const injected = yield* Effect.promise(() => notification.promise)
+      yield* Effect.promise(() => wakeStarted.promise)
+      expect((yield* sessions.get(a.metadata.sessionId)).parentID).toBe(chat.id)
+      releaseWake.resolve()
       expect(injected.parts[0]?.type).toBe("text")
       if (injected.parts[0]?.type !== "text") throw new Error("background notification text not found")
-      expect(injected.parts[0].text).toContain(`<task id="${a.metadata.sessionId}" state="completed">`)
+      expect(injected.parts[0].text).toContain(`<task state="completed">`)
+      expect(injected.parts[0].text).not.toContain(`<task id=`)
       expect(injected.parts[0].text).toContain(
         `<active_tasks>${JSON.stringify([
           { task_id: b.metadata.sessionId, description: "subagent B" },
@@ -1489,8 +1683,120 @@ describe("tool.task", () => {
       expect(injected.parts[0].text).not.toContain("other-parent-task")
       expect(injected.parts[0].text).toContain("React to this event now")
       expect(injected.parts[0].text).toContain("Do not poll the active tasks")
+      const deadline = Date.now() + 1_000
+      while ((yield* executions.get(a.metadata.sessionId))?.wakeClaimedAt === undefined) {
+        if (Date.now() >= deadline) yield* Effect.fail(new Error("completed child wake did not finish"))
+        yield* Effect.sleep("10 millis")
+      }
+      expect((yield* sessions.get(a.metadata.sessionId)).parentID).toBe(chat.id)
+      expect(
+        yield* sessions.getPart({
+          sessionID: detailPart.sessionID,
+          messageID: detailPart.messageID,
+          partID: detailPart.id,
+        }),
+      ).toEqual(detailPart)
+      expect(
+        (yield* sessions.messages({ sessionID: a.metadata.sessionId })).some((message) =>
+          message.parts.some((part) => part.id === detailPart.id),
+        ),
+      ).toBe(true)
+      expect((yield* sessions.list({ roots: true })).some((item) => item.id === a.metadata.sessionId)).toBe(false)
+      expect((yield* sessions.list()).some((item) => item.id === a.metadata.sessionId)).toBe(true)
+      const persisted = yield* sessions.getPart({
+        sessionID: launchPart.sessionID,
+        messageID: launchPart.messageID,
+        partID: launchPart.id,
+      })
+      expect(persisted?.type).toBe("tool")
+      if (persisted?.type === "tool" && persisted.state.status === "completed") {
+        expect(persisted.state.metadata?.sessionId).toBe(a.metadata.sessionId)
+        expect(persisted.state.metadata?.jobId).toBe(a.metadata.sessionId)
+        expect(persisted.state.output).toContain(`<task id="${a.metadata.sessionId}"`)
+      }
       expect((yield* jobs.get(b.metadata.sessionId))?.status).toBe("running")
       expect((yield* jobs.get(d.metadata.sessionId))?.status).toBe("running")
+    }),
+  )
+
+  background.instance("completed exact-generation replay stays terminal in the durable CLI projection", () =>
+    Effect.gen(function* () {
+      const executions = yield* BackgroundTaskExecution.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "replayed child" })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const callID = "replayed-call"
+      const generation = `${assistant.id}:${callID}`
+      const replayPartID = PartID.ascending()
+      const terminals: SessionPrompt.PromptInput["parts"][number][] = []
+      const promptOps = stubOps({
+        onPrompt: (input) => {
+          if (input.sessionID === chat.id) terminals.push(...input.parts)
+        },
+      })
+      const params = {
+        description: child.title,
+        prompt: "already completed",
+        subagent_type: "general",
+        background: true,
+        task_id: child.id,
+      } as const
+      const context = { ...taskContext(chat.id, assistant.id, promptOps), callID }
+
+      yield* executions.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation,
+        description: child.title,
+        parentMessageID: assistant.id,
+        wakeRequired: true,
+      })
+      yield* executions.settle({
+        sessionID: child.id,
+        generation,
+        state: "completed",
+        output: "durable result",
+      })
+
+      const first = yield* def.execute(params, context)
+      const second = yield* def.execute(params, context)
+
+      expect(first.metadata).toMatchObject({
+        background: true,
+        jobId: child.id,
+        sessionId: child.id,
+        backgroundTaskGeneration: generation,
+        backgroundTaskState: "completed",
+        model: { providerID: ref.providerID, modelID: ref.modelID },
+      })
+      expect(second.metadata).toEqual(first.metadata)
+      expect(terminals).toHaveLength(1)
+
+      const messages = [
+        {
+          info: {},
+          parts: [
+            {
+              id: replayPartID,
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                input: params,
+                output: first.output,
+                title: first.title,
+                metadata: first.metadata,
+                time: { start: 1, end: 2 },
+              },
+            },
+            ...terminals,
+          ],
+        },
+      ]
+      expect(projectBackgroundTasks(messages).size).toBe(0)
+      expect(projectBackgroundTasks(messages).size).toBe(0)
     }),
   )
 
@@ -1608,7 +1914,9 @@ describe("tool.task", () => {
       const notifications = messages.filter(
         (message) =>
           message.info.role === "user" &&
-          message.parts.some((part) => part.type === "text" && part.synthetic && part.text.includes("<task id=")),
+          message.parts.some(
+            (part) => part.type === "text" && part.synthetic && part.text.includes('<task state="completed">'),
+          ),
       )
       const acknowledgements = messages.filter((message) => {
         const info = message.info
@@ -1836,8 +2144,528 @@ describe("tool.task", () => {
     }),
   )
 
+  background.instance("preserves a real background failure as error and allows a durable relaunch", () =>
+    Effect.gen(function* () {
+      const executions = yield* BackgroundTaskExecution.Service
+      const jobs = yield* BackgroundJob.Service
+      const runState = yield* SessionRunState.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const terminal = yield* Deferred.make<SessionPrompt.PromptInput>()
+      const woke = yield* Deferred.make<void>()
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        cancel: (sessionID) => runState.cancel(sessionID),
+        interrupt: (sessionID) => runState.interrupt(sessionID),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) {
+            return Deferred.succeed(terminal, input).pipe(Effect.as(reply(input, "notified")))
+          }
+          const text = input.parts[0]?.type === "text" ? input.parts[0].text : ""
+          if (text === "fail durably") return Effect.die(new Error("child provider defect"))
+          return Effect.never
+        },
+        wake: () => Deferred.succeed(woke, undefined).pipe(Effect.asVoid),
+      }
+      const context = taskContext(chat.id, assistant.id, promptOps)
+
+      const failed = yield* def.execute(
+        {
+          description: "durable failure",
+          prompt: "fail durably",
+          subagent_type: "general",
+          background: true,
+        },
+        context,
+      )
+      expect((yield* jobs.wait({ id: failed.metadata.sessionId, timeout: 1_000 })).info?.status).toBe("error")
+      const event = yield* Deferred.await(terminal).pipe(Effect.timeout("1 second"))
+      yield* Deferred.await(woke).pipe(Effect.timeout("1 second"))
+
+      expect(event.parts[0]).toEqual(
+        expect.objectContaining({
+          type: "text",
+          metadata: expect.objectContaining({
+            backgroundTaskID: failed.metadata.sessionId,
+            backgroundTaskState: "error",
+            backgroundTaskGeneration: failed.metadata.backgroundTaskGeneration,
+          }),
+        }),
+      )
+      expect(yield* executions.get(failed.metadata.sessionId)).toMatchObject({
+        generation: failed.metadata.backgroundTaskGeneration,
+        state: "error",
+        error: "child provider defect",
+        cancelRequestedAt: undefined,
+      })
+
+      const relaunched = yield* def.execute(
+        {
+          description: "durable failure",
+          prompt: "retry durably",
+          subagent_type: "general",
+          background: true,
+          task_id: failed.metadata.sessionId,
+        },
+        context,
+      )
+      expect(relaunched.metadata.backgroundTaskGeneration).not.toBe(failed.metadata.backgroundTaskGeneration)
+      expect(yield* executions.get(failed.metadata.sessionId)).toMatchObject({
+        generation: relaunched.metadata.backgroundTaskGeneration,
+        state: "running",
+      })
+      yield* runState.cancel(relaunched.metadata.sessionId)
+    }),
+  )
+
+  background.instance("autonomously reaps an expired owner and wakes its parent", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "expired child" })
+      let now = 1_000
+      const expired = yield* BackgroundTaskExecution.make({
+        ownerID: "expired-runtime",
+        leaseMillis: 20,
+        now: () => now,
+      })
+      const recovery = yield* BackgroundTaskExecution.make({
+        ownerID: "recovery-runtime",
+        leaseMillis: 20,
+        now: () => now,
+      })
+      yield* expired.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation: "expired-generation",
+        description: child.title,
+        parentMessageID: assistant.id,
+      })
+      now = 1_021
+
+      const woke = yield* Deferred.make<void>()
+      let admissions = 0
+      let wakes = 0
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          Effect.sync(() => {
+            admissions++
+            return reply(input, "recovered terminal")
+          }),
+        wake: () =>
+          Effect.sync(() => {
+            wakes++
+          }).pipe(Effect.andThen(Deferred.succeed(woke, undefined)), Effect.asVoid),
+      }
+
+      yield* startBackgroundTerminalPump({
+        executions: recovery,
+        sessions,
+        ops: promptOps,
+        interval: "5 millis",
+      })
+      yield* Deferred.await(woke).pipe(Effect.timeout("1 second"))
+      yield* Effect.sleep("20 millis")
+
+      expect(yield* recovery.get(child.id)).toMatchObject({
+        generation: "expired-generation",
+        state: "error",
+        error: "Background task owner lease expired",
+      })
+      expect(admissions).toBe(1)
+      expect(wakes).toBe(1)
+    }),
+  )
+
+  background.instance("recovers a wake after its claimant crashes without duplicating the terminal", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "wake recovery" })
+      let now = 1_000
+      const owner = yield* BackgroundTaskExecution.make({ ownerID: "task-owner", leaseMillis: 20, now: () => now })
+      const first = yield* BackgroundTaskExecution.make({ ownerID: "wake-a", leaseMillis: 20, now: () => now })
+      const second = yield* BackgroundTaskExecution.make({ ownerID: "wake-b", leaseMillis: 20, now: () => now })
+      yield* owner.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation: "wake-generation",
+        description: child.title,
+        parentMessageID: assistant.id,
+      })
+      const settled = yield* owner.settle({
+        sessionID: child.id,
+        generation: "wake-generation",
+        state: "completed",
+        output: "done",
+      })
+      if (!settled) throw new Error("terminal was not settled")
+
+      let admissions = 0
+      const failed = yield* deliverBackgroundTerminal({
+        executions: first,
+        sessions,
+        terminal: settled,
+        ops: {
+          ...stubOps(),
+          prompt: (input) =>
+            Effect.sync(() => {
+              admissions++
+              return reply(input, "terminal admitted")
+            }),
+          wake: () => Effect.die(new Error("wake runtime crashed")),
+        },
+      }).pipe(Effect.exit)
+      expect(Exit.isFailure(failed)).toBe(true)
+      expect(yield* first.get(child.id)).toMatchObject({
+        terminalDeliveredAt: expect.any(Number),
+        wakeClaimedAt: undefined,
+      })
+
+      now = 1_021
+      const woke = yield* Deferred.make<void>()
+      let wakes = 0
+      yield* startBackgroundTerminalPump({
+        executions: second,
+        sessions,
+        ops: {
+          ...stubOps(),
+          prompt: (input) =>
+            Effect.sync(() => {
+              admissions++
+              return reply(input, "duplicate terminal")
+            }),
+          wake: () =>
+            Effect.sync(() => {
+              wakes++
+            }).pipe(Effect.andThen(Deferred.succeed(woke, undefined)), Effect.asVoid),
+        },
+        interval: "5 millis",
+      })
+      yield* Deferred.await(woke).pipe(Effect.timeout("1 second"))
+      yield* Effect.sleep("20 millis")
+
+      expect(admissions).toBe(1)
+      expect(wakes).toBe(1)
+      expect(yield* second.get(child.id)).toMatchObject({ wakeClaimedAt: expect.any(Number) })
+    }),
+  )
+
+  background.instance("does not rehydrate leased terminal work until each lease expires", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const deliveryParent = yield* seed("delivery parent")
+      const wakeParent = yield* seed("wake parent")
+      const deliveryChild = yield* sessions.create({ parentID: deliveryParent.chat.id, title: "delivery child" })
+      const wakeChild = yield* sessions.create({ parentID: wakeParent.chat.id, title: "wake child" })
+      let now = 1_000
+      const owner = yield* BackgroundTaskExecution.make({ ownerID: "task-owner", leaseMillis: 20, now: () => now })
+      const recovery = yield* BackgroundTaskExecution.make({ ownerID: "recovery", leaseMillis: 20, now: () => now })
+
+      yield* owner.claim({
+        sessionID: deliveryChild.id,
+        parentSessionID: deliveryParent.chat.id,
+        generation: "delivery-generation",
+        description: deliveryChild.title,
+        parentMessageID: deliveryParent.assistant.id,
+        wakeRequired: true,
+      })
+      yield* owner.settle({
+        sessionID: deliveryChild.id,
+        generation: "delivery-generation",
+        state: "cancelled",
+        error: "cancelled",
+      })
+      yield* owner.claim({
+        sessionID: wakeChild.id,
+        parentSessionID: wakeParent.chat.id,
+        generation: "wake-generation",
+        description: wakeChild.title,
+        parentMessageID: wakeParent.assistant.id,
+        wakeRequired: true,
+      })
+      yield* owner.settle({
+        sessionID: wakeChild.id,
+        generation: "wake-generation",
+        state: "completed",
+        output: "done",
+      })
+      yield* owner.claimDelivery({ sessionID: wakeChild.id, generation: "wake-generation" })
+      yield* owner.completeDelivery({ sessionID: wakeChild.id, generation: "wake-generation" })
+
+      const hydrations = new Map<SessionID, number>()
+      let prompts = 0
+      let wakes = 0
+      const deliveryReclaimed = yield* Deferred.make<void>()
+      const wakeReclaimed = yield* Deferred.make<void>()
+      yield* startBackgroundTerminalPump({
+        executions: recovery,
+        sessions,
+        ops: {
+          ...stubOps(),
+          prompt: (input) => {
+            const part = input.parts[0]
+            if (part?.type !== "text" || part.metadata?.backgroundTaskID !== deliveryChild.id) {
+              return Effect.succeed(reply(input, "terminal admitted"))
+            }
+            prompts++
+            if (prompts === 1) return Effect.never
+            return Deferred.succeed(deliveryReclaimed, undefined).pipe(Effect.as(reply(input, "delivery reclaimed")))
+          },
+          wake: (sessionID) => {
+            if (sessionID !== wakeParent.chat.id) return Effect.void
+            wakes++
+            if (wakes === 1) return Effect.never
+            return Deferred.succeed(wakeReclaimed, undefined).pipe(Effect.asVoid)
+          },
+        },
+        provide: (terminal, delivery) =>
+          Effect.sync(() => hydrations.set(terminal.sessionID, (hydrations.get(terminal.sessionID) ?? 0) + 1)).pipe(
+            Effect.andThen(delivery),
+          ),
+        interval: "5 millis",
+      })
+
+      const firstDeadline = Date.now() + 1_000
+      while ((hydrations.get(deliveryChild.id) ?? 0) < 1 || (hydrations.get(wakeChild.id) ?? 0) < 1) {
+        if (Date.now() >= firstDeadline) yield* Effect.fail(new Error("terminal work was not initially hydrated"))
+        yield* Effect.sleep("5 millis")
+      }
+      yield* Effect.sleep("25 millis")
+      expect(hydrations.get(deliveryChild.id)).toBe(1)
+      expect(hydrations.get(wakeChild.id)).toBe(1)
+      expect(prompts).toBe(1)
+      expect(wakes).toBe(1)
+
+      now = 1_021
+      yield* Effect.all([Deferred.await(deliveryReclaimed), Deferred.await(wakeReclaimed)], {
+        concurrency: "unbounded",
+      }).pipe(Effect.timeout("1 second"))
+      yield* Effect.sleep("25 millis")
+
+      expect(hydrations.get(deliveryChild.id)).toBe(2)
+      expect(hydrations.get(wakeChild.id)).toBe(2)
+      expect(prompts).toBe(2)
+      expect(wakes).toBe(2)
+      expect(yield* recovery.get(deliveryChild.id)).toMatchObject({ terminalDeliveredAt: expect.any(Number) })
+      expect(yield* recovery.get(wakeChild.id)).toMatchObject({ wakeClaimedAt: expect.any(Number) })
+    }),
+  )
+
+  background.instance("renews a long parent wake without blocking later terminal recovery", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const firstChild = yield* sessions.create({ parentID: chat.id, title: "slow wake" })
+      const secondChild = yield* sessions.create({ parentID: chat.id, title: "later terminal" })
+      const recovery = yield* BackgroundTaskExecution.make({ ownerID: "wake-owner", leaseMillis: 200 })
+      const remote = yield* BackgroundTaskExecution.make({ ownerID: "wake-remote", leaseMillis: 200 })
+      const firstTerminal = yield* recovery.claim({
+        sessionID: firstChild.id,
+        parentSessionID: chat.id,
+        generation: "slow-generation",
+        description: firstChild.title,
+        parentMessageID: assistant.id,
+        wakeRequired: true,
+      })
+      yield* recovery.settle({
+        sessionID: firstChild.id,
+        generation: firstTerminal.info.generation,
+        state: "completed",
+        output: "slow done",
+      })
+
+      const firstWake = yield* Deferred.make<void>()
+      const releaseFirstWake = yield* Deferred.make<void>()
+      const secondWake = yield* Deferred.make<void>()
+      let wakes = 0
+      yield* startBackgroundTerminalPump({
+        executions: recovery,
+        sessions,
+        ops: {
+          ...stubOps(),
+          wake: () =>
+            Effect.gen(function* () {
+              wakes++
+              if (wakes === 1) {
+                yield* Deferred.succeed(firstWake, undefined)
+                yield* Deferred.await(releaseFirstWake)
+                return
+              }
+              yield* Deferred.succeed(secondWake, undefined)
+            }),
+        },
+        interval: "5 millis",
+      })
+      yield* Deferred.await(firstWake).pipe(Effect.timeout("1 second"))
+
+      const secondTerminal = yield* recovery.claim({
+        sessionID: secondChild.id,
+        parentSessionID: chat.id,
+        generation: "later-generation",
+        description: secondChild.title,
+        parentMessageID: assistant.id,
+        wakeRequired: true,
+      })
+      yield* recovery.settle({
+        sessionID: secondChild.id,
+        generation: secondTerminal.info.generation,
+        state: "completed",
+        output: "later done",
+      })
+      yield* Deferred.await(secondWake).pipe(Effect.timeout("1 second"))
+      yield* Effect.sleep("300 millis")
+
+      expect(yield* remote.claimWake({ sessionID: firstChild.id, generation: "slow-generation" })).toBe(false)
+      yield* Deferred.succeed(releaseFirstWake, undefined)
+      const deadline = Date.now() + 1_000
+      while ((yield* recovery.get(firstChild.id))?.wakeClaimedAt === undefined) {
+        if (Date.now() >= deadline) yield* Effect.fail(new Error("slow wake did not complete"))
+        yield* Effect.sleep("5 millis")
+      }
+      expect(wakes).toBe(2)
+    }),
+  )
+
+  background.instance("recovery retains completed task detail without duplicating terminal delivery", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const backgroundChild = yield* sessions.create({ parentID: chat.id, title: "recovered background" })
+      const foregroundChild = yield* sessions.create({ parentID: chat.id, title: "retained foreground" })
+      const legacyChild = yield* sessions.create({ parentID: chat.id, title: "retained legacy" })
+      const nestedChild = yield* sessions.create({ parentID: chat.id, title: "retained nested background" })
+      const grandchild = yield* sessions.create({ parentID: nestedChild.id, title: "retained descendant" })
+      const recovery = yield* BackgroundTaskExecution.make({ ownerID: "recovery-runtime" })
+      const recoveredPart = yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        callID: "recovered-background-task",
+        tool: "task",
+        state: {
+          status: "completed",
+          input: { description: backgroundChild.title },
+          title: backgroundChild.title,
+          metadata: {
+            background: true,
+            sessionId: backgroundChild.id,
+            jobId: backgroundChild.id,
+          },
+          output: `<task id="${backgroundChild.id}" state="running">`,
+          time: { start: Date.now(), end: Date.now() },
+        },
+      })
+      let deletions = 0
+      let admissions = 0
+      let wakes = 0
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Deleted.type) return Effect.void
+        return Effect.sync(() => deletions++)
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      yield* recovery.claim({
+        sessionID: backgroundChild.id,
+        parentSessionID: chat.id,
+        generation: "background-generation",
+        description: backgroundChild.title,
+        parentMessageID: assistant.id,
+        wakeRequired: true,
+      })
+      yield* recovery.settle({
+        sessionID: backgroundChild.id,
+        generation: "background-generation",
+        state: "completed",
+        output: "done",
+      })
+
+      yield* recovery.claim({
+        sessionID: foregroundChild.id,
+        parentSessionID: chat.id,
+        generation: "foreground-generation",
+        description: foregroundChild.title,
+        parentMessageID: assistant.id,
+        wakeRequired: false,
+      })
+      yield* recovery.settle({
+        sessionID: foregroundChild.id,
+        generation: "foreground-generation",
+        state: "completed",
+        output: "done",
+      })
+      yield* recovery.claimDelivery({ sessionID: foregroundChild.id, generation: "foreground-generation" })
+      yield* recovery.completeDelivery({ sessionID: foregroundChild.id, generation: "foreground-generation" })
+
+      yield* recovery.claim({
+        sessionID: nestedChild.id,
+        parentSessionID: chat.id,
+        generation: "nested-generation",
+        description: nestedChild.title,
+        parentMessageID: assistant.id,
+        wakeRequired: false,
+      })
+      yield* recovery.settle({
+        sessionID: nestedChild.id,
+        generation: "nested-generation",
+        state: "completed",
+        output: "done",
+      })
+      yield* recovery.claimDelivery({ sessionID: nestedChild.id, generation: "nested-generation" })
+      yield* recovery.completeDelivery({ sessionID: nestedChild.id, generation: "nested-generation" })
+
+      expect(yield* recovery.pendingTerminals()).toHaveLength(1)
+      yield* startBackgroundTerminalPump({
+        executions: recovery,
+        sessions,
+        ops: {
+          ...stubOps(),
+          prompt: (input) => Effect.sync(() => admissions++).pipe(Effect.as(reply(input, "recovered"))),
+          wake: () => Effect.sync(() => wakes++),
+        },
+        interval: "5 millis",
+      })
+
+      const deadline = Date.now() + 1_000
+      while ((yield* recovery.get(backgroundChild.id))?.wakeClaimedAt === undefined) {
+        if (Date.now() >= deadline) yield* Effect.fail(new Error("recovered background wake did not finish"))
+        yield* Effect.sleep("5 millis")
+      }
+      yield* Effect.sleep("30 millis")
+
+      expect((yield* sessions.get(backgroundChild.id)).parentID).toBe(chat.id)
+      expect((yield* sessions.get(foregroundChild.id)).parentID).toBe(chat.id)
+      expect((yield* sessions.get(legacyChild.id)).parentID).toBe(chat.id)
+      expect((yield* sessions.get(nestedChild.id)).parentID).toBe(chat.id)
+      expect((yield* sessions.get(grandchild.id)).parentID).toBe(nestedChild.id)
+      expect(
+        yield* sessions.getPart({
+          sessionID: recoveredPart.sessionID,
+          messageID: recoveredPart.messageID,
+          partID: recoveredPart.id,
+        }),
+      ).toMatchObject({
+        state: {
+          metadata: {
+            background: true,
+            sessionId: backgroundChild.id,
+            jobId: backgroundChild.id,
+          },
+        },
+      })
+      expect(admissions).toBe(1)
+      expect(wakes).toBe(1)
+      expect(deletions).toBe(0)
+    }),
+  )
+
   background.instance("failed background tasks can restart while parallel tasks keep running", () =>
     Effect.gen(function* () {
+      const executions = yield* BackgroundTaskExecution.Service
       const jobs = yield* BackgroundJob.Service
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
@@ -1921,6 +2749,12 @@ describe("tool.task", () => {
         }),
       ])
       expect(wakes).toBe(1)
+      releaseFirstWake.resolve()
+      const wakeDeadline = Date.now() + 1_000
+      while ((yield* executions.get(a.metadata.sessionId))?.wakeClaimedAt === undefined) {
+        if (Date.now() >= wakeDeadline) yield* Effect.fail(new Error("failed task wake did not complete"))
+        yield* Effect.sleep("5 millis")
+      }
 
       const restarted = yield* launch("subagent A", "retry A", a.metadata.sessionId)
       expect(restarted.metadata.sessionId).toBe(a.metadata.sessionId)
@@ -1928,12 +2762,12 @@ describe("tool.task", () => {
       expect((yield* jobs.get(b.metadata.sessionId))?.status).toBe("running")
       expect((yield* jobs.get(d.metadata.sessionId))?.status).toBe("running")
 
-      releaseFirstWake.resolve()
       finishB.resolve()
       const completed = yield* Effect.promise(() => secondNotification.promise)
       expect(completed.parts[0]?.type).toBe("text")
       if (completed.parts[0]?.type !== "text") throw new Error("background completion notification text not found")
-      expect(completed.parts[0].text).toContain(`<task id="${b.metadata.sessionId}" state="completed">`)
+      expect(completed.parts[0].text).toContain(`<task state="completed">`)
+      expect(completed.parts[0].text).not.toContain(`<task id=`)
       expect(completed.parts[0].text).toContain(
         `<active_tasks>${JSON.stringify([
           { task_id: d.metadata.sessionId, description: "subagent D" },
@@ -2447,8 +3281,9 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("a late terminal keeps the generation of the cancelled run after an immediate relaunch", () =>
+  background.instance("blocks relaunch until the cancelled terminal delivery completes", () =>
     Effect.gen(function* () {
+      const executions = yield* BackgroundTaskExecution.Service
       const jobs = yield* BackgroundJob.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
@@ -2470,15 +3305,28 @@ describe("tool.task", () => {
 
       yield* jobs.cancel(started.metadata.sessionId)
       const lateTerminal = yield* Effect.promise(() => terminal.promise).pipe(Effect.timeout("1 second"))
+      const retry = {
+        description: "subagent A",
+        prompt: "retry A",
+        subagent_type: "general",
+        background: true,
+        task_id: started.metadata.sessionId,
+      } as const
+      const context = { ...taskContext(chat.id, assistant.id, promptOps), callID: "call-2" }
+      const blocked = yield* def.execute(retry, context).pipe(Effect.exit)
+      expect(Exit.isFailure(blocked)).toBe(true)
+
+      releaseTerminal.resolve()
+      const deadline = Date.now() + 1_000
+      while ((yield* executions.get(started.metadata.sessionId))?.terminalDeliveredAt === undefined) {
+        if (Date.now() >= deadline) yield* Effect.fail(new Error("cancelled terminal was not delivered"))
+        yield* Effect.sleep("5 millis")
+      }
       const restarted = yield* def.execute(
         {
-          description: "subagent A",
-          prompt: "retry A",
-          subagent_type: "general",
-          background: true,
-          task_id: started.metadata.sessionId,
+          ...retry,
         },
-        { ...taskContext(chat.id, assistant.id, promptOps), callID: "call-2" },
+        context,
       )
 
       expect(started.metadata.backgroundTaskGeneration).toBe(`${assistant.id}:call-1`)
@@ -2497,7 +3345,6 @@ describe("tool.task", () => {
       )
       expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
 
-      releaseTerminal.resolve()
       yield* Effect.yieldNow
       expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
       yield* jobs.cancel(started.metadata.sessionId)
@@ -2551,6 +3398,118 @@ describe("tool.task", () => {
 
       expect((yield* jobs.get(child.id))?.status).toBe("cancelled")
       expect((yield* jobs.get(grandchild.id))?.status).toBe("cancelled")
+    }),
+  )
+
+  background.instance("cancelling a parent durably requests cancellation from a remote descendant owner", () =>
+    Effect.gen(function* () {
+      const runState = yield* SessionRunState.Service
+      const sessions = yield* Session.Service
+      const { chat } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "remote child" })
+      const remote = yield* BackgroundTaskExecution.make({ ownerID: "remote-runtime" })
+      yield* remote.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation: "remote-generation",
+        description: child.title,
+        parentMessageID: MessageID.ascending(),
+      })
+
+      yield* runState.cancel(chat.id)
+
+      expect(yield* remote.heartbeat({ sessionID: child.id, generation: "remote-generation" })).toBe("cancelled")
+    }),
+  )
+
+  background.instance("projects a remotely owned task as busy until cancellation is requested", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "remote child" })
+      const remote = yield* BackgroundTaskExecution.make({ ownerID: "remote-runtime" })
+      yield* remote.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation: "remote-generation",
+        description: child.title,
+        parentMessageID: assistant.id,
+      })
+
+      expect(yield* status.get(child.id)).toEqual({ type: "busy" })
+      expect((yield* status.list()).get(child.id)).toEqual({ type: "busy" })
+
+      yield* remote.requestCancel(child.id)
+
+      expect(yield* status.get(child.id)).toEqual({ type: "idle" })
+      expect((yield* status.list()).has(child.id)).toBe(false)
+    }),
+  )
+
+  background.instance("task_stop persists cancellation for a remotely owned task", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "remote child" })
+      const remote = yield* BackgroundTaskExecution.make({ ownerID: "remote-runtime" })
+      yield* remote.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation: "remote-generation",
+        description: child.title,
+        parentMessageID: assistant.id,
+      })
+      const stop = yield* TaskStopTool
+      const def = yield* stop.init()
+
+      const result = yield* def.execute({ task_ids: [child.id] }, taskContext(chat.id, assistant.id, stubOps()))
+
+      expect(result.metadata.statuses).toEqual([{ task_id: child.id, status: "cancelled" }])
+      expect(yield* remote.heartbeat({ sessionID: child.id, generation: "remote-generation" })).toBe("cancelled")
+    }),
+  )
+
+  background.instance("does not relaunch while another runtime owns the prior terminal delivery", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "remote child" })
+      const remote = yield* BackgroundTaskExecution.make({ ownerID: "remote-runtime" })
+      yield* remote.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation: "remote-generation",
+        description: child.title,
+        parentMessageID: assistant.id,
+      })
+      yield* remote.settle({
+        sessionID: child.id,
+        generation: "remote-generation",
+        state: "error",
+        error: "remote failure",
+      })
+      expect(yield* remote.claimDelivery({ sessionID: child.id, generation: "remote-generation" })).toBeDefined()
+
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const exit = yield* def
+        .execute(
+          {
+            description: "retry remote child",
+            prompt: "retry",
+            subagent_type: "general",
+            background: true,
+            task_id: child.id,
+          },
+          { ...taskContext(chat.id, assistant.id, stubOps()), callID: "retry-call" },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect((yield* remote.get(child.id))?.generation).toBe("remote-generation")
+      expect(yield* jobs.get(child.id)).toBeUndefined()
     }),
   )
 })

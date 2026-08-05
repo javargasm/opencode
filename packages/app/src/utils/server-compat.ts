@@ -85,8 +85,16 @@ function sessionInfo(session: Session): SessionInfo {
 
 export function createCompatibleApi(input: CompatibleInput): CompatibleApi {
   const v1 = createV1Api(input)
+  // V2 compaction cannot resolve a model yet, so it must use the legacy endpoint.
+  const v2 = {
+    ...input.current,
+    session: {
+      ...input.current.session,
+      compact: v1.session.compact,
+    },
+  }
   return lazyApi(
-    input.protocol.then((protocol) => (protocol === "v1" ? v1 : input.current)),
+    input.protocol.then((protocol) => (protocol === "v1" ? v1 : v2)),
     input.current,
   )
 }

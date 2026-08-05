@@ -5,7 +5,13 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { expect, test } from "bun:test"
 import { onCleanup } from "solid-js"
 import { TuiKeybind } from "../src/config/keybind"
-import { getOpencodeModeStack, OPENCODE_BASE_MODE, OpencodeKeymapProvider, registerOpencodeKeymap } from "../src/keymap"
+import {
+  getOpencodeModeStack,
+  OPENCODE_BASE_MODE,
+  OpencodeKeymapProvider,
+  registerOpencodeKeymap,
+  resolveLocalCommandSlash,
+} from "../src/keymap"
 
 function createResolvedKeymapConfig(input: TuiKeybind.KeybindOverrides = {}) {
   const keybinds = TuiKeybind.parse(input)
@@ -61,6 +67,28 @@ test("legacy page key aliases compile as page keys", async () => {
   } finally {
     app.renderer.destroy()
   }
+})
+
+test("manual local slashes resolve aliases without overriding server commands", () => {
+  let selections = 0
+  const compact = {
+    display: "/compact",
+    aliases: ["/summarize"],
+    onSelect() {
+      selections++
+    },
+  }
+
+  const direct = resolveLocalCommandSlash("/compact", [], [compact])
+  const alias = resolveLocalCommandSlash("/summarize", [], [compact])
+  expect(direct).toBe(compact)
+  expect(alias).toBe(compact)
+  if (!direct || !alias) throw new Error("Expected local slash actions")
+  direct.onSelect()
+  alias.onSelect()
+  expect(selections).toBe(2)
+  expect(resolveLocalCommandSlash("/compact", [{ name: "compact" }], [compact])).toBeUndefined()
+  expect(resolveLocalCommandSlash("/compact now", [], [compact])).toBeUndefined()
 })
 
 test("mode-less bindings stay active when opencode mode changes", async () => {

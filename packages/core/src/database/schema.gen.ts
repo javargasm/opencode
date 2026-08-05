@@ -125,6 +125,32 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`background_task_execution\` (
+          \`session_id\` text PRIMARY KEY,
+          \`parent_session_id\` text NOT NULL,
+          \`generation\` text NOT NULL,
+          \`owner_id\` text NOT NULL,
+          \`state\` text NOT NULL,
+          \`description\` text NOT NULL,
+          \`parent_message_id\` text NOT NULL,
+          \`lease_expires_at\` integer NOT NULL,
+          \`cancel_requested_at\` integer,
+          \`output\` text,
+          \`error\` text,
+          \`delivery\` text NOT NULL,
+          \`delivery_owner_id\` text,
+          \`delivery_lease_expires_at\` integer,
+          \`terminal_delivered_at\` integer,
+          \`wake_required\` integer DEFAULT false NOT NULL,
+          \`wake_owner_id\` text,
+          \`wake_lease_expires_at\` integer,
+          \`wake_claimed_at\` integer,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          CONSTRAINT \`fk_background_task_execution_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`message\` (
           \`id\` text PRIMARY KEY,
           \`session_id\` text NOT NULL,
@@ -240,6 +266,12 @@ export default {
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(
         `CREATE UNIQUE INDEX \`permission_project_action_resource_idx\` ON \`permission\` (\`project_id\`,\`action\`,\`resource\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`background_task_execution_parent_state_idx\` ON \`background_task_execution\` (\`parent_session_id\`,\`state\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`background_task_execution_state_lease_idx\` ON \`background_task_execution\` (\`state\`,\`lease_expires_at\`);`,
       )
       yield* tx.run(
         `CREATE INDEX \`message_session_time_created_id_idx\` ON \`message\` (\`session_id\`,\`time_created\`,\`id\`);`,

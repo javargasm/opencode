@@ -2,6 +2,7 @@ Launch a new agent to handle complex, multistep tasks autonomously.
 
 When using the Task tool, you must specify a subagent_type parameter to select which agent type to use.
 Only set the optional model parameter when the user explicitly asks for a specific model; otherwise omit it. It must use provider/model format and requires model_override confirmation.
+Set the optional variant parameter when the user explicitly asks for a provider-specific reasoning effort or model variant (for example, high or max).
 
 When NOT to use the Task tool:
 - If you want to read a specific file path, use the Read or Glob tool instead of the Task tool, to find the match more quickly

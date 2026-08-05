@@ -4,7 +4,7 @@ import { fileURLToPath } from "url"
 import path from "path"
 import { SqliteClient } from "@effect/sql-sqlite-bun"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
-import { Effect, Layer } from "effect"
+import { Cause, Effect, Exit, Layer } from "effect"
 import { eq, inArray, sql } from "drizzle-orm"
 import { DatabaseMigration } from "@opencode-ai/core/database/migration"
 import { migrations } from "@opencode-ai/core/database/migration.gen"
@@ -15,6 +15,7 @@ import eventSourcedSessionInputMigration from "@opencode-ai/core/database/migrat
 import contextEpochAgentMigration from "@opencode-ai/core/database/migration/20260605042240_add_context_epoch_agent"
 import simplifyIntegrationCredentialsMigration from "@opencode-ai/core/database/migration/20260611192811_lush_chimera"
 import simplifySessionInputMigration from "@opencode-ai/core/database/migration/20260622202450_simplify_session_input"
+import backgroundTaskExecutionMigration from "@opencode-ai/core/database/migration/20260805174858_background_task_execution"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -36,6 +37,35 @@ const run = <A, E>(effect: Effect.Effect<A, E, SqlClientService>) =>
   )
 
 const makeDb = EffectDrizzleSqlite.makeWithDefaults()
+
+const backgroundTaskExecutionColumns = [
+  "session_id",
+  "parent_session_id",
+  "generation",
+  "owner_id",
+  "state",
+  "description",
+  "parent_message_id",
+  "lease_expires_at",
+  "cancel_requested_at",
+  "output",
+  "error",
+  "delivery",
+  "delivery_owner_id",
+  "delivery_lease_expires_at",
+  "terminal_delivered_at",
+  "wake_required",
+  "wake_owner_id",
+  "wake_lease_expires_at",
+  "wake_claimed_at",
+  "time_created",
+  "time_updated",
+]
+
+const backgroundTaskExecutionIndexes = [
+  "background_task_execution_parent_state_idx",
+  "background_task_execution_state_lease_idx",
+]
 
 describe("DatabaseMigration", () => {
   test("serializes concurrent embedded initialization for one database path", async () => {
@@ -617,6 +647,278 @@ describe("DatabaseMigration", () => {
           { id: "20260511173437_session-metadata" },
           { id: "20260530232709_lovely_romulus" },
         ])
+      }),
+    )
+  })
+
+  test("creates the consolidated background execution schema on a fresh database", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+
+        yield* DatabaseMigration.applyOnly(db, [backgroundTaskExecutionMigration])
+        yield* DatabaseMigration.applyOnly(db, [backgroundTaskExecutionMigration])
+
+        expect(
+          (yield* db.all<{ name: string }>(sql`PRAGMA table_info(background_task_execution)`)).map(
+            (column) => column.name,
+          ),
+        ).toEqual(backgroundTaskExecutionColumns)
+        expect(
+          (yield* db.all<{ name: string }>(sql`PRAGMA index_list(background_task_execution)`)).map(
+            (index) => index.name,
+          ),
+        ).toEqual(expect.arrayContaining(backgroundTaskExecutionIndexes))
+        expect(
+          yield* db.get<{ count: number }>(
+            sql`SELECT count(*) AS count FROM migration WHERE id = ${backgroundTaskExecutionMigration.id}`,
+          ),
+        ).toEqual({ count: 1 })
+      }),
+    )
+  })
+
+  test("accepts the legacy background execution superset and records the consolidated migration once", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(sql`
+          CREATE TABLE background_task_execution (
+            session_id text PRIMARY KEY,
+            parent_session_id text NOT NULL,
+            generation text NOT NULL,
+            owner_id text NOT NULL,
+            state text NOT NULL,
+            description text NOT NULL,
+            parent_message_id text NOT NULL,
+            lease_expires_at integer NOT NULL,
+            cancel_requested_at integer,
+            output text,
+            error text,
+            delivery text NOT NULL,
+            delivery_owner_id text,
+            delivery_lease_expires_at integer,
+            terminal_delivered_at integer,
+            wake_required integer DEFAULT false NOT NULL,
+            wake_owner_id text,
+            wake_lease_expires_at integer,
+            wake_claimed_at integer,
+            delete_on_completion integer DEFAULT false NOT NULL,
+            cleanup_owner_id text,
+            cleanup_lease_expires_at integer,
+            time_created integer NOT NULL,
+            time_updated integer NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE
+          )
+        `)
+        yield* db.run(sql`CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`)
+        yield* Effect.forEach(
+          [
+            "20260805071903_background_task_execution",
+            "20260805083814_background_task_recovery",
+            "20260805085316_background_task_wake_requirement",
+            "20260805133744_little_bug",
+          ],
+          (id) => db.run(sql`INSERT INTO migration (id, time_completed) VALUES (${id}, 1)`),
+          { discard: true },
+        )
+
+        yield* DatabaseMigration.applyOnly(db, [backgroundTaskExecutionMigration])
+        yield* DatabaseMigration.applyOnly(db, [backgroundTaskExecutionMigration])
+
+        const columns = (yield* db.all<{ name: string }>(sql`PRAGMA table_info(background_task_execution)`)).map(
+          (column) => column.name,
+        )
+        expect(columns).toEqual(expect.arrayContaining(backgroundTaskExecutionColumns))
+        expect(columns).toEqual(
+          expect.arrayContaining(["delete_on_completion", "cleanup_owner_id", "cleanup_lease_expires_at"]),
+        )
+        expect(
+          (yield* db.all<{ name: string }>(sql`PRAGMA index_list(background_task_execution)`)).map(
+            (index) => index.name,
+          ),
+        ).toEqual(expect.arrayContaining(backgroundTaskExecutionIndexes))
+        expect(
+          yield* db.get<{ count: number }>(
+            sql`SELECT count(*) AS count FROM migration WHERE id = ${backgroundTaskExecutionMigration.id}`,
+          ),
+        ).toEqual({ count: 1 })
+      }),
+    )
+  })
+
+  test("repairs an interrupted compatible background execution table without rebuilding it", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(sql`
+          CREATE TABLE background_task_execution (
+            session_id text PRIMARY KEY,
+            parent_session_id text NOT NULL,
+            generation text NOT NULL,
+            owner_id text NOT NULL,
+            state text NOT NULL,
+            description text NOT NULL,
+            parent_message_id text NOT NULL,
+            lease_expires_at integer NOT NULL,
+            delivery text NOT NULL,
+            time_created integer NOT NULL,
+            time_updated integer NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE
+          )
+        `)
+        yield* db.run(sql`
+          INSERT INTO background_task_execution (
+            session_id,
+            parent_session_id,
+            generation,
+            owner_id,
+            state,
+            description,
+            parent_message_id,
+            lease_expires_at,
+            delivery,
+            time_created,
+            time_updated
+          ) VALUES ('child', 'parent', 'generation', 'owner', 'completed', 'description', 'message', 1, '{}', 1, 1)
+        `)
+
+        yield* DatabaseMigration.applyOnly(db, [backgroundTaskExecutionMigration])
+
+        expect(
+          (yield* db.all<{ name: string }>(sql`PRAGMA table_info(background_task_execution)`)).map(
+            (column) => column.name,
+          ),
+        ).toEqual(expect.arrayContaining(backgroundTaskExecutionColumns))
+        expect(yield* db.get(sql`SELECT session_id, wake_required FROM background_task_execution`)).toEqual({
+          session_id: "child",
+          wake_required: 0,
+        })
+        expect(
+          (yield* db.all<{ name: string }>(sql`PRAGMA index_list(background_task_execution)`)).map(
+            (index) => index.name,
+          ),
+        ).toEqual(expect.arrayContaining(backgroundTaskExecutionIndexes))
+      }),
+    )
+  })
+
+  test("does not journal an incompatible partial background execution table", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(sql`
+          CREATE TABLE background_task_execution (
+            session_id text PRIMARY KEY,
+            FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE
+          )
+        `)
+
+        const result = yield* DatabaseMigration.applyOnly(db, [backgroundTaskExecutionMigration]).pipe(Effect.exit)
+
+        expect(Exit.isFailure(result)).toBe(true)
+        expect(
+          yield* db.get<{ count: number }>(
+            sql`SELECT count(*) AS count FROM migration WHERE id = ${backgroundTaskExecutionMigration.id}`,
+          ),
+        ).toEqual({ count: 0 })
+      }),
+    )
+  })
+
+  test("does not journal a background execution table with an alternate primary key", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(sql`
+          CREATE TABLE background_task_execution (
+            session_id text NOT NULL,
+            parent_session_id text NOT NULL,
+            generation text PRIMARY KEY,
+            owner_id text NOT NULL,
+            state text NOT NULL,
+            description text NOT NULL,
+            parent_message_id text NOT NULL,
+            lease_expires_at integer NOT NULL,
+            cancel_requested_at integer,
+            output text,
+            error text,
+            delivery text NOT NULL,
+            delivery_owner_id text,
+            delivery_lease_expires_at integer,
+            terminal_delivered_at integer,
+            wake_required integer DEFAULT false NOT NULL,
+            wake_owner_id text,
+            wake_lease_expires_at integer,
+            wake_claimed_at integer,
+            time_created integer NOT NULL,
+            time_updated integer NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE
+          )
+        `)
+
+        const result = yield* DatabaseMigration.applyOnly(db, [backgroundTaskExecutionMigration]).pipe(Effect.exit)
+
+        expect(Exit.isFailure(result)).toBe(true)
+        if (Exit.isFailure(result))
+          expect(Cause.pretty(result.cause)).toContain("session_id must be the sole PRIMARY KEY")
+        expect(
+          yield* db.get<{ count: number }>(
+            sql`SELECT count(*) AS count FROM migration WHERE id = ${backgroundTaskExecutionMigration.id}`,
+          ),
+        ).toEqual({ count: 0 })
+      }),
+    )
+  })
+
+  test("does not journal a background execution table with a restrictive session foreign key", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(sql`
+          CREATE TABLE background_task_execution (
+            session_id text PRIMARY KEY,
+            parent_session_id text NOT NULL,
+            generation text NOT NULL,
+            owner_id text NOT NULL,
+            state text NOT NULL,
+            description text NOT NULL,
+            parent_message_id text NOT NULL,
+            lease_expires_at integer NOT NULL,
+            cancel_requested_at integer,
+            output text,
+            error text,
+            delivery text NOT NULL,
+            delivery_owner_id text,
+            delivery_lease_expires_at integer,
+            terminal_delivered_at integer,
+            wake_required integer DEFAULT false NOT NULL,
+            wake_owner_id text,
+            wake_lease_expires_at integer,
+            wake_claimed_at integer,
+            time_created integer NOT NULL,
+            time_updated integer NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE RESTRICT
+          )
+        `)
+
+        const result = yield* DatabaseMigration.applyOnly(db, [backgroundTaskExecutionMigration]).pipe(Effect.exit)
+
+        expect(Exit.isFailure(result)).toBe(true)
+        if (Exit.isFailure(result)) {
+          expect(Cause.pretty(result.cause)).toContain("session_id must reference session(id) ON DELETE CASCADE")
+        }
+        expect(
+          yield* db.get<{ count: number }>(
+            sql`SELECT count(*) AS count FROM migration WHERE id = ${backgroundTaskExecutionMigration.id}`,
+          ),
+        ).toEqual({ count: 0 })
       }),
     )
   })

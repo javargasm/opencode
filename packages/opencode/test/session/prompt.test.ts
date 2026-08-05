@@ -921,7 +921,7 @@ it.instance("failed subtask preserves metadata on error tool state", () =>
   }),
 )
 
-it.instance("subtask child inherits parent session external_directory allow", () =>
+it.instance("completed foreground subtask retains its child for direct recovery", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -936,15 +936,14 @@ it.instance("subtask child inherits parent session external_directory allow", ()
 
     yield* prompt.loop({ sessionID: chat.id })
 
-    const kids = yield* sessions.children(chat.id)
-    expect(kids).toHaveLength(1)
-    const child = kids[0]!
-    const rules = child.permission ?? []
-    expect(rules).toEqual(
-      expect.arrayContaining([{ permission: "external_directory", pattern: "/tmp/allowed/*", action: "allow" }]),
-    )
-    expect(Permission.evaluate("external_directory", "/tmp/allowed/file", rules).action).toBe("allow")
-    expect(Permission.evaluate("task", "anything", rules).action).toBe("deny")
+    expect(yield* sessions.children(chat.id)).toHaveLength(1)
+    const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+    const taskMsg = msgs.find((item) => item.info.role === "assistant" && item.info.agent === "general")
+    const task = taskMsg ? completedTool(taskMsg.parts) : undefined
+    expect(task?.state.metadata?.sessionId).toBeDefined()
+    expect(task?.state.metadata?.jobId).toBeUndefined()
+    expect(task?.state.output).toContain(`<task state="completed">`)
+    expect(task?.state.output).not.toContain(`<task id=`)
   }),
 )
 
@@ -982,7 +981,10 @@ it.instance(
       const { llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
       const sessions = yield* Session.Service
-      const chat = yield* sessions.create({ title: "Pinned" })
+      const chat = yield* sessions.create({
+        title: "Parent",
+        permission: [{ permission: "external_directory", pattern: "/tmp/allowed/*", action: "allow" }],
+      })
       yield* llm.hang
       const msg = yield* user(chat.id, "hello")
       yield* addSubtask(chat.id, msg.id)
@@ -1004,6 +1006,14 @@ it.instance(
       expect(tool.state.title).toBeDefined()
       expect(tool.state.metadata?.model).toBeDefined()
       expect(tool.state.input.background).toBe(false)
+      const child = yield* sessions.get(SessionID.make(String(tool.state.metadata?.sessionId)))
+      const rules = child.permission ?? []
+      expect(child.title).toBe("(subagente) Parent")
+      expect(rules).toEqual(
+        expect.arrayContaining([{ permission: "external_directory", pattern: "/tmp/allowed/*", action: "allow" }]),
+      )
+      expect(Permission.evaluate("external_directory", "/tmp/allowed/file", rules).action).toBe("allow")
+      expect(Permission.evaluate("task", "anything", rules).action).toBe("deny")
 
       yield* prompt.cancel(chat.id)
       yield* Fiber.await(fiber)

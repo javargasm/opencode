@@ -48,6 +48,7 @@ import { Agent } from "../agent/agent"
 import { Skill } from "../skill"
 import { Permission } from "@/permission"
 import { BackgroundJob } from "@/background/job"
+import { BackgroundTaskExecution } from "@/background/task-execution"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -435,6 +436,7 @@ export const node = LayerNode.make({
     Skill.node,
     Session.node,
     BackgroundJob.node,
+    BackgroundTaskExecution.node,
     Provider.node,
     LSP.node,
     Instruction.node,

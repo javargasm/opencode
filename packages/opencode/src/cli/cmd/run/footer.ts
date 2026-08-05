@@ -396,6 +396,7 @@ export class RunFooter implements FooterApi {
           this.scrollback.writeTurnSummary({
             agent: this.options.agentLabel,
             model: current ? modelInfo(this.providers(), current).model : this.state().model,
+            variant: this.currentVariant(),
             duration: next.duration,
           }),
         )

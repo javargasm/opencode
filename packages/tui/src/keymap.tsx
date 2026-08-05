@@ -30,7 +30,7 @@ export { useBindings, useKeymapSelector }
 
 export type OpenTuiKeymap = ReturnType<typeof useKeymap>
 type OpencodeModeStack = ReturnType<typeof createOpencodeModeStack>
-type CommandSlashEntry = {
+export type CommandSlashEntry = {
   display: string
   description?: string
   aliases?: string[]
@@ -255,6 +255,16 @@ export function useCommandShortcut(command: string): Accessor<string> {
       config,
     ),
   )
+}
+
+export function resolveLocalCommandSlash(
+  input: string,
+  serverCommands: readonly { name: string }[],
+  slashes: readonly CommandSlashEntry[],
+) {
+  if (!input.startsWith("/")) return undefined
+  if (serverCommands.some((command) => command.name === input.split("\n")[0].split(" ")[0].slice(1))) return undefined
+  return slashes.find((slash) => slash.display === input || slash.aliases?.includes(input))
 }
 
 export function useCommandSlashes(): Accessor<readonly CommandSlashEntry[]> {

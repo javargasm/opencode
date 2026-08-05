@@ -766,6 +766,70 @@ it.live("session.processor effect tests complete AI SDK tool calls when native f
   ),
 )
 
+it.live("session.processor retains a completed foreground task child for direct recovery", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        yield* llm.tool("task", {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+        })
+
+        const chat = yield* session.create({ title: "Parent" })
+        const child = yield* session.create({ parentID: chat.id, title: "(subagente) Parent" })
+        const parent = yield* user(chat.id, "tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "tool" }],
+          tools: {
+            task: tool({
+              description: "Delegate work",
+              inputSchema: z.object({
+                description: z.string(),
+                prompt: z.string(),
+                subagent_type: z.string(),
+              }),
+              execute: async () => ({
+                title: "inspect bug",
+                output: '<task state="completed">\ndone\n</task>',
+                metadata: { parentSessionId: chat.id, sessionId: child.id },
+              }),
+            }),
+          },
+        })
+
+        const call = (yield* MessageV2.parts(msg.id)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task",
+        )
+        expect(call?.state.status).toBe("completed")
+        if (call?.state.status === "completed") {
+          expect(call.state.metadata?.sessionId).toBe(child.id)
+          expect(call.state.metadata?.jobId).toBeUndefined()
+        }
+        expect((yield* session.get(child.id)).parentID).toBe(chat.id)
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
 it.live("session.processor effect tests mark pending tools as aborted on cleanup", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>

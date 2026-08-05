@@ -5,17 +5,21 @@ import type { RunProvider, StreamCommit } from "./types"
 export function turnSummaryCommit(input: {
   agent: string
   model: string
+  variant?: string
   duration: string
   messageID?: string
 }): StreamCommit {
+  const variant = input.variant && input.variant !== "default" ? input.variant : undefined
+
   return {
     kind: "system",
-    text: `▣ ${input.agent} · ${input.model} · ${input.duration}`,
+    text: `▣ ${input.agent} · ${input.model}${variant ? ` · ${variant}` : ""} · ${input.duration}`,
     phase: "final",
     source: "system",
     summary: {
       agent: input.agent,
       model: input.model,
+      ...(variant ? { variant } : {}),
       duration: input.duration,
     },
     messageID: input.messageID,
@@ -41,6 +45,7 @@ export function messageTurnSummaryCommit(
   return turnSummaryCommit({
     agent: Locale.titlecase(info.agent),
     model: model ?? info.modelID,
+    variant: info.variant,
     duration: Locale.duration(completed - info.time.created),
     messageID: info.id,
   })

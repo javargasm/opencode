@@ -147,6 +147,22 @@ describe("createCompatibleApi", () => {
     expect(detections).toBe(1)
   })
 
+  test("uses legacy summarize for V2 compaction until the V2 endpoint is implemented", async () => {
+    const { api, requests } = setup("v2")
+
+    await api.session.compact({
+      sessionID: "ses_1",
+      model: { providerID: "provider", modelID: "model" },
+    })
+
+    expect(requests).toHaveLength(1)
+    const request = requests[0]
+    if (!request) throw new Error("Expected a summarize request")
+    expect(new URL(request.url).pathname).toBe("/session/ses_1/summarize")
+    expect(request.method).toBe("POST")
+    expect(await request.json()).toEqual({ providerID: "provider", modelID: "model" })
+  })
+
   /*
   test("keeps V2 session actions on the current API", async () => {
     const { api, requests } = setup("v2")

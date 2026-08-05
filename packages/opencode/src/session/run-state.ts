@@ -3,6 +3,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
+import { BackgroundTaskExecution } from "@/background/task-execution"
 import { Effect, Latch, Layer, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
@@ -11,6 +12,7 @@ import { SessionStatus } from "./status"
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  readonly interrupt: (sessionID: SessionID) => Effect.Effect<void>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -35,6 +37,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service
+    const executions = yield* BackgroundTaskExecution.Service
     const status = yield* SessionStatus.Service
 
     const state = yield* InstanceState.make(
@@ -79,8 +82,7 @@ const layer = Layer.effect(
       if (existing?.busy) yield* busyError(sessionID)
     })
 
-    const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
-      yield* cancelBackgroundJobs(background, sessionID)
+    const interrupt = Effect.fn("SessionRunState.interrupt")(function* (sessionID: SessionID) {
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
       if (!existing) {
@@ -88,6 +90,12 @@ const layer = Layer.effect(
         return
       }
       yield* existing.cancel
+    })
+
+    const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
+      yield* executions.requestCancel(sessionID)
+      yield* cancelBackgroundJobs(background, sessionID)
+      yield* interrupt(sessionID)
     })
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
@@ -117,7 +125,7 @@ const layer = Layer.effect(
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, ensureRunning, wake, startShell })
+    return Service.of({ assertNotBusy, cancel, interrupt, ensureRunning, wake, startShell })
   }),
 )
 
@@ -159,6 +167,10 @@ function busyError(sessionID: SessionID) {
   return new Session.BusyError({ sessionID })
 }
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [BackgroundJob.node, SessionStatus.node] })
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [BackgroundJob.node, BackgroundTaskExecution.node, SessionStatus.node],
+})
 
 export * as SessionRunState from "./run-state"

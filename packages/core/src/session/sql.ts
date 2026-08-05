@@ -174,3 +174,36 @@ export const SessionContextEpochTable = sqliteTable("session_context_epoch", {
   snapshot: text({ mode: "json" }).notNull().$type<SystemContext.Snapshot>(),
   baseline_seq: integer().notNull(),
 })
+
+export const BackgroundTaskExecutionTable = sqliteTable(
+  "background_task_execution",
+  {
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .primaryKey()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    parent_session_id: text().$type<SessionSchema.ID>().notNull(),
+    generation: text().notNull(),
+    owner_id: text().notNull(),
+    state: text().$type<"running" | "completed" | "error" | "cancelled">().notNull(),
+    description: text().notNull(),
+    parent_message_id: text().$type<MessageID>().notNull(),
+    lease_expires_at: integer().notNull(),
+    cancel_requested_at: integer(),
+    output: text(),
+    error: text(),
+    delivery: text({ mode: "json" }).$type<{ messageID: string; partID: string }>().notNull(),
+    delivery_owner_id: text(),
+    delivery_lease_expires_at: integer(),
+    terminal_delivered_at: integer(),
+    wake_required: integer({ mode: "boolean" }).default(false).notNull(),
+    wake_owner_id: text(),
+    wake_lease_expires_at: integer(),
+    wake_claimed_at: integer(),
+    ...Timestamps,
+  },
+  (table) => [
+    index("background_task_execution_parent_state_idx").on(table.parent_session_id, table.state),
+    index("background_task_execution_state_lease_idx").on(table.state, table.lease_expires_at),
+  ],
+)

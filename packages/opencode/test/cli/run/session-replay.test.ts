@@ -36,6 +36,7 @@ function assistantInfo(
     parentID?: string
     modelID?: string
     providerID?: string
+    variant?: string
     time?: { created: number; completed?: number }
   } = {},
 ) {
@@ -47,6 +48,7 @@ function assistantInfo(
     parentID: input.parentID ?? "msg-user-1",
     modelID: input.modelID ?? "gpt-5",
     providerID: input.providerID ?? "openai",
+    ...(input.variant !== undefined ? { variant: input.variant } : {}),
     mode: "chat",
     agent: "build",
     path: {
@@ -73,6 +75,7 @@ function assistantMessage(
     parentID?: string
     modelID?: string
     providerID?: string
+    variant?: string
     time?: { created: number; completed?: number }
   } = {},
 ): SessionMessages[number] {
@@ -318,6 +321,53 @@ describe("run session replay", () => {
         summary: {
           agent: "Build",
           model: "Little Frank",
+          duration: "2.8s",
+        },
+      }),
+    )
+  })
+
+  test("includes the assistant variant in replayed turn summaries", () => {
+    const out = replaySession({
+      messages: [userMessage("msg-user-1", "Use high effort"), assistantMessage("msg-1", "Done", { variant: "high" })],
+      permissions: [],
+      questions: [],
+      thinking: true,
+      limits: {},
+    })
+
+    expect(out.commits.at(-1)).toEqual(
+      expect.objectContaining({
+        kind: "system",
+        text: "▣ Build · gpt-5 · high · 2.8s",
+        summary: {
+          agent: "Build",
+          model: "gpt-5",
+          variant: "high",
+          duration: "2.8s",
+        },
+      }),
+    )
+  })
+
+  test("omits the default assistant variant from replayed turn summaries", () => {
+    const out = replaySession({
+      messages: [
+        userMessage("msg-user-1", "Use the default effort"),
+        assistantMessage("msg-1", "Done", { variant: "default" }),
+      ],
+      permissions: [],
+      questions: [],
+      thinking: true,
+      limits: {},
+    })
+
+    expect(out.commits.at(-1)).toEqual(
+      expect.objectContaining({
+        text: "▣ Build · gpt-5 · 2.8s",
+        summary: {
+          agent: "Build",
+          model: "gpt-5",
           duration: "2.8s",
         },
       }),

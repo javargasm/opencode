@@ -24,6 +24,7 @@ import * as HttpSessionError from "../../src/server/routes/instance/httpapi/hand
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
 import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
 import { Session } from "@/session/session"
+import { BackgroundTaskExecution } from "@/background/task-execution"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
@@ -424,6 +425,101 @@ describe("session HttpApi", () => {
         cwd: sessionDirectory,
         root: sessionDirectory,
       })
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  )
+
+  it.live("scopes durable background status to the request project and location", () =>
+    Effect.gen(function* () {
+      const config = { formatter: false, lsp: false }
+      const localDirectory = yield* tmpdirScoped({ git: true, config })
+      const foreignDirectory = yield* tmpdirScoped({ git: true, config })
+      const local = yield* Effect.gen(function* () {
+        const parent = yield* createSession({ title: "local parent" })
+        const child = yield* createSession({ title: "local child", parentID: parent.id })
+        return { parent, child }
+      }).pipe(provideInstanceEffect(localDirectory))
+      const foreign = yield* Effect.gen(function* () {
+        const parent = yield* createSession({ title: "foreign parent" })
+        const child = yield* createSession({ title: "foreign child", parentID: parent.id })
+        return { parent, child }
+      }).pipe(provideInstanceEffect(foreignDirectory))
+      const executions = yield* BackgroundTaskExecution.make({ ownerID: "status-test-runtime" })
+
+      yield* executions.claim({
+        sessionID: local.child.id,
+        parentSessionID: local.parent.id,
+        generation: "local-generation",
+        description: local.child.title,
+        parentMessageID: MessageID.ascending(),
+      })
+      yield* executions.claim({
+        sessionID: foreign.child.id,
+        parentSessionID: foreign.parent.id,
+        generation: "foreign-generation",
+        description: foreign.child.title,
+        parentMessageID: MessageID.ascending(),
+      })
+
+      expect(local.parent.projectID).not.toBe(foreign.parent.projectID)
+      expect(local.parent.directory).not.toBe(foreign.parent.directory)
+      expect(
+        yield* requestJson<Record<string, unknown>>(SessionPaths.status, {
+          headers: { "x-opencode-directory": localDirectory },
+        }),
+      ).toEqual({ [local.child.id]: { type: "busy" } })
+      expect(
+        yield* requestJson<Record<string, unknown>>(SessionPaths.status, {
+          headers: { "x-opencode-directory": foreignDirectory },
+        }),
+      ).toEqual({ [foreign.child.id]: { type: "busy" } })
+      expect(yield* executions.get(foreign.child.id)).toMatchObject({
+        sessionID: foreign.child.id,
+        state: "running",
+      })
+      expect((yield* executions.requestCancel(local.parent.id)).map((item) => item.sessionID)).toEqual([local.child.id])
+      expect((yield* executions.get(local.child.id))?.cancelRequestedAt).toBeNumber()
+      expect((yield* executions.get(foreign.child.id))?.cancelRequestedAt).toBeUndefined()
+    }),
+  )
+
+  it.live("summarizes with a persisted agent when the configured default is invalid", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      const directory = yield* tmpdirScoped({
+        git: true,
+        config: { ...testProviderConfig(llm.url), default_agent: "Build" },
+      })
+      const session = yield* createSession({ title: "summarize persisted agent" }).pipe(
+        provideInstanceEffect(directory),
+      )
+      const message = yield* Session.use
+        .updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: session.id,
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+          time: { created: Date.now() },
+        })
+        .pipe(provideInstanceEffect(directory))
+      yield* Session.use
+        .updatePart({
+          id: PartID.ascending(),
+          sessionID: session.id,
+          messageID: message.id,
+          type: "text",
+          text: "compact this session",
+        })
+        .pipe(provideInstanceEffect(directory))
+
+      const response = yield* request(pathFor(SessionPaths.summarize, { sessionID: session.id }), {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-opencode-directory": directory },
+        body: JSON.stringify({ providerID: "test", modelID: "test-model" }),
+      })
+
+      expect(response.status).toBe(200)
+      expect(yield* responseJson(response)).toBe(true)
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   )
 

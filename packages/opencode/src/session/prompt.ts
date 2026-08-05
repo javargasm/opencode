@@ -44,10 +44,13 @@ import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { TaskTool, type TaskPromptOps } from "@/tool/task"
+import { TaskTool, recoverBackgroundTerminals, startBackgroundTerminalPump, type TaskPromptOps } from "@/tool/task"
+import { BackgroundTaskExecution } from "@/background/task-execution"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { Project } from "@/project/project"
+import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
 import { Database } from "@opencode-ai/core/database/database"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -133,6 +136,7 @@ const layer = Layer.effect(
     const scope = yield* Scope.Scope
     const instruction = yield* Instruction.Service
     const state = yield* SessionRunState.Service
+    const executions = yield* BackgroundTaskExecution.Service
     const revert = yield* SessionRevert.Service
     const summary = yield* SessionSummary.Service
     const sys = yield* SystemPrompt.Service
@@ -140,10 +144,12 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const projects = yield* Project.Service
     const { db } = database
-    const ops = Effect.fn("SessionPrompt.ops")(function* () {
+    const ops: () => Effect.Effect<TaskPromptOps> = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
+        interrupt: (sessionID: SessionID) => state.interrupt(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
         wake: (sessionID: SessionID) =>
@@ -151,9 +157,12 @@ const layer = Layer.effect(
       } satisfies TaskPromptOps
     })
 
-    const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
+    const cancel: (sessionID: SessionID) => Effect.Effect<void> = Effect.fn("SessionPrompt.cancel")(function* (
+      sessionID: SessionID,
+    ) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
       yield* state.cancel(sessionID)
+      yield* recoverBackgroundTerminals({ executions, sessions, ops: yield* ops(), sessionID })
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -401,7 +410,7 @@ const layer = Layer.effect(
       yield* sessions.updateMessage(assistantMessage)
 
       if (result && part.state.status === "running") {
-        yield* sessions.updatePart({
+        const completed = yield* sessions.updatePart({
           ...part,
           state: {
             status: "completed",
@@ -412,7 +421,8 @@ const layer = Layer.effect(
             attachments,
             time: { ...part.state.time, end: Date.now() },
           },
-        } satisfies SessionV1.ToolPart)
+        } satisfies SessionV1.ToolPart & { state: SessionV1.ToolStateCompleted })
+        part = completed
       }
 
       if (!result) {
@@ -1484,6 +1494,29 @@ const layer = Layer.effect(
       return result
     })
 
+    yield* startBackgroundTerminalPump({
+      executions,
+      sessions,
+      ops: yield* ops(),
+      provide: (terminal, delivery) =>
+        sessions.get(terminal.parentSessionID).pipe(
+          Effect.flatMap((parent) =>
+            projects.fromDirectory(parent.directory).pipe(
+              Effect.flatMap(({ project, sandbox }) =>
+                delivery.pipe(
+                  Effect.provideService(InstanceRef, {
+                    directory: parent.directory,
+                    worktree: sandbox,
+                    project,
+                  }),
+                  Effect.provideService(WorkspaceRef, parent.workspaceID),
+                ),
+              ),
+            ),
+          ),
+        ),
+    })
+
     return Service.of({
       cancel,
       prompt,
@@ -1629,6 +1662,8 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    BackgroundTaskExecution.node,
+    Project.node,
   ],
 })
 

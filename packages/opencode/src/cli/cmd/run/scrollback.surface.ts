@@ -420,7 +420,12 @@ export class RunScrollbackStream {
     this.markRendered(await this.finishActive(trailingNewline))
   }
 
-  public async writeTurnSummary(input: { agent: string; model: string; duration: string }): Promise<void> {
+  public async writeTurnSummary(input: {
+    agent: string
+    model: string
+    variant?: string
+    duration: string
+  }): Promise<void> {
     await this.append(turnSummaryCommit(input))
   }
 

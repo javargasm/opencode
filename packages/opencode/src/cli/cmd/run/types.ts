@@ -100,6 +100,7 @@ export type RunDiffStyle = "auto" | "stacked"
 export type TurnSummary = {
   agent: string
   model: string
+  variant?: string
   duration: string
 }
 
