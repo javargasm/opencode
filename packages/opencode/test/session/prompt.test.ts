@@ -2287,6 +2287,18 @@ noLLMServer.instance(
       if (override.info.role !== "user") throw new Error("expected user message")
       expect(override.info.model.variant).toBe("high")
 
+      const exactDefault = yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        variant: "default",
+        noReply: true,
+        parts: [{ type: "text", text: "hello default" }],
+      })
+      if (exactDefault.info.role !== "user") throw new Error("expected user message")
+      expect(exactDefault.info.model.variant).toBe("default")
+      expect((yield* sessions.get(session.id)).model?.variant).toBe("default")
+
       yield* sessions.remove(session.id)
     }),
   {

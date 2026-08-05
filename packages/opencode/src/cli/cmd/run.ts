@@ -25,6 +25,12 @@ import { Filesystem } from "@/util/filesystem"
 import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
+import {
+  applyBackgroundTaskPart,
+  projectBackgroundTasks,
+  reconcileBackgroundTasks,
+  type BackgroundTasks,
+} from "./run/background-tasks"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
@@ -694,10 +700,15 @@ export const RunCommand = effectCmd({
         // to stdout/UI. `client` is passed explicitly because attach mode may
         // rebind the SDK to the session's directory after the subscription is
         // created, and replies issued from inside the loop must use that client.
-        async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
+        async function loop(
+          client: OpencodeClient,
+          events: Awaited<ReturnType<typeof sdk.event.subscribe>>,
+          initialBackgroundTasks: BackgroundTasks,
+        ) {
           const toggles = new Map<string, boolean>()
-          const backgroundTasks = new Set<string>()
+          const backgroundTasks = new Map(initialBackgroundTasks)
           let error: string | undefined
+          let parentIdle = false
 
           for await (const event of events.stream) {
             if (
@@ -716,25 +727,8 @@ export const RunCommand = effectCmd({
             if (event.type === "message.part.updated") {
               const part = event.properties.part
               if (part.sessionID !== sessionID) continue
-
-              if (part.type === "tool" && part.tool === "task" && "metadata" in part.state) {
-                const taskID = part.state.metadata?.sessionId
-                if (part.state.metadata?.background === true && typeof taskID === "string") {
-                  if (part.state.status === "error") backgroundTasks.delete(taskID)
-                  if (part.state.status === "running" || part.state.status === "completed") {
-                    backgroundTasks.add(taskID)
-                  }
-                }
-              }
-
-              if (
-                part.type === "text" &&
-                part.synthetic &&
-                typeof part.metadata?.backgroundTaskID === "string" &&
-                (part.metadata.backgroundTaskState === "completed" || part.metadata.backgroundTaskState === "error")
-              ) {
-                backgroundTasks.delete(part.metadata.backgroundTaskID)
-              }
+              const backgroundUpdate = applyBackgroundTaskPart(backgroundTasks, part)
+              if (backgroundUpdate === "cancelled" && parentIdle && backgroundTasks.size === 0) break
 
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
                 if (emit("tool_use", { part })) continue
@@ -805,11 +799,9 @@ export const RunCommand = effectCmd({
               UI.error(err)
             }
 
-            if (
-              event.type === "session.status" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.status.type === "idle"
-            ) {
+            if (event.type === "session.status" && event.properties.sessionID === sessionID) {
+              parentIdle = event.properties.status.type === "idle"
+              if (!parentIdle) continue
               // Parent idle is a provider boundary, not proof that background Tasks have delivered their terminal events.
               if (backgroundTasks.size > 0) continue
               break
@@ -849,12 +841,23 @@ export const RunCommand = effectCmd({
 
         if (!interactive) {
           const events = await client.event.subscribe()
-          const completed = loop(client, events).catch((e) => {
+          const connected = await events.stream.next()
+          if (connected.done || connected.value.type !== "server.connected") {
+            throw new Error("Failed to subscribe to session events")
+          }
+          const [history, resident] = await Promise.all([
+            client.session.messages({ sessionID }, { throwOnError: true }),
+            client.v2.session.backgroundJobs({ sessionID }, { throwOnError: true }),
+          ])
+          const completed = loop(
+            client,
+            events,
+            reconcileBackgroundTasks(projectBackgroundTasks(history.data ?? []), resident.data.data),
+          ).catch((e) => {
             console.error(e)
             process.exitCode = 1
           })
           async function finish() {
-            if (args.attach) return
             const error = await completed
             if (error) process.exitCode = 1
           }

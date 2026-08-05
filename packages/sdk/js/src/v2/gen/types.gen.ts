@@ -1672,6 +1672,7 @@ export type PermissionConfig =
       list?: PermissionRuleConfig
       bash?: PermissionRuleConfig
       task?: PermissionRuleConfig
+      model_override?: PermissionRuleConfig
       external_directory?: PermissionRuleConfig
       todowrite?: PermissionActionConfig
       question?: PermissionActionConfig
@@ -2697,6 +2698,10 @@ export type InvalidCursorError = {
 
 export type SessionActive = {
   type: "running"
+}
+
+export type SessionBackgroundJobs = {
+  data: Array<string>
 }
 
 export type SessionNotFoundError = {
@@ -11438,6 +11443,41 @@ export type V2SessionActiveResponses = {
 }
 
 export type V2SessionActiveResponse = V2SessionActiveResponses[keyof V2SessionActiveResponses]
+
+export type V2SessionBackgroundJobsData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/background-job"
+}
+
+export type V2SessionBackgroundJobsErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+}
+
+export type V2SessionBackgroundJobsError = V2SessionBackgroundJobsErrors[keyof V2SessionBackgroundJobsErrors]
+
+export type V2SessionBackgroundJobsResponses = {
+  /**
+   * SessionBackgroundJobs
+   */
+  200: SessionBackgroundJobs
+}
+
+export type V2SessionBackgroundJobsResponse = V2SessionBackgroundJobsResponses[keyof V2SessionBackgroundJobsResponses]
 
 export type V2SessionGetData = {
   body?: never

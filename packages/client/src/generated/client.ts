@@ -9,6 +9,8 @@ import type {
   SessionsCreateInput,
   SessionsCreateOutput,
   SessionsActiveOutput,
+  SessionsBackgroundJobsInput,
+  SessionsBackgroundJobsOutput,
   SessionsGetInput,
   SessionsGetOutput,
   SessionsSwitchAgentInput,
@@ -328,6 +330,17 @@ export function make(options: ClientOptions) {
             path: `/api/session/active`,
             successStatus: 200,
             declaredStatuses: [401, 400],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
+      backgroundJobs: (input: SessionsBackgroundJobsInput, requestOptions?: RequestOptions) =>
+        request<{ readonly data: SessionsBackgroundJobsOutput }>(
+          {
+            method: "GET",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/background-job`,
+            successStatus: 200,
+            declaredStatuses: [400, 404, 401],
             empty: false,
           },
           requestOptions,

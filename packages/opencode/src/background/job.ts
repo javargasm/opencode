@@ -1,7 +1,9 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { BackgroundJob as CoreBackgroundJob } from "@opencode-ai/core/background-job"
-import { InstanceState } from "@/effect/instance-state"
-import { Effect, Layer } from "effect"
+import { InstanceRef } from "@/effect/instance-ref"
+import { registerDisposer } from "@/effect/instance-registry"
+import { Location } from "@opencode-ai/core/location"
+import { Context, Effect, Layer, Option, ScopedCache } from "effect"
 
 export {
   Service,
@@ -18,16 +20,28 @@ export {
 const layer = Layer.effect(
   CoreBackgroundJob.Service,
   Effect.gen(function* () {
-    const state = yield* InstanceState.make(() => CoreBackgroundJob.make)
+    const cache = yield* ScopedCache.make<string, CoreBackgroundJob.Interface>({
+      capacity: Number.POSITIVE_INFINITY,
+      lookup: () => CoreBackgroundJob.make,
+    })
+    const off = registerDisposer((directory) => Effect.runPromise(ScopedCache.invalidate(cache, directory)))
+    yield* Effect.addFinalizer(() => Effect.sync(off))
+    const use = <A>(select: (jobs: CoreBackgroundJob.Interface) => Effect.Effect<A>) =>
+      Effect.gen(function* () {
+        const instance = yield* InstanceRef
+        const location = Context.getOption(yield* Effect.context(), Location.Service)
+        const directory = instance?.directory ?? Option.getOrThrow(location).directory
+        return yield* select(yield* ScopedCache.get(cache, directory))
+      })
     return CoreBackgroundJob.Service.of({
-      list: () => InstanceState.useEffect(state, (jobs) => jobs.list()),
-      get: (id) => InstanceState.useEffect(state, (jobs) => jobs.get(id)),
-      start: (input) => InstanceState.useEffect(state, (jobs) => jobs.start(input)),
-      extend: (input) => InstanceState.useEffect(state, (jobs) => jobs.extend(input)),
-      wait: (input) => InstanceState.useEffect(state, (jobs) => jobs.wait(input)),
-      waitForPromotion: (id) => InstanceState.useEffect(state, (jobs) => jobs.waitForPromotion(id)),
-      promote: (id) => InstanceState.useEffect(state, (jobs) => jobs.promote(id)),
-      cancel: (id) => InstanceState.useEffect(state, (jobs) => jobs.cancel(id)),
+      list: () => use((jobs) => jobs.list()),
+      get: (id) => use((jobs) => jobs.get(id)),
+      start: (input) => use((jobs) => jobs.start(input)),
+      extend: (input) => use((jobs) => jobs.extend(input)),
+      wait: (input) => use((jobs) => jobs.wait(input)),
+      waitForPromotion: (id) => use((jobs) => jobs.waitForPromotion(id)),
+      promote: (id) => use((jobs) => jobs.promote(id)),
+      cancel: (id) => use((jobs) => jobs.cancel(id)),
     })
   }),
 )

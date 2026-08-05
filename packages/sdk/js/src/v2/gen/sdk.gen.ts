@@ -335,6 +335,8 @@ import type {
   V2ReferenceListResponses,
   V2SessionActiveErrors,
   V2SessionActiveResponses,
+  V2SessionBackgroundJobsErrors,
+  V2SessionBackgroundJobsResponses,
   V2SessionCompactErrors,
   V2SessionCompactResponses,
   V2SessionContextErrors,
@@ -5514,6 +5516,29 @@ export class Session3 extends HeyApiClient {
     return (options?.client ?? this.client).get<V2SessionActiveResponses, V2SessionActiveErrors, ThrowOnError>({
       url: "/api/session/active",
       ...options,
+    })
+  }
+
+  /**
+   * List background jobs
+   *
+   * Retrieve background Task entries for this parent that are resident in the current OpenCode process.
+   */
+  public backgroundJobs<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "sessionID" }] }])
+    return (options?.client ?? this.client).get<
+      V2SessionBackgroundJobsResponses,
+      V2SessionBackgroundJobsErrors,
+      ThrowOnError
+    >({
+      url: "/api/session/{sessionID}/background-job",
+      ...options,
+      ...params,
     })
   }
 

@@ -155,6 +155,23 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
       ),
     )
     .add(
+      HttpApiEndpoint.get("session.backgroundJobs", "/api/session/:sessionID/background-job", {
+        params: { sessionID: Session.ID },
+        success: Schema.Struct({ data: Schema.Array(Session.ID) }).annotate({
+          identifier: "SessionBackgroundJobs",
+        }),
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.backgroundJobs",
+            summary: "List background jobs",
+            description:
+              "Retrieve background Task entries for this parent that are resident in the current OpenCode process.",
+          }),
+        ),
+    )
+    .add(
       HttpApiEndpoint.get("session.get", "/api/session/:sessionID", {
         params: { sessionID: Session.ID },
         success: Schema.Struct({ data: Session.Info }),

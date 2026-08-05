@@ -146,14 +146,8 @@ const layer = Layer.effect(
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
-        wake: <E>(sessionID: SessionID, admission: Effect.Effect<void, E>) =>
-          state
-            .wake(
-              sessionID,
-              lastAssistant(sessionID),
-              admission.pipe(Effect.catch(Effect.die), Effect.andThen(runLoop(sessionID))),
-            )
-            .pipe(Effect.asVoid),
+        wake: (sessionID: SessionID) =>
+          state.wake(sessionID, lastAssistant(sessionID), runLoop(sessionID)).pipe(Effect.asVoid),
       } satisfies TaskPromptOps
     })
 

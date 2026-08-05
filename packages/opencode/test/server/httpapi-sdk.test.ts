@@ -19,6 +19,7 @@ import { MessageV2 } from "../../src/session/message-v2"
 
 import type { Config } from "@/config/config"
 import { Session as SessionNs } from "@/session/session"
+import { BackgroundJob } from "@/background/job"
 import { errorMessage } from "../../src/util/error"
 import { TestLLMServer } from "../lib/llm-server"
 import path from "path"
@@ -33,7 +34,14 @@ import { httpApiLayer } from "./httpapi-layer"
 
 const noopBootstrapLayer = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
 const appLayer = AppNodeBuilder.build(
-  LayerNode.group([FSUtil.node, CrossSpawnSpawner.node, InstanceStore.node, Database.node, SessionNs.node]),
+  LayerNode.group([
+    FSUtil.node,
+    CrossSpawnSpawner.node,
+    InstanceStore.node,
+    Database.node,
+    SessionNs.node,
+    BackgroundJob.node,
+  ]),
   [[InstanceStore.bootstrapNode, noopBootstrapLayer]],
 )
 const it = testEffect(Layer.mergeAll(appLayer, httpApiLayer))
@@ -54,6 +62,7 @@ type TestServices =
   | ChildProcessSpawner.ChildProcessSpawner
   | InstanceStore.Service
   | SessionNs.Service
+  | BackgroundJob.Service
   | HttpServer.HttpServer
 type TestScope = Scope.Scope | TestServices
 
@@ -616,6 +625,55 @@ describe("HttpApi SDK", () => {
         }
       }),
     ),
+  )
+
+  httpapiInstance(
+    "lists resident background task jobs for the requested parent session",
+    { serverPath: "raw", setup: writeStandardFiles },
+    ({ sdk }) =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const create = (title: string, parentID?: string) =>
+          call(() => sdk.session.create({ title, parentID })).pipe(
+            Effect.map((result) => SessionID.make(String(result.data?.id))),
+          )
+        const parentID = yield* create("parent")
+        const foreignParentID = yield* create("foreign parent")
+        const runningID = yield* create("running child", parentID)
+        const completedID = yield* create("completed child", parentID)
+        const foreignID = yield* create("foreign child", foreignParentID)
+        const foregroundID = yield* create("foreground child", parentID)
+
+        yield* jobs.start({
+          id: runningID,
+          type: "task",
+          metadata: { parentSessionId: parentID, sessionId: runningID, background: true },
+          run: Effect.never,
+        })
+        yield* jobs.start({
+          id: completedID,
+          type: "task",
+          metadata: { parentSessionId: parentID, sessionId: completedID, background: true },
+          run: Effect.succeed("done"),
+        })
+        yield* jobs.wait({ id: completedID })
+        yield* jobs.start({
+          id: foreignID,
+          type: "task",
+          metadata: { parentSessionId: foreignParentID, sessionId: foreignID, background: true },
+          run: Effect.never,
+        })
+        yield* jobs.start({
+          id: foregroundID,
+          type: "task",
+          metadata: { parentSessionId: parentID, sessionId: foregroundID, background: false },
+          run: Effect.never,
+        })
+
+        const result = yield* call(() => sdk.v2.session.backgroundJobs({ sessionID: parentID }))
+
+        expect(result.data?.data.toSorted()).toEqual([completedID, runningID].toSorted())
+      }),
   )
 
   serverPathParity("matches generated SDK session message and part routes", (serverPath) =>

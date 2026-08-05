@@ -1,4 +1,5 @@
 import { SessionV2 } from "@opencode-ai/core/session"
+import { BackgroundJob } from "@opencode-ai/core/background-job"
 import { DateTime, Effect, Stream } from "effect"
 import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
 import { Api } from "../api"
@@ -19,6 +20,7 @@ const DefaultSessionHistoryLimit = 50
 export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handlers) =>
   Effect.gen(function* () {
     const session = yield* SessionV2.Service
+    const background = yield* BackgroundJob.Service
 
     return handlers
       .handle(
@@ -84,6 +86,25 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
             data: Object.fromEntries(
               Array.from(yield* session.active, (sessionID) => [sessionID, { type: "running" as const }]),
             ),
+          }
+        }),
+      )
+      .handle(
+        "session.backgroundJobs",
+        Effect.fn(function* (ctx) {
+          return {
+            data: (yield* background.list()).flatMap((job) => {
+              const sessionID = job.metadata?.sessionId
+              if (
+                job.type !== "task" ||
+                job.metadata?.background !== true ||
+                job.metadata.parentSessionId !== ctx.params.sessionID ||
+                typeof sessionID !== "string" ||
+                sessionID !== job.id
+              )
+                return []
+              return [SessionV2.ID.make(sessionID)]
+            }),
           }
         }),
       )

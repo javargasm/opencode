@@ -329,6 +329,10 @@ export type SessionsCreateOutput = {
 
 export type SessionsActiveOutput = { readonly data: { readonly [x: string]: { readonly type: "running" } } }["data"]
 
+export type SessionsBackgroundJobsInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
+
+export type SessionsBackgroundJobsOutput = { readonly data: ReadonlyArray<string> }["data"]
+
 export type SessionsGetInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
 export type SessionsGetOutput = {
