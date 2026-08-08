@@ -10,7 +10,10 @@ export function applyBackgroundTaskPart(tasks: BackgroundTasks, input: unknown):
     const metadata = record(state?.metadata)
     const taskID = text(metadata?.sessionId)
     const generation = text(metadata?.backgroundTaskGeneration)
+    const backgroundState = text(metadata?.backgroundTaskState)
     if (metadata?.background !== true || !taskID) return undefined
+
+    if (backgroundState === "waiting") return undefined
 
     if (state?.status === "running" || state?.status === "completed") {
       tasks.set(taskID, generation)
@@ -47,10 +50,10 @@ export function projectBackgroundTasks(input: unknown) {
   return tasks
 }
 
-export function reconcileBackgroundTasks(tasks: BackgroundTasks, residentTaskIDs: readonly string[]) {
-  const resident = new Set(residentTaskIDs)
+export function reconcileBackgroundTasks(tasks: BackgroundTasks, durableTaskIDs: readonly string[]) {
+  const durable = new Set(durableTaskIDs)
   for (const taskID of tasks.keys()) {
-    if (!resident.has(taskID)) tasks.delete(taskID)
+    if (!durable.has(taskID)) tasks.delete(taskID)
   }
   return tasks
 }

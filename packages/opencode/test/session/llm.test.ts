@@ -333,6 +333,20 @@ describe("session.llm.ai-sdk adapter", () => {
     ).toEqual([])
   })
 
+  test("preserves structured raw errors when AI SDK flattens them", async () => {
+    const raw = { error: { type: "server_error", code: "server_error", message: "xxx" } }
+    const state = LLMAISDK.adapterState()
+    const exit = await Effect.runPromise(
+      Effect.forEach(
+        [uncheckedAdapterEvent({ type: "raw", rawValue: raw }), uncheckedAdapterEvent({ type: "error", error: "xxx" })],
+        (event) => LLMAISDK.toLLMEvents(state, event),
+      ).pipe(Effect.exit),
+    )
+
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toEqual(raw)
+  })
+
   test("preserves tool-error cause", async () => {
     const error = new PermissionV1.RejectedError()
     const events = await Effect.runPromise(

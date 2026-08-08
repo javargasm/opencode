@@ -845,14 +845,14 @@ export const RunCommand = effectCmd({
           if (connected.done || connected.value.type !== "server.connected") {
             throw new Error("Failed to subscribe to session events")
           }
-          const [history, resident] = await Promise.all([
+          const [history, durable] = await Promise.all([
             client.session.messages({ sessionID }, { throwOnError: true }),
             client.v2.session.backgroundJobs({ sessionID }, { throwOnError: true }),
           ])
           const completed = loop(
             client,
             events,
-            reconcileBackgroundTasks(projectBackgroundTasks(history.data ?? []), resident.data.data),
+            reconcileBackgroundTasks(projectBackgroundTasks(history.data ?? []), durable.data.data),
           ).catch((e) => {
             console.error(e)
             process.exitCode = 1

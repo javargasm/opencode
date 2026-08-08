@@ -32,6 +32,29 @@ describe("BackgroundTaskExecution", () => {
     }),
   )
 
+  it.live("lists durable executions for a parent after settlement", () =>
+    Effect.gen(function* () {
+      const ids = yield* seed()
+      const owner = yield* BackgroundTaskExecution.make({ ownerID: "runtime-a" })
+      yield* owner.claim(claim(ids, "generation-1"))
+      yield* owner.settle({
+        sessionID: ids.child,
+        generation: "generation-1",
+        state: "completed",
+        output: "durable result",
+      })
+
+      expect(yield* owner.listForParent(ids.parent)).toEqual([
+        expect.objectContaining({
+          sessionID: ids.child,
+          generation: "generation-1",
+          state: "completed",
+          output: "durable result",
+        }),
+      ])
+    }),
+  )
+
   it.live("makes a remote cancellation request observable to the owner", () =>
     Effect.gen(function* () {
       const ids = yield* seed()
@@ -165,7 +188,7 @@ describe("BackgroundTaskExecution", () => {
     }),
   )
 
-  it.live("does not schedule a parent wake for a foreground terminal", () =>
+  it.live("recovers an undelivered foreground terminal without scheduling a parent wake", () =>
     Effect.gen(function* () {
       const ids = yield* seed()
       const owner = yield* BackgroundTaskExecution.make({ ownerID: "runtime-a" })
@@ -177,7 +200,13 @@ describe("BackgroundTaskExecution", () => {
         output: "done",
       })
 
-      expect(yield* owner.pendingTerminals(ids.parent)).toEqual([])
+      expect(yield* owner.pendingTerminals(ids.parent)).toEqual([
+        expect.objectContaining({
+          sessionID: ids.child,
+          wakeRequired: false,
+          terminalDeliveredAt: undefined,
+        }),
+      ])
       yield* owner.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
       yield* owner.completeDelivery({ sessionID: ids.child, generation: "generation-1" })
 
@@ -215,6 +244,41 @@ describe("BackgroundTaskExecution", () => {
         status: "claimed",
         info: { generation: "generation-2" },
       })
+    }),
+  )
+
+  it.live("replaces an active terminal wake only after observing its delivered message", () =>
+    Effect.gen(function* () {
+      const ids = yield* seed()
+      const first = yield* BackgroundTaskExecution.make({ ownerID: "runtime-a" })
+      const second = yield* BackgroundTaskExecution.make({ ownerID: "runtime-b" })
+      yield* first.claim({ ...claim(ids, "generation-1"), wakeRequired: true })
+      const terminal = yield* first.settle({
+        sessionID: ids.child,
+        generation: "generation-1",
+        state: "completed",
+        output: "done",
+      })
+      if (!terminal) throw new Error("terminal execution missing")
+      yield* first.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
+      yield* first.completeDelivery({ sessionID: ids.child, generation: "generation-1" })
+      expect(yield* first.claimWake({ sessionID: ids.child, generation: "generation-1" })).toBe(true)
+
+      expect(
+        yield* second.claimAfterObservedTerminal({
+          ...claim(ids, "generation-2"),
+          wakeRequired: true,
+          observedDeliveryMessageID: MessageID.ascending(),
+        }),
+      ).toMatchObject({ status: "terminal", info: { generation: "generation-1" } })
+      expect(
+        yield* second.claimAfterObservedTerminal({
+          ...claim(ids, "generation-2"),
+          wakeRequired: true,
+          observedDeliveryMessageID: terminal.delivery.messageID,
+        }),
+      ).toMatchObject({ status: "claimed", info: { generation: "generation-2", state: "running" } })
+      expect(yield* first.completeWake({ sessionID: ids.child, generation: "generation-1" })).toBe(false)
     }),
   )
 

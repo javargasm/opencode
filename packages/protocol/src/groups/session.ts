@@ -167,7 +167,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
             identifier: "v2.session.backgroundJobs",
             summary: "List background jobs",
             description:
-              "Retrieve background Task entries for this parent that are resident in the current OpenCode process.",
+              "Retrieve durable background Task entries for this parent, including terminal tasks recovered after a process restart.",
           }),
         ),
     )

@@ -20,6 +20,7 @@ import { MessageV2 } from "../../src/session/message-v2"
 import type { Config } from "@/config/config"
 import { Session as SessionNs } from "@/session/session"
 import { BackgroundJob } from "@/background/job"
+import { BackgroundTaskExecution } from "@/background/task-execution"
 import { errorMessage } from "../../src/util/error"
 import { TestLLMServer } from "../lib/llm-server"
 import path from "path"
@@ -41,6 +42,7 @@ const appLayer = AppNodeBuilder.build(
     Database.node,
     SessionNs.node,
     BackgroundJob.node,
+    BackgroundTaskExecution.node,
   ]),
   [[InstanceStore.bootstrapNode, noopBootstrapLayer]],
 )
@@ -63,6 +65,7 @@ type TestServices =
   | InstanceStore.Service
   | SessionNs.Service
   | BackgroundJob.Service
+  | BackgroundTaskExecution.Service
   | HttpServer.HttpServer
 type TestScope = Scope.Scope | TestServices
 
@@ -628,11 +631,11 @@ describe("HttpApi SDK", () => {
   )
 
   httpapiInstance(
-    "lists resident background task jobs for the requested parent session",
+    "lists durable background task jobs for the requested parent session",
     { serverPath: "raw", setup: writeStandardFiles },
     ({ sdk }) =>
       Effect.gen(function* () {
-        const jobs = yield* BackgroundJob.Service
+        const executions = yield* BackgroundTaskExecution.Service
         const create = (title: string, parentID?: string) =>
           call(() => sdk.session.create({ title, parentID })).pipe(
             Effect.map((result) => SessionID.make(String(result.data?.id))),
@@ -644,31 +647,25 @@ describe("HttpApi SDK", () => {
         const foreignID = yield* create("foreign child", foreignParentID)
         const foregroundID = yield* create("foreground child", parentID)
 
-        yield* jobs.start({
-          id: runningID,
-          type: "task",
-          metadata: { parentSessionId: parentID, sessionId: runningID, background: true },
-          run: Effect.never,
+        const claim = (sessionID: SessionID, parentSessionID: SessionID, generation: string, wakeRequired: boolean) =>
+          executions.claim({
+            sessionID,
+            parentSessionID,
+            generation,
+            description: generation,
+            parentMessageID: MessageID.ascending(),
+            wakeRequired,
+          })
+        yield* claim(runningID, parentID, "running", true)
+        yield* claim(completedID, parentID, "completed", true)
+        yield* executions.settle({
+          sessionID: completedID,
+          generation: "completed",
+          state: "completed",
+          output: "done",
         })
-        yield* jobs.start({
-          id: completedID,
-          type: "task",
-          metadata: { parentSessionId: parentID, sessionId: completedID, background: true },
-          run: Effect.succeed("done"),
-        })
-        yield* jobs.wait({ id: completedID })
-        yield* jobs.start({
-          id: foreignID,
-          type: "task",
-          metadata: { parentSessionId: foreignParentID, sessionId: foreignID, background: true },
-          run: Effect.never,
-        })
-        yield* jobs.start({
-          id: foregroundID,
-          type: "task",
-          metadata: { parentSessionId: parentID, sessionId: foregroundID, background: false },
-          run: Effect.never,
-        })
+        yield* claim(foreignID, foreignParentID, "foreign", true)
+        yield* claim(foregroundID, parentID, "foreground", false)
 
         const result = yield* call(() => sdk.v2.session.backgroundJobs({ sessionID: parentID }))
 

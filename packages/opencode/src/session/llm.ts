@@ -291,8 +291,10 @@ const live: Layer.Layer<
               }),
             )
           },
-          // Copilot returns the authoritative billed amount only in provider-specific response fields.
-          includeRawChunks: input.model.providerID.includes("github-copilot"),
+          // Copilot returns billed usage in raw chunks; OpenAI variants expose structured stream errors there.
+          includeRawChunks:
+            ["@ai-sdk/openai", "@ai-sdk/openai-compatible"].includes(input.model.api.npm) ||
+            input.model.providerID.includes("github-copilot"),
           async experimental_repairToolCall(failed) {
             const lower = failed.toolCall.toolName.toLowerCase()
             if (lower !== failed.toolCall.toolName && prepared.tools[lower]) {

@@ -95,6 +95,26 @@ function defer<T>() {
   return { promise, resolve }
 }
 
+const waitForTerminalExecution = Effect.fn("TaskToolTest.waitForTerminalExecution")(function* (sessionID: SessionID) {
+  const executions = yield* BackgroundTaskExecution.Service
+  const deadline = Date.now() + 1_000
+  while (true) {
+    const execution = yield* executions.get(sessionID)
+    if (execution && execution.state !== "running") return execution
+    if (Date.now() >= deadline) return yield* Effect.fail(new Error(`task ${sessionID} did not settle`))
+    yield* Effect.sleep("5 millis")
+  }
+})
+
+const waitForJobEviction = Effect.fn("TaskToolTest.waitForJobEviction")(function* (id: string) {
+  const jobs = yield* BackgroundJob.Service
+  const deadline = Date.now() + 1_000
+  while (yield* jobs.get(id)) {
+    if (Date.now() >= deadline) return yield* Effect.fail(new Error(`task ${id} was not evicted`))
+    yield* Effect.sleep("5 millis")
+  }
+})
+
 const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
   const session = yield* Session.Service
   const chat = yield* session.create({ title })
@@ -498,7 +518,6 @@ describe("tool.task", () => {
     "uses an explicit model override in background after requesting permission before task permission",
     () =>
       Effect.gen(function* () {
-        const jobs = yield* BackgroundJob.Service
         const { chat, assistant } = yield* seed()
         const tool = yield* TaskTool
         const def = yield* tool.init()
@@ -531,7 +550,7 @@ describe("tool.task", () => {
 
         expect(`${result.metadata.model.providerID}/${result.metadata.model.modelID}`).toBe("test/override")
         const prompt = yield* Effect.promise(() => ready.promise)
-        expect((yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })).info?.status).toBe("completed")
+        expect((yield* waitForTerminalExecution(result.metadata.sessionId)).state).toBe("completed")
 
         expect(calls).toEqual([
           {
@@ -562,7 +581,6 @@ describe("tool.task", () => {
   background.instance("propagates an explicit model variant to the child session and prompt", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
-      const jobs = yield* BackgroundJob.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -587,7 +605,7 @@ describe("tool.task", () => {
       )
 
       const prompt = yield* Effect.promise(() => ready.promise)
-      yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+      yield* waitForTerminalExecution(result.metadata.sessionId)
       const child = yield* sessions.get(result.metadata.sessionId)
 
       expect(child?.model?.variant).toBe("high")
@@ -1490,7 +1508,7 @@ describe("tool.task", () => {
       expect(runs).toBe(1)
 
       yield* Deferred.succeed(done, undefined)
-      expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe("background done")
+      expect((yield* waitForTerminalExecution(result.metadata.sessionId)).output).toBe("background done")
       expect((yield* Deferred.await(injected)).parts[0]?.type).toBe("text")
       expect(runs).toBe(1)
     }),
@@ -1626,6 +1644,89 @@ describe("tool.task", () => {
       expect(result.metadata.background).toBeUndefined()
       expect(result.output).toContain(`state="completed"`)
       expect((yield* sessions.get(result.metadata.sessionId)).parentID).toBe(chat.id)
+    }),
+  )
+
+  background.instance("waits for descendant handoffs and returns the latest child response", () =>
+    Effect.gen(function* () {
+      const executions = yield* BackgroundTaskExecution.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const ready = yield* Deferred.make<{ parentID: SessionID; sessionID: SessionID; generation: string }>()
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) return Effect.succeed(reply(input, "notified"))
+          return Effect.gen(function* () {
+            const descendant = yield* sessions.create({ parentID: input.sessionID, title: "nested review" })
+            const generation = "nested-generation"
+            yield* executions.claim({
+              sessionID: descendant.id,
+              parentSessionID: input.sessionID,
+              generation,
+              description: descendant.title,
+              parentMessageID: input.messageID ?? MessageID.ascending(),
+              wakeRequired: true,
+            })
+            yield* Deferred.succeed(ready, { parentID: input.sessionID, sessionID: descendant.id, generation })
+            return reply(input, "review still in progress")
+          })
+        },
+      }
+      const fiber = yield* def
+        .execute(
+          {
+            description: "complete nested review",
+            prompt: "review everything",
+            subagent_type: "general",
+            background: false,
+          },
+          taskContext(chat.id, assistant.id, promptOps),
+        )
+        .pipe(Effect.forkChild)
+      const descendant = yield* Deferred.await(ready)
+
+      expect((yield* Fiber.await(fiber).pipe(Effect.timeoutOption("20 millis")))._tag).toBe("None")
+      const terminal = yield* executions.settle({
+        sessionID: descendant.sessionID,
+        generation: descendant.generation,
+        state: "completed",
+        output: "nested done",
+      })
+      if (!terminal) throw new Error("nested terminal missing")
+      yield* executions.claimDelivery({ sessionID: descendant.sessionID, generation: descendant.generation })
+      yield* executions.completeDelivery({ sessionID: descendant.sessionID, generation: descendant.generation })
+      expect(yield* executions.claimWake({ sessionID: descendant.sessionID, generation: descendant.generation })).toBe(
+        true,
+      )
+      const time = Date.now()
+      const final = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: terminal.delivery.messageID,
+        sessionID: descendant.parentID,
+        mode: "general",
+        agent: "general",
+        finish: "stop",
+        time: { created: time, completed: time },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: final.id,
+        sessionID: final.sessionID,
+        type: "text",
+        text: "final response after descendants",
+      })
+      yield* executions.completeWake({ sessionID: descendant.sessionID, generation: descendant.generation })
+
+      const result = yield* Fiber.join(fiber).pipe(Effect.timeout("1 second"))
+      expect(result.output).toContain("final response after descendants")
+      expect(yield* executions.get(descendant.parentID)).toMatchObject({
+        state: "completed",
+        output: "final response after descendants",
+      })
     }),
   )
 
@@ -2189,7 +2290,6 @@ describe("tool.task", () => {
   background.instance("preserves a real background failure as error and allows a durable relaunch", () =>
     Effect.gen(function* () {
       const executions = yield* BackgroundTaskExecution.Service
-      const jobs = yield* BackgroundJob.Service
       const runState = yield* SessionRunState.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
@@ -2221,7 +2321,7 @@ describe("tool.task", () => {
         },
         context,
       )
-      expect((yield* jobs.wait({ id: failed.metadata.sessionId, timeout: 1_000 })).info?.status).toBe("error")
+      expect((yield* waitForTerminalExecution(failed.metadata.sessionId)).state).toBe("error")
       const event = yield* Deferred.await(terminal).pipe(Effect.timeout("1 second"))
       yield* Deferred.await(woke).pipe(Effect.timeout("1 second"))
 
@@ -2883,7 +2983,6 @@ describe("tool.task", () => {
     "background extension keeps the child model and variant across both dispatches",
     () =>
       Effect.gen(function* () {
-        const jobs = yield* BackgroundJob.Service
         const { chat, assistant } = yield* seed()
         const tool = yield* TaskTool
         const def = yield* tool.init()
@@ -2932,7 +3031,7 @@ describe("tool.task", () => {
         expect(first.model).toEqual(second.model)
         expect(first.variant).toBe("high")
         expect(second.variant).toBe("high")
-        expect((yield* jobs.wait({ id: started.metadata.sessionId, timeout: 1_000 })).info?.status).toBe("completed")
+        expect((yield* waitForTerminalExecution(started.metadata.sessionId)).state).toBe("completed")
       }),
     { config: { agent: { general: { model: "test/configured", variant: "high" } } } },
   )
@@ -3008,9 +3107,9 @@ describe("tool.task", () => {
       ])
 
       second.resolve()
-      const waited = yield* jobs.wait({ id: started.metadata.sessionId, timeout: 1_000 })
-      expect(waited.info?.status).toBe("completed")
-      expect(waited.info?.output).toBe("second done")
+      const terminal = yield* waitForTerminalExecution(started.metadata.sessionId)
+      expect(terminal.state).toBe("completed")
+      expect(terminal.output).toBe("second done")
       const notification = yield* Effect.promise(() => injected.promise)
       expect(notification.variant).toBe("xhigh")
       expect(notification.parts[0]?.type).toBe("text")
@@ -3018,12 +3117,14 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("background tasks complete through the background job service", () =>
+  background.instance("background tasks persist results before evicting the terminal job", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
+      const executions = yield* BackgroundTaskExecution.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
+      const delivered = defer<void>()
 
       const result = yield* def.execute(
         {
@@ -3037,23 +3138,32 @@ describe("tool.task", () => {
           messageID: assistant.id,
           agent: "build",
           abort: new AbortController().signal,
-          extra: { promptOps: stubOps({ text: "background done" }) },
+          extra: {
+            promptOps: {
+              ...stubOps({ text: "background done" }),
+              prompt: (input) =>
+                input.sessionID === chat.id
+                  ? Effect.sync(() => delivered.resolve()).pipe(Effect.as(reply(input, "notified")))
+                  : Effect.succeed(reply(input, "background done")),
+            } satisfies TaskPromptOps,
+          },
           messages: [],
           metadata: () => Effect.void,
           ask: () => Effect.void,
         },
       )
 
-      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
-      expect(waited.timedOut).toBe(false)
-      expect(waited.info?.status).toBe("completed")
-      expect(waited.info?.output).toBe("background done")
+      yield* Effect.promise(() => delivered.promise)
+      expect(yield* executions.get(result.metadata.sessionId)).toMatchObject({
+        state: "completed",
+        output: "background done",
+      })
+      expect(yield* jobs.get(result.metadata.sessionId)).toBeUndefined()
     }),
   )
 
   background.instance("background task completion does not wait for the parent async prompt", () =>
     Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -3083,15 +3193,13 @@ describe("tool.task", () => {
         },
       )
 
-      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
-      expect(waited.timedOut).toBe(false)
-      expect(waited.info?.status).toBe("completed")
+      expect((yield* waitForTerminalExecution(result.metadata.sessionId)).state).toBe("completed")
     }),
   )
 
-  background.instance("removing the parent session cancels running background tasks", () =>
+  background.instance("removing the parent session cancels and evicts running background tasks", () =>
     Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
+      const executions = yield* BackgroundTaskExecution.Service
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
@@ -3122,15 +3230,14 @@ describe("tool.task", () => {
       )
 
       yield* sessions.remove(chat.id)
-      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
-      expect(waited.timedOut).toBe(false)
-      expect(waited.info?.status).toBe("cancelled")
+      yield* waitForJobEviction(result.metadata.sessionId)
+      expect(yield* executions.get(result.metadata.sessionId)).toBeUndefined()
     }),
   )
 
-  background.instance("removing the child task session cancels its running background task", () =>
+  background.instance("removing the child task session cancels and evicts its running background task", () =>
     Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
+      const executions = yield* BackgroundTaskExecution.Service
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
@@ -3161,15 +3268,13 @@ describe("tool.task", () => {
       )
 
       yield* sessions.remove(result.metadata.sessionId)
-      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
-      expect(waited.timedOut).toBe(false)
-      expect(waited.info?.status).toBe("cancelled")
+      yield* waitForJobEviction(result.metadata.sessionId)
+      expect(yield* executions.get(result.metadata.sessionId)).toBeUndefined()
     }),
   )
 
   background.instance("cancelling the parent run cancels running background tasks", () =>
     Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
       const runState = yield* SessionRunState.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
@@ -3209,9 +3314,7 @@ describe("tool.task", () => {
       )
 
       yield* runState.cancel(chat.id)
-      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
-      expect(waited.timedOut).toBe(false)
-      expect(waited.info?.status).toBe("cancelled")
+      expect((yield* waitForTerminalExecution(result.metadata.sessionId)).state).toBe("cancelled")
       const admitted = yield* Deferred.await(terminal).pipe(Effect.timeout("1 second"))
       expect(admitted.parts[0]).toEqual(
         expect.objectContaining({
@@ -3314,7 +3417,6 @@ describe("tool.task", () => {
 
   background.instance("task_stop allows a cancelled task to relaunch with the same task_id", () =>
     Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
       const runState = yield* SessionRunState.Service
       const { chat, assistant } = yield* seed()
       const task = yield* TaskTool
@@ -3347,7 +3449,7 @@ describe("tool.task", () => {
       )
 
       yield* stopDef.execute({ task_ids: [started.metadata.sessionId] }, context)
-      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("cancelled")
+      expect((yield* waitForTerminalExecution(started.metadata.sessionId)).state).toBe("cancelled")
       const cancelled = yield* Deferred.await(terminal).pipe(Effect.timeout("1 second"))
       expect(cancelled.parts[0]).toEqual(
         expect.objectContaining({
@@ -3373,18 +3475,18 @@ describe("tool.task", () => {
         },
         context,
       )
-      const waited = yield* jobs.wait({ id: restarted.metadata.sessionId, timeout: 1_000 })
+      const terminalExecution = yield* waitForTerminalExecution(restarted.metadata.sessionId)
 
       expect(restarted.metadata.sessionId).toBe(started.metadata.sessionId)
       expect(typeof restarted.metadata.backgroundTaskGeneration).toBe("string")
       expect(restarted.metadata.backgroundTaskGeneration).not.toBe(started.metadata.backgroundTaskGeneration)
-      expect(waited.info?.status).toBe("completed")
-      expect(waited.info?.output).toBe("restarted")
+      expect(terminalExecution.state).toBe("completed")
+      expect(terminalExecution.output).toBe("restarted")
       expect(wakes).toBe(1)
     }),
   )
 
-  background.instance("blocks relaunch until the cancelled terminal delivery completes", () =>
+  background.instance("waits for cancelled terminal delivery before relaunch", () =>
     Effect.gen(function* () {
       const executions = yield* BackgroundTaskExecution.Service
       const jobs = yield* BackgroundJob.Service
@@ -3416,8 +3518,10 @@ describe("tool.task", () => {
         task_id: started.metadata.sessionId,
       } as const
       const context = { ...taskContext(chat.id, assistant.id, promptOps), callID: "call-2" }
-      const blocked = yield* def.execute(retry, context).pipe(Effect.exit)
-      expect(Exit.isFailure(blocked)).toBe(true)
+      const waiting = yield* def.execute(retry, context)
+      expect(waiting.metadata.background).toBe(true)
+      expect(waiting.output).toContain("Another OpenCode process is delivering this task result")
+      expect(waiting.output).toContain("do not relaunch it")
 
       releaseTerminal.resolve()
       const deadline = Date.now() + 1_000
@@ -3573,7 +3677,7 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("does not relaunch while another runtime owns the prior terminal delivery", () =>
+  background.instance("waits when another runtime owns the prior terminal delivery", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const sessions = yield* Session.Service
@@ -3610,9 +3714,75 @@ describe("tool.task", () => {
         )
         .pipe(Effect.exit)
 
-      expect(Exit.isFailure(exit)).toBe(true)
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) {
+        expect(exit.value.metadata.background).toBe(true)
+        expect(exit.value.output).toContain("Another OpenCode process is delivering this task result")
+        expect(exit.value.output).toContain("do not relaunch it")
+      }
       expect((yield* remote.get(child.id))?.generation).toBe("remote-generation")
       expect(yield* jobs.get(child.id)).toBeUndefined()
+    }),
+  )
+
+  background.instance("restarts from the assistant consuming a terminal while its wake is active", () =>
+    Effect.gen(function* () {
+      const executions = yield* BackgroundTaskExecution.Service
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "causal retry" })
+      yield* executions.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation: "old-generation",
+        description: child.title,
+        parentMessageID: assistant.id,
+        wakeRequired: true,
+      })
+      const terminal = yield* executions.settle({
+        sessionID: child.id,
+        generation: "old-generation",
+        state: "completed",
+        output: "incomplete",
+      })
+      if (!terminal) throw new Error("terminal execution missing")
+      yield* executions.claimDelivery({ sessionID: child.id, generation: terminal.generation })
+      yield* executions.completeDelivery({ sessionID: child.id, generation: terminal.generation })
+      expect(yield* executions.claimWake({ sessionID: child.id, generation: terminal.generation })).toBe(true)
+      const causal = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: terminal.delivery.messageID,
+        time: { created: Date.now() },
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const result = yield* def.execute(
+        {
+          description: "complete causal retry",
+          prompt: "finish the result",
+          subagent_type: "general",
+          background: true,
+          task_id: child.id,
+        },
+        {
+          ...taskContext(chat.id, causal.id, {
+            ...stubOps(),
+            prompt: (input) => (input.sessionID === child.id ? Effect.never : Effect.succeed(reply(input, "notified"))),
+          }),
+          callID: "causal-retry",
+        },
+      )
+
+      expect(result.output).toContain("Background task started")
+      expect(result.metadata.backgroundTaskGeneration).toBe(`${causal.id}:causal-retry`)
+      expect(yield* executions.get(child.id)).toMatchObject({
+        generation: `${causal.id}:causal-retry`,
+        state: "running",
+      })
+      expect(yield* executions.completeWake({ sessionID: child.id, generation: terminal.generation })).toBe(false)
+      yield* jobs.cancel(child.id)
     }),
   )
 })

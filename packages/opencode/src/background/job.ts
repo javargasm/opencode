@@ -2,6 +2,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { BackgroundJob as CoreBackgroundJob } from "@opencode-ai/core/background-job"
 import { InstanceRef } from "@/effect/instance-ref"
 import { registerDisposer } from "@/effect/instance-registry"
+import { BackgroundTaskExecution } from "@/background/task-execution"
+import { SessionID } from "@/session/schema"
 import { Location } from "@opencode-ai/core/location"
 import { Context, Effect, Layer, Option, ScopedCache } from "effect"
 
@@ -20,6 +22,7 @@ export {
 const layer = Layer.effect(
   CoreBackgroundJob.Service,
   Effect.gen(function* () {
+    const executions = yield* BackgroundTaskExecution.Service
     const cache = yield* ScopedCache.make<string, CoreBackgroundJob.Interface>({
       capacity: Number.POSITIVE_INFINITY,
       lookup: () => CoreBackgroundJob.make,
@@ -35,6 +38,18 @@ const layer = Layer.effect(
       })
     return CoreBackgroundJob.Service.of({
       list: () => use((jobs) => jobs.list()),
+      listForParent: (parentSessionID) =>
+        use((jobs) =>
+          Effect.gen(function* () {
+            const [resident, durable] = yield* Effect.all([
+              jobs.listForParent(parentSessionID),
+              executions.listForParent(SessionID.make(parentSessionID)),
+            ])
+            return [
+              ...new Set([...resident, ...durable.filter((task) => task.wakeRequired).map((task) => task.sessionID)]),
+            ].toSorted()
+          }),
+        ),
       get: (id) => use((jobs) => jobs.get(id)),
       start: (input) => use((jobs) => jobs.start(input)),
       extend: (input) => use((jobs) => jobs.extend(input)),
@@ -42,10 +57,11 @@ const layer = Layer.effect(
       waitForPromotion: (id) => use((jobs) => jobs.waitForPromotion(id)),
       promote: (id) => use((jobs) => jobs.promote(id)),
       cancel: (id) => use((jobs) => jobs.cancel(id)),
+      evict: (id) => use((jobs) => jobs.evict(id)),
     })
   }),
 )
 
-export const node = LayerNode.make({ service: CoreBackgroundJob.Service, layer, deps: [] })
+export const node = LayerNode.make({ service: CoreBackgroundJob.Service, layer, deps: [BackgroundTaskExecution.node] })
 
 export * as BackgroundJob from "./job"

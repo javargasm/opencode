@@ -53,6 +53,9 @@ export interface Interface {
   readonly ownerID: string
   readonly leaseMillis: number
   readonly claim: (input: ClaimInput) => Effect.Effect<ClaimResult>
+  readonly claimAfterObservedTerminal: (
+    input: ClaimInput & { observedDeliveryMessageID: MessageID },
+  ) => Effect.Effect<ClaimResult>
   readonly heartbeat: (input: {
     sessionID: SessionID
     generation: string
@@ -68,6 +71,8 @@ export interface Interface {
   readonly claimFollowup: (input: { sessionID: SessionID; generation: string }) => Effect.Effect<FollowupClaim>
   readonly get: (sessionID: SessionID) => Effect.Effect<Info | undefined>
   readonly list: (input: { projectID: ProjectV2.ID; directory: string }) => Effect.Effect<Info[]>
+  readonly listForParent: (parentSessionID: SessionID) => Effect.Effect<Info[]>
+  readonly listPendingHandoffs: (parentSessionID: SessionID) => Effect.Effect<Info[]>
   readonly listRunning: (parentSessionID?: SessionID) => Effect.Effect<Info[]>
   readonly pendingTerminals: (sessionID?: SessionID) => Effect.Effect<Info[]>
   readonly claimDelivery: (input: { sessionID: SessionID; generation: string }) => Effect.Effect<Info | undefined>
@@ -151,23 +156,68 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
         .filter(isInfo)
     })
 
+    const claimValues = (input: ClaimInput, time: number) => ({
+      session_id: input.sessionID,
+      parent_session_id: input.parentSessionID,
+      generation: input.generation,
+      owner_id: ownerID,
+      state: "running" as const,
+      description: input.description,
+      parent_message_id: input.parentMessageID,
+      parent_variant: input.parentVariant,
+      lease_expires_at: time + leaseMillis,
+      delivery: { messageID: MessageID.ascending(), partID: PartID.ascending() },
+      wake_required: input.wakeRequired ?? true,
+      time_created: time,
+      time_updated: time,
+    })
+
+    const replace = Effect.fn("BackgroundTaskExecution.replace")(function* (
+      current: Info,
+      values: ReturnType<typeof claimValues>,
+      allowPendingWake: boolean,
+    ) {
+      const base = [
+        eq(BackgroundTaskExecutionTable.session_id, current.sessionID),
+        eq(BackgroundTaskExecutionTable.generation, current.generation),
+        eq(BackgroundTaskExecutionTable.state, current.state),
+        isNotNull(BackgroundTaskExecutionTable.terminal_delivered_at),
+      ]
+      const condition = allowPendingWake
+        ? and(...base)
+        : and(
+            ...base,
+            or(
+              eq(BackgroundTaskExecutionTable.wake_required, false),
+              eq(BackgroundTaskExecutionTable.state, "cancelled"),
+              isNotNull(BackgroundTaskExecutionTable.wake_claimed_at),
+            ),
+          )
+      return fromRow(
+        yield* db
+          .update(BackgroundTaskExecutionTable)
+          .set({
+            ...values,
+            cancel_requested_at: null,
+            followup_claimed_at: null,
+            output: null,
+            error: null,
+            delivery_owner_id: null,
+            delivery_lease_expires_at: null,
+            terminal_delivered_at: null,
+            wake_owner_id: null,
+            wake_lease_expires_at: null,
+            wake_claimed_at: null,
+          })
+          .where(condition)
+          .returning()
+          .get()
+          .pipe(Effect.orDie),
+      )
+    })
+
     const claim: Interface["claim"] = Effect.fn("BackgroundTaskExecution.claim")(function* (input) {
-      const time = now()
-      const values = {
-        session_id: input.sessionID,
-        parent_session_id: input.parentSessionID,
-        generation: input.generation,
-        owner_id: ownerID,
-        state: "running" as const,
-        description: input.description,
-        parent_message_id: input.parentMessageID,
-        parent_variant: input.parentVariant,
-        lease_expires_at: time + leaseMillis,
-        delivery: { messageID: MessageID.ascending(), partID: PartID.ascending() },
-        wake_required: input.wakeRequired ?? true,
-        time_created: time,
-        time_updated: time,
-      }
+      const values = claimValues(input, now())
 
       const inserted = yield* db
         .insert(BackgroundTaskExecutionTable)
@@ -195,38 +245,21 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
         return { status: "terminal", info: current }
       }
 
-      const replaced = yield* db
-        .update(BackgroundTaskExecutionTable)
-        .set({
-          ...values,
-          cancel_requested_at: null,
-          followup_claimed_at: null,
-          output: null,
-          error: null,
-          delivery_owner_id: null,
-          delivery_lease_expires_at: null,
-          terminal_delivered_at: null,
-          wake_owner_id: null,
-          wake_lease_expires_at: null,
-          wake_claimed_at: null,
-        })
-        .where(
-          and(
-            eq(BackgroundTaskExecutionTable.session_id, input.sessionID),
-            eq(BackgroundTaskExecutionTable.generation, current.generation),
-            eq(BackgroundTaskExecutionTable.state, current.state),
-            isNotNull(BackgroundTaskExecutionTable.terminal_delivered_at),
-            or(
-              eq(BackgroundTaskExecutionTable.wake_required, false),
-              eq(BackgroundTaskExecutionTable.state, "cancelled"),
-              isNotNull(BackgroundTaskExecutionTable.wake_claimed_at),
-            ),
-          ),
-        )
-        .returning()
-        .get()
-        .pipe(Effect.orDie)
-      if (replaced) return { status: "claimed", info: fromRow(replaced)! }
+      const replaced = yield* replace(current, values, false)
+      if (replaced) return { status: "claimed", info: replaced }
+      return yield* claim(input)
+    })
+
+    const claimAfterObservedTerminal: Interface["claimAfterObservedTerminal"] = Effect.fn(
+      "BackgroundTaskExecution.claimAfterObservedTerminal",
+    )(function* (input) {
+      const ownership = yield* claim(input)
+      if (ownership.status !== "terminal") return ownership
+      if (ownership.info.generation === input.generation) return ownership
+      if (ownership.info.terminalDeliveredAt === undefined) return ownership
+      if (ownership.info.delivery.messageID !== input.observedDeliveryMessageID) return ownership
+      const replaced = yield* replace(ownership.info, claimValues(input, now()), true)
+      if (replaced) return { status: "claimed", info: replaced }
       return yield* claim(input)
     })
 
@@ -372,6 +405,26 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
       },
     )
 
+    const listForParent: Interface["listForParent"] = Effect.fn("BackgroundTaskExecution.listForParent")(
+      function* (parentSessionID) {
+        yield* reconcileExpired()
+        return (yield* db
+          .select()
+          .from(BackgroundTaskExecutionTable)
+          .where(eq(BackgroundTaskExecutionTable.parent_session_id, parentSessionID))
+          .all()
+          .pipe(Effect.orDie))
+          .map(fromRow)
+          .filter(isInfo)
+      },
+    )
+
+    const listPendingHandoffs: Interface["listPendingHandoffs"] = Effect.fn(
+      "BackgroundTaskExecution.listPendingHandoffs",
+    )(function* (parentSessionID) {
+      return (yield* listForParent(parentSessionID)).filter(isPendingHandoff)
+    })
+
     const pendingTerminals: Interface["pendingTerminals"] = Effect.fn("BackgroundTaskExecution.pendingTerminals")(
       function* (sessionID) {
         yield* reconcileExpired()
@@ -382,7 +435,6 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
           .where(
             and(
               sql`${BackgroundTaskExecutionTable.state} <> 'running'`,
-              eq(BackgroundTaskExecutionTable.wake_required, true),
               or(
                 and(
                   isNull(BackgroundTaskExecutionTable.terminal_delivered_at),
@@ -394,6 +446,7 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
                 ),
                 and(
                   isNotNull(BackgroundTaskExecutionTable.terminal_delivered_at),
+                  eq(BackgroundTaskExecutionTable.wake_required, true),
                   sql`${BackgroundTaskExecutionTable.state} <> 'cancelled'`,
                   isNull(BackgroundTaskExecutionTable.wake_claimed_at),
                   or(
@@ -565,12 +618,15 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
       ownerID,
       leaseMillis,
       claim,
+      claimAfterObservedTerminal,
       heartbeat,
       settle,
       requestCancel,
       claimFollowup,
       get,
       list,
+      listForParent,
+      listPendingHandoffs,
       listRunning,
       pendingTerminals,
       claimDelivery,
@@ -612,6 +668,12 @@ function fromRow(row: typeof BackgroundTaskExecutionTable.$inferSelect | undefin
 
 function isInfo(info: Info | undefined): info is Info {
   return info !== undefined
+}
+
+function isPendingHandoff(info: Info) {
+  if (info.state === "running") return true
+  if (info.terminalDeliveredAt === undefined) return true
+  return info.wakeRequired && info.state !== "cancelled" && info.wakeClaimedAt === undefined
 }
 
 function tree(rows: Info[], sessionID: SessionID) {

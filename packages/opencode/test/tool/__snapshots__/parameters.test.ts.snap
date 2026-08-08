@@ -329,6 +329,10 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
       "description": "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)",
       "type": "string",
     },
+    "variant": {
+      "description": "Optional provider-specific model variant, such as a reasoning effort (for example, high or max).",
+      "type": "string",
+    },
   },
   "required": [
     "description",

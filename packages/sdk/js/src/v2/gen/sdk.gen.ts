@@ -5522,7 +5522,7 @@ export class Session3 extends HeyApiClient {
   /**
    * List background jobs
    *
-   * Retrieve background Task entries for this parent that are resident in the current OpenCode process.
+   * Retrieve durable background Task entries for this parent, including terminal tasks recovered after a process restart.
    */
   public backgroundJobs<ThrowOnError extends boolean = false>(
     parameters: {

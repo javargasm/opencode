@@ -28,7 +28,7 @@ import { useTuiStartup } from "./runtime"
 import { createSimpleContext } from "./helper"
 import { useExit } from "./exit"
 import { useArgs } from "./args"
-import { batch, onMount } from "solid-js"
+import { batch, onCleanup, onMount } from "solid-js"
 import path from "path"
 import { useKV } from "./kv"
 import { usePermission } from "./permission"
@@ -150,6 +150,25 @@ export const {
     const touchPart = (sessionID: string, partID: string) => {
       hydratingSessions.get(sessionID)?.parts.add(partID)
     }
+    let sessionStatusRevision = 0
+    let sessionStatusRefresh: Promise<void> | undefined
+
+    function refreshSessionStatus(workspace = project.workspace.current()) {
+      if (sessionStatusRefresh) return sessionStatusRefresh
+      const request = (async () => {
+        while (true) {
+          const revision = sessionStatusRevision
+          const response = await sdk.client.session.status({ workspace })
+          if (revision !== sessionStatusRevision) continue
+          setStore("session_status", reconcile(response.data ?? {}))
+          return
+        }
+      })()
+      sessionStatusRefresh = request.finally(() => {
+        sessionStatusRefresh = undefined
+      })
+      return sessionStatusRefresh
+    }
 
     function sessionListQuery(): { scope?: "project"; path?: string } {
       if (!kv.get("session_directory_filter_enabled", true)) return { scope: "project" }
@@ -169,7 +188,12 @@ export const {
 
     event.subscribe((event, { directory, workspace }) => {
       switch (event.type) {
+        case "server.connected":
+          sessionStatusRevision++
+          void refreshSessionStatus(workspace).catch(() => {})
+          break
         case "server.instance.disposed":
+          sessionStatusRevision++
           void bootstrap()
           break
         case "permission.replied": {
@@ -308,6 +332,7 @@ export const {
         }
 
         case "session.status": {
+          sessionStatusRevision++
           setStore("session_status", event.properties.sessionID, event.properties.status)
           break
         }
@@ -529,9 +554,7 @@ export const {
               .list({ workspace })
               .then((x) => setStore("mcp_resource", reconcile(x.data ?? {}))),
             sdk.client.formatter.status({ workspace }).then((x) => setStore("formatter", reconcile(x.data ?? []))),
-            sdk.client.session.status({ workspace }).then((x) => {
-              setStore("session_status", reconcile(x.data ?? {}))
-            }),
+            refreshSessionStatus(workspace),
             sdk.client.provider.auth({ workspace }).then((x) => setStore("provider_auth", reconcile(x.data ?? {}))),
             sdk.client.vcs.get({ workspace }).then((x) => setStore("vcs", reconcile(x.data))),
             project.workspace.sync(),
@@ -556,6 +579,12 @@ export const {
     onMount(() => {
       void bootstrap()
     })
+
+    const sessionStatusTimer = setInterval(() => {
+      if (!Object.values(store.session_status).some((status) => status.type !== "idle")) return
+      void refreshSessionStatus().catch(() => {})
+    }, 5_000)
+    onCleanup(() => clearInterval(sessionStatusTimer))
 
     const result = {
       data: store,

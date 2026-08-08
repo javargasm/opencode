@@ -15,6 +15,7 @@ export function adapterState() {
     currentReasoningID: undefined as string | undefined,
     toolNames: {} as Record<string, string>,
     copilotTotalNanoAiu: undefined as number | undefined,
+    streamError: undefined as object | undefined,
   }
 }
 
@@ -39,6 +40,11 @@ function copilotTotalNanoAiu(value: unknown) {
   const total = (usage as Record<string, unknown>).total_nano_aiu
   if (typeof total !== "number" || !Number.isFinite(total) || total < 0) return
   return total
+}
+
+function rawStreamError(value: unknown): object | undefined {
+  if (!value || typeof value !== "object" || !("error" in value)) return undefined
+  return value
 }
 
 function usage(value: unknown) {
@@ -262,7 +268,7 @@ export function toLLMEvents(
       })
 
     case "error":
-      return Effect.fail(event.error)
+      return Effect.fail(state.streamError ?? event.error)
 
     case "abort":
     case "source":
@@ -274,6 +280,7 @@ export function toLLMEvents(
     case "raw":
       return Effect.sync(() => {
         state.copilotTotalNanoAiu = copilotTotalNanoAiu(event.rawValue) ?? state.copilotTotalNanoAiu
+        state.streamError = rawStreamError(event.rawValue) ?? state.streamError
         return []
       })
 

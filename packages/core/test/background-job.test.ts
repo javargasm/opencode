@@ -61,6 +61,28 @@ describe("BackgroundJob", () => {
     }).pipe(Effect.provide(jobsLayer)),
   )
 
+  it.live("evicts terminal work without interrupting running work", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const completed = yield* jobs.start({ id: "completed", type: "test", run: Effect.succeed("done") })
+      expect((yield* jobs.wait({ id: completed.id })).info).toMatchObject({ status: "completed", output: "done" })
+      expect(yield* jobs.evict(completed.id)).toBe(true)
+      expect(yield* jobs.get(completed.id)).toBeUndefined()
+
+      const latch = yield* Deferred.make<void>()
+      const running = yield* jobs.start({
+        id: "running",
+        type: "task",
+        metadata: { parentSessionId: "parent", sessionId: "running", background: true },
+        run: Deferred.await(latch).pipe(Effect.as("done")),
+      })
+      expect(yield* jobs.listForParent("parent")).toEqual([running.id])
+      expect(yield* jobs.evict(running.id)).toBe(false)
+      expect((yield* jobs.get(running.id))?.status).toBe("running")
+      yield* Deferred.succeed(latch, undefined)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
   it.live("increments pending work before starting immediately settling extensions", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service

@@ -87,6 +87,7 @@ export type WaitResult = {
 
 export interface Interface {
   readonly list: () => Effect.Effect<Info[]>
+  readonly listForParent: (parentSessionID: string) => Effect.Effect<string[]>
   readonly get: (id: string) => Effect.Effect<Info | undefined>
   readonly start: (input: StartInput) => Effect.Effect<Info>
   readonly extend: (input: ExtendInput) => Effect.Effect<boolean>
@@ -94,6 +95,7 @@ export interface Interface {
   readonly waitForPromotion: (id: string) => Effect.Effect<Info>
   readonly promote: (id: string) => Effect.Effect<Info | undefined>
   readonly cancel: (id: string) => Effect.Effect<Info | undefined>
+  readonly evict: (id: string) => Effect.Effect<boolean>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/BackgroundJob") {}
@@ -108,6 +110,19 @@ function snapshot(job: Active): Info {
 function errorText(error: unknown) {
   if (error instanceof Error) return error.message
   return String(error)
+}
+
+function taskIDForParent(job: Info, parentSessionID: string) {
+  const sessionID = job.metadata?.sessionId
+  if (
+    job.type !== "task" ||
+    job.metadata?.background !== true ||
+    job.metadata.parentSessionId !== parentSessionID ||
+    typeof sessionID !== "string" ||
+    sessionID !== job.id
+  )
+    return
+  return sessionID
 }
 
 /**
@@ -192,6 +207,15 @@ export const make = Effect.gen(function* () {
       .map(snapshot)
       .toSorted((a, b) => a.started_at - b.started_at)
   })
+
+  const listForParent: Interface["listForParent"] = Effect.fn("BackgroundJob.listForParent")(
+    function* (parentSessionID) {
+      return (yield* list()).flatMap((job) => {
+        const taskID = taskIDForParent(job, parentSessionID)
+        return taskID ? [taskID] : []
+      })
+    },
+  )
 
   const get: Interface["get"] = Effect.fn("BackgroundJob.get")(function* (id) {
     const job = (yield* SynchronizedRef.get(state.jobs)).get(id)
@@ -357,7 +381,17 @@ export const make = Effect.gen(function* () {
     return result.info
   })
 
-  return Service.of({ list, get, start, extend, wait, waitForPromotion, promote, cancel })
+  const evict: Interface["evict"] = Effect.fn("BackgroundJob.evict")(function* (id) {
+    return yield* SynchronizedRef.modify(state.jobs, (jobs): readonly [boolean, Map<string, Active>] => {
+      const job = jobs.get(id)
+      if (!job || job.info.status === "running") return [false, jobs]
+      const next = new Map(jobs)
+      next.delete(id)
+      return [true, next]
+    })
+  })
+
+  return Service.of({ list, listForParent, get, start, extend, wait, waitForPromotion, promote, cancel, evict })
 })
 
 const layer = Layer.effect(Service, make)

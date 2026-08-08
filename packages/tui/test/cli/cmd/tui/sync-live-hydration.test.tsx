@@ -309,3 +309,61 @@ test("a message removed during hydration does not regain stale parts", async () 
     app.renderer.destroy()
   }
 })
+
+test("server reconnect replaces stale session statuses with the authoritative snapshot", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  let requests = 0
+  const { app, emit, sync } = await mount((url) => {
+    if (url.pathname !== "/session/status") return undefined
+    requests++
+    return json(requests === 1 ? { child: { type: "busy" } } : {})
+  }, tmp.path)
+
+  try {
+    expect(sync.data.session_status.child).toEqual({ type: "busy" })
+    emit(global({ id: "evt_connected", type: "server.connected", properties: {} }))
+    await wait(() => sync.data.session_status.child === undefined)
+
+    expect(requests).toBe(2)
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("reconnect status refresh cannot overwrite a newer live status event", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  let resolveStale!: (response: Response) => void
+  const stale = new Promise<Response>((resolve) => {
+    resolveStale = resolve
+  })
+  let requests = 0
+  const { app, emit, sync } = await mount((url) => {
+    if (url.pathname !== "/session/status") return undefined
+    requests++
+    if (requests === 1) return json({})
+    if (requests === 2) return stale
+    return json({ child: { type: "busy" } })
+  }, tmp.path)
+
+  try {
+    emit(global({ id: "evt_connected", type: "server.connected", properties: {} }))
+    await wait(() => requests === 2)
+    emit(
+      global({
+        id: "evt_status",
+        type: "session.status",
+        properties: { sessionID: "child", status: { type: "busy" } },
+      }),
+    )
+    await wait(() => sync.data.session_status.child?.type === "busy")
+    resolveStale(json({}))
+    await wait(() => requests === 3)
+    await wait(() => sync.data.session_status.child?.type === "busy")
+
+    expect(sync.data.session_status.child).toEqual({ type: "busy" })
+  } finally {
+    app.renderer.destroy()
+  }
+})

@@ -12,7 +12,7 @@ import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import { Provider } from "@/provider/provider"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
-import { Cause, Duration, Effect, Exit, Schedule, Schema, Scope } from "effect"
+import { Cause, Duration, Effect, Exit, Option, Schedule, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
@@ -259,20 +259,29 @@ export const startBackgroundTerminalPump = Effect.fn("TaskTool.startBackgroundTe
     delivery: Effect.Effect<boolean, unknown>,
   ) => Effect.Effect<boolean, unknown>
 }) {
+  const inFlight = new Set<SessionID>()
   const terminals = input.executions.pendingTerminals().pipe(
     Effect.flatMap((terminals) =>
       Effect.forEach(
         terminals,
-        (terminal) =>
-          (input.provide
-            ? input.provide(terminal, deliverBackgroundTerminal({ ...input, terminal }))
-            : deliverBackgroundTerminal({ ...input, terminal })
+        (terminal) => {
+          const leaseExpiresAt = terminal.terminalDeliveredAt
+            ? terminal.wakeLeaseExpiresAt
+            : terminal.deliveryLeaseExpiresAt
+          if (inFlight.has(terminal.sessionID) && leaseExpiresAt === undefined) return Effect.void
+          inFlight.add(terminal.sessionID)
+          return (
+            input.provide
+              ? input.provide(terminal, deliverBackgroundTerminal({ ...input, terminal }))
+              : deliverBackgroundTerminal({ ...input, terminal })
           ).pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning("failed to recover background task terminal", { sessionID: terminal.sessionID, cause }),
             ),
+            Effect.ensuring(Effect.sync(() => inFlight.delete(terminal.sessionID))),
             Effect.forkScoped,
-          ),
+          )
+        },
         { concurrency: "unbounded", discard: true },
       ),
     ),
@@ -485,6 +494,7 @@ export const TaskTool = Tool.define(
       const requestedGeneration = ctx.callID
         ? `${ctx.messageID}:${ctx.callID}`
         : `${ctx.messageID}:${PartID.ascending()}`
+      const observedDeliveryMessageID = parentMessage.parentID
 
       const ops = ctx.extra?.promptOps as TaskPromptOps
       if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
@@ -502,7 +512,25 @@ export const TaskTool = Tool.define(
           agent: next.name,
           parts,
         })
-        return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        const initial = result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        while ((yield* executions.listPendingHandoffs(nextSession.id)).length > 0) {
+          yield* Effect.sleep("250 millis")
+        }
+        const latest = Option.getOrUndefined(
+          yield* sessions
+            .findMessage(
+              nextSession.id,
+              (message) =>
+                message.info.role === "assistant" &&
+                message.parts.some((part) => part.type === "text" && !part.ignored),
+            )
+            .pipe(Effect.orDie),
+        )
+        const latestText = latest?.parts.findLast(
+          (item): item is Extract<(typeof latest.parts)[number], { type: "text" }> =>
+            item.type === "text" && !item.ignored,
+        )
+        return latestText?.text ?? initial
       })
 
       const acknowledge = Effect.fn("TaskTool.acknowledgeBackgroundResult")(function* (
@@ -584,9 +612,9 @@ export const TaskTool = Tool.define(
           Effect.flatMap((result) =>
             Effect.gen(function* () {
               if (generation === undefined) return
-              yield* settleResult(result.info, generation)
-              const terminal = yield* executions.get(nextSession.id)
+              const terminal = yield* settleResult(result.info, generation)
               if (!terminal || terminal.generation !== generation || terminal.state === "running") return
+              yield* background.evict(jobID)
               const terminalState = terminal.state
               yield* deliverBackgroundTerminal({
                 executions,
@@ -675,7 +703,7 @@ export const TaskTool = Tool.define(
           }
 
           const nextMetadata = { ...metadata, backgroundTaskGeneration: requestedGeneration }
-          let ownership = yield* executions.claim({
+          const claimInput = {
             sessionID: nextSession.id,
             parentSessionID: ctx.sessionID,
             generation: requestedGeneration,
@@ -683,27 +711,74 @@ export const TaskTool = Tool.define(
             parentMessageID: ctx.messageID,
             parentVariant: parentMessage.variant,
             wakeRequired: runInBackground,
-          })
+          }
+          let ownership = observedDeliveryMessageID
+            ? yield* executions.claimAfterObservedTerminal({ ...claimInput, observedDeliveryMessageID })
+            : yield* executions.claim(claimInput)
           if (ownership.status === "terminal") {
-            yield* deliverBackgroundTerminal({ executions, sessions, ops, terminal: ownership.info })
+            const delivered = yield* deliverBackgroundTerminal({ executions, sessions, ops, terminal: ownership.info })
             if (ownership.info.generation === requestedGeneration) {
+              if (!delivered) {
+                if (!runInBackground) {
+                  return yield* Effect.fail(new Error("Task result is being delivered by another OpenCode process"))
+                }
+                return {
+                  waiting: "delivery" as const,
+                  generation: ownership.info.generation,
+                  metadata: { ...metadata, backgroundTaskGeneration: ownership.info.generation },
+                }
+              }
               return { replayed: true as const, terminal: ownership.info, metadata: nextMetadata }
             }
-            ownership = yield* executions.claim({
-              sessionID: nextSession.id,
-              parentSessionID: ctx.sessionID,
-              generation: requestedGeneration,
-              description: params.description,
-              parentMessageID: ctx.messageID,
-              parentVariant: parentMessage.variant,
-              wakeRequired: runInBackground,
-            })
+            const current = yield* executions.get(nextSession.id)
+            if (
+              current?.terminalDeliveredAt !== undefined &&
+              current.wakeRequired &&
+              current.state !== "cancelled" &&
+              current.wakeClaimedAt === undefined
+            ) {
+              return yield* Effect.fail(
+                new Error(
+                  "The previous task result was delivered, but its parent wake is still in progress. Retry after it completes.",
+                ),
+              )
+            }
+            if (current?.terminalDeliveredAt === undefined && !runInBackground) {
+              return yield* Effect.fail(new Error("Task result is being delivered by another OpenCode process"))
+            }
+            ownership = yield* executions.claim(claimInput)
           }
           if (ownership.status === "owned") {
-            return yield* Effect.fail(new Error("Task is already running in another OpenCode process"))
+            if (!runInBackground) {
+              return yield* Effect.fail(new Error("Task is already running in another OpenCode process"))
+            }
+            return {
+              waiting: "execution" as const,
+              generation: ownership.info.generation,
+              metadata: { ...metadata, backgroundTaskGeneration: ownership.info.generation },
+            }
           }
           if (ownership.status === "terminal") {
-            return yield* Effect.fail(new Error("Task result is being delivered by another OpenCode process"))
+            if (
+              ownership.info.terminalDeliveredAt !== undefined &&
+              ownership.info.wakeRequired &&
+              ownership.info.state !== "cancelled" &&
+              ownership.info.wakeClaimedAt === undefined
+            ) {
+              return yield* Effect.fail(
+                new Error(
+                  "The previous task result was delivered, but its parent wake is still in progress. Retry after it completes.",
+                ),
+              )
+            }
+            if (!runInBackground) {
+              return yield* Effect.fail(new Error("Task result is being delivered by another OpenCode process"))
+            }
+            return {
+              waiting: "delivery" as const,
+              generation: ownership.info.generation,
+              metadata: { ...metadata, backgroundTaskGeneration: ownership.info.generation },
+            }
           }
           const info = yield* background.start({
             id: nextSession.id,
@@ -762,13 +837,37 @@ export const TaskTool = Tool.define(
           metadata: {
             ...dispatch.metadata,
             background: true,
-            jobId: nextSession.id,
+            backgroundTaskState: "waiting",
           },
           output: renderOutput({
             sessionID: nextSession.id,
             state: "running",
             summary: "Background task updated",
             text: BACKGROUND_UPDATED,
+          }),
+        }
+      }
+
+      if (dispatch.waiting) {
+        const text =
+          dispatch.waiting === "delivery"
+            ? "Another OpenCode process is delivering this task result. It will be delivered automatically; do not relaunch it."
+            : "This task is already running in another OpenCode process. It will notify you automatically when it finishes."
+        return {
+          title: params.description,
+          metadata: {
+            ...dispatch.metadata,
+            background: true,
+            backgroundTaskState: "waiting",
+          },
+          output: renderOutput({
+            sessionID: nextSession.id,
+            state: "running",
+            summary:
+              dispatch.waiting === "delivery"
+                ? "Background task delivery in progress"
+                : "Background task already running",
+            text,
           }),
         }
       }
@@ -817,6 +916,7 @@ export const TaskTool = Tool.define(
             if (result?.metadata?.background === true) return backgroundResult()
             const terminal = yield* settleResult(result, dispatch.generation)
             if (terminal && terminal.state !== "running") {
+              yield* background.evict(nextSession.id)
               const claimed = yield* executions.claimDelivery({
                 sessionID: terminal.sessionID,
                 generation: terminal.generation,

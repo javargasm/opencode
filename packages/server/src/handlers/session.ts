@@ -93,18 +93,9 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         "session.backgroundJobs",
         Effect.fn(function* (ctx) {
           return {
-            data: (yield* background.list()).flatMap((job) => {
-              const sessionID = job.metadata?.sessionId
-              if (
-                job.type !== "task" ||
-                job.metadata?.background !== true ||
-                job.metadata.parentSessionId !== ctx.params.sessionID ||
-                typeof sessionID !== "string" ||
-                sessionID !== job.id
-              )
-                return []
-              return [SessionV2.ID.make(sessionID)]
-            }),
+            data: (yield* background.listForParent(ctx.params.sessionID)).map((sessionID) =>
+              SessionV2.ID.make(sessionID),
+            ),
           }
         }),
       )

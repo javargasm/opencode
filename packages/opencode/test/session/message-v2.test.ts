@@ -1463,6 +1463,24 @@ describe("session.message-v2.fromError", () => {
     })
   })
 
+  test("serializes direct OpenAI-compatible server_error stream chunks as retryable APIError", () => {
+    const body = {
+      type: "server_error",
+      code: "server_error",
+      message: "An error occurred while processing your request.",
+    }
+    const result = MessageV2.fromError(body, { providerID })
+
+    expect(result).toStrictEqual({
+      name: "APIError",
+      data: {
+        message: body.message,
+        isRetryable: true,
+        responseBody: JSON.stringify(body),
+      },
+    })
+  })
+
   test("detects context overflow from APICallError provider messages", () => {
     const cases = [
       "prompt is too long: 213462 tokens > 200000 maximum",

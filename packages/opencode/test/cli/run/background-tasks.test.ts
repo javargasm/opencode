@@ -110,7 +110,43 @@ describe("run background task projection", () => {
     expect(tasks.size).toBe(0)
   })
 
-  test("restart reconciliation keeps only durable tasks resident in the current process", () => {
+  test("does not resurrect a task from a waiting replay part", () => {
+    const tasks = projectBackgroundTasks([
+      {
+        info: {},
+        parts: [
+          start("ses_child", "prt_001", "generation-1"),
+          terminal("ses_child", "completed", "prt_002", "generation-1"),
+        ],
+      },
+    ])
+
+    expect(
+      applyBackgroundTaskPart(tasks, {
+        id: "prt_003",
+        messageID: "msg_parent",
+        sessionID: "ses_parent",
+        type: "tool",
+        tool: "task",
+        state: {
+          status: "completed",
+          input: {},
+          output: "waiting",
+          title: "task",
+          metadata: {
+            background: true,
+            sessionId: "ses_child",
+            backgroundTaskGeneration: "generation-1",
+            backgroundTaskState: "waiting",
+          },
+          time: { start: 3, end: 4 },
+        },
+      }),
+    ).toBeUndefined()
+    expect(tasks.size).toBe(0)
+  })
+
+  test("restart reconciliation keeps only tasks returned by durable storage", () => {
     const tasks = projectBackgroundTasks([
       {
         info: {},
@@ -118,11 +154,11 @@ describe("run background task projection", () => {
       },
     ])
 
-    expect(reconcileBackgroundTasks(tasks, ["ses_running", "ses_resident_only"])).toBe(tasks)
+    expect(reconcileBackgroundTasks(tasks, ["ses_running", "ses_durable_only"])).toBe(tasks)
     expect([...tasks]).toEqual([["ses_running", "generation-1"]])
   })
 
-  test("restart reconciliation clears durable launches when the process registry is empty", () => {
+  test("restart reconciliation clears launches absent from durable storage", () => {
     const tasks = projectBackgroundTasks([{ info: {}, parts: [start("ses_orphan")] }])
 
     reconcileBackgroundTasks(tasks, [])
