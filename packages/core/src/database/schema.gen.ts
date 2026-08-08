@@ -133,7 +133,9 @@ export default {
           \`state\` text NOT NULL,
           \`description\` text NOT NULL,
           \`parent_message_id\` text NOT NULL,
+          \`parent_variant\` text,
           \`lease_expires_at\` integer NOT NULL,
+          \`followup_claimed_at\` integer,
           \`cancel_requested_at\` integer,
           \`output\` text,
           \`error\` text,
@@ -202,6 +204,22 @@ export default {
           \`time_updated\` integer NOT NULL,
           \`data\` text NOT NULL,
           CONSTRAINT \`fk_session_message_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_run_lease\` (
+          \`session_id\` text PRIMARY KEY,
+          \`owner_id\` text,
+          \`owner_pid\` integer,
+          \`owner_incarnation_id\` text,
+          \`owner_incarnation_port\` integer,
+          \`lease_expires_at\` integer,
+          \`wake_requested_seq\` integer DEFAULT 0 NOT NULL,
+          \`wake_completed_seq\` integer DEFAULT 0 NOT NULL,
+          \`cancel_requested_at\` integer,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          CONSTRAINT \`fk_session_run_lease_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
       yield* tx.run(`

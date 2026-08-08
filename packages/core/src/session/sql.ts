@@ -188,7 +188,9 @@ export const BackgroundTaskExecutionTable = sqliteTable(
     state: text().$type<"running" | "completed" | "error" | "cancelled">().notNull(),
     description: text().notNull(),
     parent_message_id: text().$type<MessageID>().notNull(),
+    parent_variant: text(),
     lease_expires_at: integer().notNull(),
+    followup_claimed_at: integer(),
     cancel_requested_at: integer(),
     output: text(),
     error: text(),
@@ -207,3 +209,19 @@ export const BackgroundTaskExecutionTable = sqliteTable(
     index("background_task_execution_state_lease_idx").on(table.state, table.lease_expires_at),
   ],
 )
+
+export const SessionRunLeaseTable = sqliteTable("session_run_lease", {
+  session_id: text()
+    .$type<SessionSchema.ID>()
+    .primaryKey()
+    .references(() => SessionTable.id, { onDelete: "cascade" }),
+  owner_id: text(),
+  owner_pid: integer(),
+  owner_incarnation_id: text(),
+  owner_incarnation_port: integer(),
+  lease_expires_at: integer(),
+  wake_requested_seq: integer().default(0).notNull(),
+  wake_completed_seq: integer().default(0).notNull(),
+  cancel_requested_at: integer(),
+  ...Timestamps,
+})

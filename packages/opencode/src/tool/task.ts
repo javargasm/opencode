@@ -140,11 +140,22 @@ export const deliverBackgroundTerminal = Effect.fn("TaskTool.deliverBackgroundTe
       const activeTasks = (yield* input.executions.listRunning(terminal.parentSessionID))
         .filter((task) => task.cancelRequestedAt === undefined)
         .map((task) => ({ task_id: task.sessionID, description: task.description }))
+      const parentMessage = terminal.parentVariant
+        ? undefined
+        : yield* input.sessions
+            .getMessage({
+              sessionID: terminal.parentSessionID,
+              messageID: terminal.parentMessageID,
+            })
+            .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
       const event = yield* input.ops.prompt({
         sessionID: terminal.parentSessionID,
         messageID: terminal.delivery.messageID,
         agent: parentAgent,
-        variant: input.variant,
+        variant:
+          terminal.parentVariant ??
+          (parentMessage?.info.role === "assistant" ? parentMessage.info.variant : undefined) ??
+          input.variant,
         noReply: true,
         parts: [
           {
@@ -304,7 +315,6 @@ export const TaskTool = Tool.define(
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
-    const reactions = KeyedMutex.makeUnsafe<SessionID>()
     const dispatches = KeyedMutex.makeUnsafe<SessionID>()
 
     const run = Effect.fn("TaskTool.execute")(function* (
@@ -575,21 +585,17 @@ export const TaskTool = Tool.define(
             Effect.gen(function* () {
               if (generation === undefined) return
               yield* settleResult(result.info, generation)
-              yield* reactions.withLock(ctx.sessionID)(
-                Effect.gen(function* () {
-                  const terminal = yield* executions.get(nextSession.id)
-                  if (!terminal || terminal.generation !== generation || terminal.state === "running") return
-                  const terminalState = terminal.state
-                  yield* deliverBackgroundTerminal({
-                    executions,
-                    sessions,
-                    ops,
-                    terminal,
-                    variant: parentMessage.variant,
-                    afterAdmit: (admitted) => acknowledge(admitted, terminalState),
-                  })
-                }),
-              )
+              const terminal = yield* executions.get(nextSession.id)
+              if (!terminal || terminal.generation !== generation || terminal.state === "running") return
+              const terminalState = terminal.state
+              yield* deliverBackgroundTerminal({
+                executions,
+                sessions,
+                ops,
+                terminal,
+                variant: parentMessage.variant,
+                afterAdmit: (admitted) => acknowledge(admitted, terminalState),
+              })
             }),
           ),
           Effect.forkIn(scope, { startImmediately: true }),
@@ -639,18 +645,33 @@ export const TaskTool = Tool.define(
               typeof current?.metadata?.backgroundTaskGeneration === "string"
                 ? current.metadata.backgroundTaskGeneration
                 : undefined
-            if (!generation || !(yield* background.extend({ id: nextSession.id, run: ownedRun(generation) }))) {
-              return yield* Effect.fail(new Error("Unable to continue background task"))
+            const followup =
+              current.metadata?.background === true && generation !== undefined
+                ? yield* executions.claimFollowup({ sessionID: nextSession.id, generation })
+                : undefined
+            if (followup === "already_claimed") {
+              return yield* Effect.fail(
+                new Error(
+                  "This background task is still running and already received its follow-up. It will notify you automatically when it finishes.",
+                ),
+              )
             }
-            const nextMetadata = {
-              ...metadata,
-              ...(generation !== undefined ? { backgroundTaskGeneration: generation } : {}),
+            if (followup === "inactive") {
+              yield* background.cancel(nextSession.id)
+            } else {
+              if (!generation || !(yield* background.extend({ id: nextSession.id, run: ownedRun(generation) }))) {
+                return yield* Effect.fail(new Error("Unable to continue background task"))
+              }
+              const nextMetadata = {
+                ...metadata,
+                ...(generation !== undefined ? { backgroundTaskGeneration: generation } : {}),
+              }
+              yield* ctx.metadata({
+                title: params.description,
+                metadata: { ...nextMetadata, background: true, jobId: nextSession.id },
+              })
+              return { extended: true as const, generation, metadata: nextMetadata }
             }
-            yield* ctx.metadata({
-              title: params.description,
-              metadata: { ...nextMetadata, background: true, jobId: nextSession.id },
-            })
-            return { extended: true as const, generation, metadata: nextMetadata }
           }
 
           const nextMetadata = { ...metadata, backgroundTaskGeneration: requestedGeneration }
@@ -660,6 +681,7 @@ export const TaskTool = Tool.define(
             generation: requestedGeneration,
             description: params.description,
             parentMessageID: ctx.messageID,
+            parentVariant: parentMessage.variant,
             wakeRequired: runInBackground,
           })
           if (ownership.status === "terminal") {
@@ -673,6 +695,7 @@ export const TaskTool = Tool.define(
               generation: requestedGeneration,
               description: params.description,
               parentMessageID: ctx.messageID,
+              parentVariant: parentMessage.variant,
               wakeRequired: runInBackground,
             })
           }

@@ -1155,6 +1155,11 @@ describe("session.compaction.process", () => {
       expect(
         last?.parts.some((part) => part.type === "text" && part.text.includes("Attached image/png: cat.png")),
       ).toBe(true)
+      expect(
+        last?.parts.some(
+          (part) => part.type === "text" && part.synthetic === true && part.metadata?.compactionReplay === true,
+        ),
+      ).toBe(true)
     }),
   )
 

@@ -26,3 +26,14 @@ export function name(
 ) {
   return get(list, providerID, modelID)?.name ?? modelID
 }
+
+export function label(
+  list: Provider[] | ReadonlyMap<string, Provider> | undefined,
+  providerID: string,
+  modelID: string,
+  variant?: string,
+) {
+  const model = name(list, providerID, modelID)
+  if (!variant || variant === "default") return model
+  return `${model} · ${variant}`
+}

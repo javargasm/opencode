@@ -366,8 +366,16 @@ export function applyDirectoryEvent(input: {
       if (!parts) break
       const result = Binary.search(parts, props.partID, (p) => p.id)
       if (!result.found) break
-      const field = props.field as keyof (typeof parts)[number]
-      const current = parts[result.index]?.[field]
+      const part = parts[result.index]
+      if (!part) break
+      let current: string | undefined
+      if (props.field === "metadata.output") {
+        if (part.type !== "tool" || part.state.status === "pending") break
+        current = typeof part.state.metadata?.output === "string" ? part.state.metadata.output : ""
+      } else {
+        const field = props.field as keyof typeof part
+        current = part[field] as string | undefined
+      }
       input.setStore(
         "part_text_accum_delta",
         props.partID,
@@ -378,6 +386,14 @@ export function applyDirectoryEvent(input: {
         props.messageID,
         produce((draft) => {
           const part = draft[result.index]
+          if (!part) return
+          if (props.field === "metadata.output") {
+            if (part.type !== "tool" || part.state.status === "pending") return
+            const metadata = part.state.metadata ?? {}
+            const output = typeof metadata.output === "string" ? metadata.output : ""
+            part.state.metadata = { ...metadata, output: output + props.delta }
+            return
+          }
           const field = props.field as keyof typeof part
           const existing = part[field] as string | undefined
           ;(part[field] as string) = (existing ?? "") + props.delta

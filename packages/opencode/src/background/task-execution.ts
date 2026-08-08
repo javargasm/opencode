@@ -16,7 +16,9 @@ export type Info = {
   state: State
   description: string
   parentMessageID: MessageID
+  parentVariant?: string
   leaseExpiresAt: number
+  followupClaimedAt?: number
   cancelRequestedAt?: number
   output?: string
   error?: string
@@ -36,6 +38,7 @@ export type ClaimInput = {
   generation: string
   description: string
   parentMessageID: MessageID
+  parentVariant?: string
   wakeRequired?: boolean
 }
 
@@ -43,6 +46,8 @@ export type ClaimResult = {
   status: "claimed" | "owned" | "terminal"
   info: Info
 }
+
+export type FollowupClaim = "claimed" | "already_claimed" | "inactive"
 
 export interface Interface {
   readonly ownerID: string
@@ -60,6 +65,7 @@ export interface Interface {
     error?: string
   }) => Effect.Effect<Info | undefined>
   readonly requestCancel: (sessionID: SessionID) => Effect.Effect<Info[]>
+  readonly claimFollowup: (input: { sessionID: SessionID; generation: string }) => Effect.Effect<FollowupClaim>
   readonly get: (sessionID: SessionID) => Effect.Effect<Info | undefined>
   readonly list: (input: { projectID: ProjectV2.ID; directory: string }) => Effect.Effect<Info[]>
   readonly listRunning: (parentSessionID?: SessionID) => Effect.Effect<Info[]>
@@ -155,6 +161,7 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
         state: "running" as const,
         description: input.description,
         parent_message_id: input.parentMessageID,
+        parent_variant: input.parentVariant,
         lease_expires_at: time + leaseMillis,
         delivery: { messageID: MessageID.ascending(), partID: PartID.ascending() },
         wake_required: input.wakeRequired ?? true,
@@ -193,6 +200,7 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
         .set({
           ...values,
           cancel_requested_at: null,
+          followup_claimed_at: null,
           output: null,
           error: null,
           delivery_owner_id: null,
@@ -307,6 +315,41 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
           { concurrency: "unbounded", discard: true },
         )
         return tree(yield* listAll(), sessionID)
+      },
+    )
+
+    const claimFollowup: Interface["claimFollowup"] = Effect.fn("BackgroundTaskExecution.claimFollowup")(
+      function* (input) {
+        yield* reconcileExpired()
+        const time = now()
+        const claimed = yield* db
+          .update(BackgroundTaskExecutionTable)
+          .set({ followup_claimed_at: time, time_updated: time })
+          .where(
+            and(
+              eq(BackgroundTaskExecutionTable.session_id, input.sessionID),
+              eq(BackgroundTaskExecutionTable.generation, input.generation),
+              eq(BackgroundTaskExecutionTable.state, "running"),
+              gt(BackgroundTaskExecutionTable.lease_expires_at, time),
+              isNull(BackgroundTaskExecutionTable.cancel_requested_at),
+              isNull(BackgroundTaskExecutionTable.followup_claimed_at),
+            ),
+          )
+          .returning({ sessionID: BackgroundTaskExecutionTable.session_id })
+          .get()
+          .pipe(Effect.orDie)
+        if (claimed) return "claimed"
+        const current = yield* get(input.sessionID)
+        if (
+          current?.generation === input.generation &&
+          current.state === "running" &&
+          current.leaseExpiresAt > time &&
+          current.cancelRequestedAt === undefined &&
+          current.followupClaimedAt !== undefined
+        ) {
+          return "already_claimed"
+        }
+        return "inactive"
       },
     )
 
@@ -525,6 +568,7 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
       heartbeat,
       settle,
       requestCancel,
+      claimFollowup,
       get,
       list,
       listRunning,
@@ -549,7 +593,9 @@ function fromRow(row: typeof BackgroundTaskExecutionTable.$inferSelect | undefin
     state: row.state,
     description: row.description,
     parentMessageID: row.parent_message_id,
+    parentVariant: row.parent_variant ?? undefined,
     leaseExpiresAt: row.lease_expires_at,
+    followupClaimedAt: row.followup_claimed_at ?? undefined,
     cancelRequestedAt: row.cancel_requested_at ?? undefined,
     output: row.output ?? undefined,
     error: row.error ?? undefined,

@@ -26,7 +26,7 @@ import { Image } from "../../src/image/image"
 import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
 import { Session } from "@/session/session"
-import { SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { SessionMessageTable, SessionRunLeaseTable } from "@opencode-ai/core/session/sql"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -37,6 +37,8 @@ import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
+import { SessionRunLease } from "../../src/session/run-lease"
+import { ProcessIncarnation } from "../../src/session/process-incarnation"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -188,6 +190,7 @@ const promptRoot = LayerNode.group([
   BackgroundJob.node,
   SessionStatus.node,
   SessionRunState.node,
+  ProcessIncarnation.node,
   Database.node,
   EventV2Bridge.node,
   Question.node,
@@ -1477,6 +1480,63 @@ noLLMServer.instance("assertNotBusy succeeds when idle", () =>
   }),
 )
 
+noLLMServer.instance("reconciles local status after a remote lease owner releases", () =>
+  Effect.gen(function* () {
+    const run = yield* SessionRunState.Service
+    const sessions = yield* Session.Service
+    const status = yield* SessionStatus.Service
+    const remote = yield* SessionRunLease.make()
+    const chat = yield* sessions.create({})
+    const admitted = yield* user(chat.id, "hi")
+    const fallback = yield* MessageV2.get({ sessionID: chat.id, messageID: admitted.id })
+
+    yield* status.set(chat.id, { type: "busy" })
+    yield* remote.requestWake(chat.id)
+    const claim = yield* remote.claim(chat.id)
+    if (!claim) throw new Error("remote owner did not claim the session")
+    const fiber = yield* run.wake(chat.id, Effect.succeed(fallback), Effect.never).pipe(Effect.forkChild)
+    yield* Effect.sleep("50 millis")
+    yield* waitForBusy(chat.id)
+    yield* run.interrupt(chat.id).pipe(Effect.timeout("1 second"))
+    expect((yield* status.get(chat.id)).type).toBe("busy")
+
+    expect(yield* remote.release(chat.id, claim.token)).toBe(true)
+    expect(yield* remote.isBusy(chat.id)).toBe(false)
+    yield* pollWithTimeout(
+      status.get(chat.id).pipe(Effect.map((current) => (current.type === "idle" ? (true as const) : undefined))),
+      "local session status remained busy after the remote lease ended",
+    )
+    expect(Exit.isSuccess(yield* Fiber.await(fiber))).toBe(true)
+  }),
+)
+
+noLLMServer.instance("reclaims an expired dead owner when waking a session", () =>
+  Effect.gen(function* () {
+    const run = yield* SessionRunState.Service
+    const remote = yield* SessionRunLease.make()
+    const sessions = yield* Session.Service
+    const { db } = yield* Database.Service
+    const chat = yield* sessions.create({})
+    const admitted = yield* user(chat.id, "hi")
+    const fallback = yield* MessageV2.get({ sessionID: chat.id, messageID: admitted.id })
+
+    yield* remote.requestWake(chat.id)
+    const stale = yield* remote.claim(chat.id)
+    if (!stale) throw new Error("stale owner did not claim the session")
+
+    yield* db
+      .update(SessionRunLeaseTable)
+      .set({ owner_pid: 2_147_483_647, lease_expires_at: Date.now() - 1 })
+      .where(eq(SessionRunLeaseTable.session_id, chat.id))
+      .run()
+
+    const result = yield* run.wake(chat.id, Effect.succeed(fallback), Effect.succeed(fallback))
+    expect(result.info.id).toBe(fallback.info.id)
+    expect(yield* remote.get(chat.id)).toMatchObject({ wakeRequested: 2, wakeCompleted: 2 })
+    expect(yield* remote.isBusy(chat.id)).toBe(false)
+  }),
+)
+
 // Shell semantics
 
 it.instance("shell rejects with BusyError when loop running", () =>
@@ -1650,28 +1710,51 @@ unixNoLLMServer(
 )
 
 unixNoLLMServer(
-  "shell updates running metadata before process exit",
+  "shell streams output metadata without durable intermediate snapshots",
   () =>
     withSh(() =>
       Effect.gen(function* () {
+        const events = yield* EventV2Bridge.Service
         const { prompt, chat } = yield* boot()
+        const seen: Array<{ type: string; data: unknown; durable?: unknown }> = []
+        const off = yield* events.listen((event) => {
+          seen.push(event)
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
 
         const fiber = yield* prompt
           .shell({ sessionID: chat.id, agent: "build", command: "printf first && sleep 0.2 && printf second" })
           .pipe(Effect.forkChild)
 
         yield* pollWithTimeout(
-          Effect.gen(function* () {
-            const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
-            const taskMsg = msgs.find((item) => item.info.role === "assistant")
-            const tool = taskMsg ? toolPart(taskMsg.parts) : undefined
-            if (tool?.state.status === "running" && tool.state.metadata?.output.includes("first")) return true
+          Effect.sync(() => {
+            const delta = seen.find(
+              (event) =>
+                event.type === SessionV1.Event.PartDelta.type &&
+                (event.data as { field?: string; delta?: string }).field === "metadata.output",
+            )
+            return delta && (delta.data as { delta?: string }).delta?.includes("first") ? (true as const) : undefined
           }),
-          "timed out waiting for running shell metadata",
+          "timed out waiting for streamed shell output",
         )
 
         const exit = yield* Fiber.await(fiber)
         expect(Exit.isSuccess(exit)).toBe(true)
+
+        const deltas = seen.filter(
+          (event) =>
+            event.type === SessionV1.Event.PartDelta.type &&
+            (event.data as { field?: string }).field === "metadata.output",
+        )
+        const updates = seen.filter((event) => {
+          if (event.type !== SessionV1.Event.PartUpdated.type) return false
+          return (event.data as { part?: SessionV1.Part }).part?.type === "tool"
+        })
+        expect(deltas.map((event) => (event.data as { delta: string }).delta).join("")).toContain("first")
+        expect(deltas.every((event) => event.durable === undefined)).toBe(true)
+        expect(updates).toHaveLength(2)
+        expect(updates.every((event) => event.durable !== undefined)).toBe(true)
       }),
     ),
   { config: cfg },

@@ -448,6 +448,10 @@ export interface Interface {
   readonly setWorkspace: (input: { sessionID: SessionID; workspaceID: Info["workspaceID"] }) => Effect.Effect<void>
   readonly diff: (sessionID: SessionID) => Effect.Effect<Snapshot.FileDiff[]>
   readonly messages: (input: { sessionID: SessionID; limit?: number }) => Effect.Effect<SessionV1.WithParts[], NotFound>
+  readonly getMessage: (input: {
+    sessionID: SessionID
+    messageID: MessageID
+  }) => Effect.Effect<SessionV1.WithParts, NotFound>
   readonly children: (parentID: SessionID) => Effect.Effect<Info[]>
   readonly remove: (sessionID: SessionID) => Effect.Effect<void, NotFound>
   readonly updateMessage: <T extends SessionV1.Info>(msg: T) => Effect.Effect<T>
@@ -852,6 +856,10 @@ const layer: Layer.Layer<
       return result.reverse()
     })
 
+    const getMessage: Interface["getMessage"] = Effect.fn("Session.getMessage")((input) =>
+      MessageV2.get(input).pipe(Effect.provideService(Database.Service, database)),
+    )
+
     const removeMessage = Effect.fn("Session.removeMessage")(function* (input: {
       sessionID: SessionID
       messageID: MessageID
@@ -924,6 +932,7 @@ const layer: Layer.Layer<
       setWorkspace,
       diff,
       messages,
+      getMessage,
       children,
       remove,
       updateMessage,

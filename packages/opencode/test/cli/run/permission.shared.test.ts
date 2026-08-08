@@ -120,9 +120,17 @@ describe("run permission shared", () => {
       lines: ["- /tmp/work/**/*.ts", "- /tmp/work/**/*.tsx"],
     })
 
-    expect(permissionInfo(req({ permission: "doom_loop" }))).toMatchObject({
-      title: "Continue after repeated failures",
+    expect(permissionInfo(req({ permission: "doom_loop", metadata: { reason: "unchanged_success" } }))).toMatchObject({
+      title: "Continue after identical results",
+      lines: ["The tool returned the same result repeatedly. Continuing may loop."],
     })
+
+    for (const metadata of [{ reason: "repeated_failure" }, {}]) {
+      expect(permissionInfo(req({ permission: "doom_loop", metadata }))).toMatchObject({
+        title: "Continue after repeated failures",
+        lines: ["This keeps the session running despite repeated failures."],
+      })
+    }
 
     expect(permissionInfo(req({ permission: "custom_tool" }))).toMatchObject({
       title: "Call tool custom_tool",

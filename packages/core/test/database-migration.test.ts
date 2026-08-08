@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import { $ } from "bun"
+import { spawn } from "child_process"
 import { fileURLToPath } from "url"
 import path from "path"
 import { SqliteClient } from "@effect/sql-sqlite-bun"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
-import { Cause, Effect, Exit, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Layer, Ref } from "effect"
 import { eq, inArray, sql } from "drizzle-orm"
 import { DatabaseMigration } from "@opencode-ai/core/database/migration"
 import { migrations } from "@opencode-ai/core/database/migration.gen"
@@ -16,6 +17,7 @@ import contextEpochAgentMigration from "@opencode-ai/core/database/migration/202
 import simplifyIntegrationCredentialsMigration from "@opencode-ai/core/database/migration/20260611192811_lush_chimera"
 import simplifySessionInputMigration from "@opencode-ai/core/database/migration/20260622202450_simplify_session_input"
 import backgroundTaskExecutionMigration from "@opencode-ai/core/database/migration/20260805174858_background_task_execution"
+import sessionRunLeaseMigration from "@opencode-ai/core/database/migration/20260805222957_grey_klaw"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -68,6 +70,108 @@ const backgroundTaskExecutionIndexes = [
 ]
 
 describe("DatabaseMigration", () => {
+  test("keeps simultaneous in-process migration callers idempotent", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "simultaneous-migration.sqlite")
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const firstContext = yield* Layer.build(Layer.fresh(SqliteClient.layer({ filename })))
+          const secondContext = yield* Layer.build(Layer.fresh(SqliteClient.layer({ filename })))
+          const first = yield* makeDb.pipe(Effect.provide(firstContext))
+          const second = yield* makeDb.pipe(Effect.provide(secondContext))
+          const entered = yield* Ref.make(0)
+          const ready = yield* Deferred.make<void>()
+          const concurrentMigration: DatabaseMigration.Migration = {
+            id: "test_simultaneous_connections",
+            up(tx) {
+              return Effect.gen(function* () {
+                if ((yield* Ref.updateAndGet(entered, (count) => count + 1)) === 2) {
+                  yield* Deferred.succeed(ready, undefined)
+                }
+                yield* Deferred.await(ready).pipe(Effect.timeout("100 millis"), Effect.ignore)
+                yield* tx.run(`CREATE TABLE concurrent_migration_probe (id text PRIMARY KEY)`)
+              })
+            },
+          }
+          yield* first.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+
+          const exit = yield* Effect.all(
+            [
+              DatabaseMigration.applyOnly(first, [concurrentMigration]),
+              DatabaseMigration.applyOnly(second, [concurrentMigration]),
+            ],
+            { concurrency: "unbounded", discard: true },
+          ).pipe(Effect.exit)
+
+          expect(Exit.isSuccess(exit)).toBe(true)
+          expect(
+            yield* first.get<{ count: number }>(
+              sql`SELECT count(*) AS count FROM migration WHERE id = ${concurrentMigration.id}`,
+            ),
+          ).toEqual({ count: 1 })
+        }),
+      ),
+    )
+  })
+
+  test("serializes one incremental migration across separate processes", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "cross-process-migration.sqlite")
+    const start = path.join(tmp.path, "start")
+    const firstReady = path.join(tmp.path, "first-ready")
+    const secondReady = path.join(tmp.path, "second-ready")
+    const firstEntered = path.join(tmp.path, "first-entered")
+    const secondEntered = path.join(tmp.path, "second-entered")
+
+    await withDatabase(
+      filename,
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(sql`CREATE TABLE migration_probe (id integer PRIMARY KEY AUTOINCREMENT)`)
+      }),
+    )
+
+    const first = migrationWorker({
+      filename,
+      start,
+      ready: firstReady,
+      entered: firstEntered,
+      peerEntered: secondEntered,
+    })
+    const second = migrationWorker({
+      filename,
+      start,
+      ready: secondReady,
+      entered: secondEntered,
+      peerEntered: firstEntered,
+    })
+    const results = Promise.all([waitForChild(first), waitForChild(second)])
+    await Promise.all([waitForFile(firstReady), waitForFile(secondReady)])
+    await Bun.write(start, "go")
+
+    expect(await results).toEqual([
+      { code: 0, stderr: "" },
+      { code: 0, stderr: "" },
+    ])
+    await withDatabase(
+      filename,
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        expect(yield* db.get<{ count: number }>(sql`SELECT count(*) AS count FROM migration_probe`)).toEqual({
+          count: 1,
+        })
+        expect(
+          yield* db.get<{ count: number }>(
+            sql`SELECT count(*) AS count FROM migration WHERE id = 'test_cross_process_incremental'`,
+          ),
+        ).toEqual({ count: 1 })
+      }),
+    )
+  })
+
   test("serializes concurrent embedded initialization for one database path", async () => {
     await using tmp = await tmpdir()
     const filename = path.join(tmp.path, "embedded.sqlite")
@@ -110,6 +214,14 @@ describe("DatabaseMigration", () => {
             sql`SELECT name FROM pragma_table_info('session_context_epoch') WHERE name IN ('agent', 'replacement_seq', 'revision')`,
           ),
         ).toBeUndefined()
+        expect(
+          yield* db.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_run_lease'`),
+        ).toEqual({ name: "session_run_lease" })
+        expect(
+          (yield* db.all<{ name: string }>(sql`PRAGMA table_info(background_task_execution)`)).map(
+            (column) => column.name,
+          ),
+        ).toEqual(expect.arrayContaining(["parent_variant", "followup_claimed_at"]))
         expect(yield* db.get(sql`SELECT count(*) as count FROM migration`)).toEqual({ count: migrations.length })
         expect(
           yield* db.all(
@@ -679,6 +791,74 @@ describe("DatabaseMigration", () => {
     )
   })
 
+  test("upgrades the consolidated background execution schema with session run authority", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(sql`CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, data text NOT NULL)`)
+        yield* DatabaseMigration.applyOnly(db, [backgroundTaskExecutionMigration])
+        yield* db.run(sql`INSERT INTO session (id) VALUES ('ses_child')`)
+        yield* db.run(
+          sql`INSERT INTO message (id, session_id, data) VALUES ('msg_parent', 'ses_parent', ${JSON.stringify({ role: "assistant", variant: "xhigh" })})`,
+        )
+        yield* db.run(sql`
+          INSERT INTO background_task_execution (
+            session_id,
+            parent_session_id,
+            generation,
+            owner_id,
+            state,
+            description,
+            parent_message_id,
+            lease_expires_at,
+            delivery,
+            time_created,
+            time_updated
+          ) VALUES (
+            'ses_child',
+            'ses_parent',
+            'generation-1',
+            'owner-1',
+            'running',
+            'child',
+            'msg_parent',
+            1000,
+            '{"messageID":"msg_delivery","partID":"part_delivery"}',
+            1,
+            1
+          )
+        `)
+
+        yield* DatabaseMigration.applyOnly(db, [sessionRunLeaseMigration])
+
+        expect(
+          (yield* db.all<{ name: string }>(sql`PRAGMA table_info(background_task_execution)`)).map(
+            (column) => column.name,
+          ),
+        ).toEqual(expect.arrayContaining(["parent_variant", "followup_claimed_at"]))
+        expect(
+          (yield* db.all<{ name: string }>(sql`PRAGMA table_info(session_run_lease)`)).map((column) => column.name),
+        ).toEqual([
+          "session_id",
+          "owner_id",
+          "owner_pid",
+          "owner_incarnation_id",
+          "owner_incarnation_port",
+          "lease_expires_at",
+          "wake_requested_seq",
+          "wake_completed_seq",
+          "cancel_requested_at",
+          "time_created",
+          "time_updated",
+        ])
+        expect(
+          yield* db.get(sql`SELECT parent_variant FROM background_task_execution WHERE session_id = 'ses_child'`),
+        ).toEqual({ parent_variant: "xhigh" })
+      }),
+    )
+  })
+
   test("accepts the legacy background execution superset and records the consolidated migration once", async () => {
     await run(
       Effect.gen(function* () {
@@ -944,3 +1124,41 @@ describe("DatabaseMigration", () => {
     )
   })
 })
+
+function withDatabase<A, E>(filename: string, effect: Effect.Effect<A, E, SqlClientService>) {
+  return Effect.runPromise(
+    Effect.scoped(effect.pipe(Effect.provide(SqliteClient.layer({ filename, disableWAL: true })))),
+  )
+}
+
+function migrationWorker(input: {
+  filename: string
+  start: string
+  ready: string
+  entered: string
+  peerEntered: string
+}) {
+  return spawn(
+    process.execPath,
+    [path.join(import.meta.dir, "fixture/database-migration-worker.ts"), JSON.stringify(input)],
+    { cwd: path.join(import.meta.dir, ".."), stdio: ["ignore", "ignore", "pipe"] },
+  )
+}
+
+function waitForChild(child: ReturnType<typeof migrationWorker>) {
+  return new Promise<{ code: number; stderr: string }>((resolve, reject) => {
+    const stderr: Buffer[] = []
+    child.stderr?.on("data", (chunk) => stderr.push(Buffer.from(chunk)))
+    child.once("error", reject)
+    child.once("close", (code) => resolve({ code: code ?? 1, stderr: Buffer.concat(stderr).toString() }))
+  })
+}
+
+async function waitForFile(file: string) {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    if (await Bun.file(file).exists()) return
+    await Bun.sleep(10)
+  }
+  throw new Error(`Timed out waiting for ${file}`)
+}

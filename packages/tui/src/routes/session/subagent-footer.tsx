@@ -1,18 +1,25 @@
-import { createMemo, createSignal, Show } from "solid-js"
+import { createMemo, createSignal, onCleanup, Show } from "solid-js"
 import { useRouteData } from "../../context/route"
+import { useSDK } from "../../context/sdk"
 import { useSync } from "../../context/sync"
 import { useTheme } from "../../context/theme"
 import { SplitBorder } from "../../ui/border"
 import type { AssistantMessage } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
+import { getSessionActivity } from "../../util/session"
 import { useTerminalDimensions } from "@opentui/solid"
-import { useCommandShortcut, useOpencodeKeymap } from "../../keymap"
+import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
+import { useTuiConfig } from "../../config"
 
 export function SubagentFooter() {
   const route = useRouteData("session")
+  const sdk = useSDK()
   const sync = useSync()
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
   const session = createMemo(() => sync.session.get(route.sessionID))
+  const interruptible = createMemo(
+    () => getSessionActivity(route.sessionID, sync.data.session, sync.data.session_status) !== "idle",
+  )
 
   const subagentInfo = createMemo(() => {
     const s = session()
@@ -55,11 +62,52 @@ export function SubagentFooter() {
   })
 
   const { theme } = useTheme()
+  const tuiConfig = useTuiConfig()
   const keymap = useOpencodeKeymap()
   const parentShortcut = useCommandShortcut("session.parent")
   const previousShortcut = useCommandShortcut("session.child.previous")
   const nextShortcut = useCommandShortcut("session.child.next")
-  const [hover, setHover] = createSignal<"parent" | "prev" | "next" | null>(null)
+  const [hover, setHover] = createSignal<"stop" | "parent" | "prev" | "next" | null>(null)
+  const [interrupt, setInterrupt] = createSignal<{ sessionID: string; count: number }>()
+  let interruptTimer: ReturnType<typeof setTimeout> | undefined
+
+  const clearInterrupt = () => {
+    if (interruptTimer) clearTimeout(interruptTimer)
+    interruptTimer = undefined
+    setInterrupt(undefined)
+  }
+  const abort = (sessionID: string) => {
+    clearInterrupt()
+    void sdk.client.session.abort({ sessionID }).catch(() => {})
+  }
+
+  useBindings(() => ({
+    mode: OPENCODE_BASE_MODE,
+    commands: [
+      {
+        title: "Interrupt session",
+        name: "session.interrupt",
+        category: "Session",
+        hidden: true,
+        enabled: interruptible(),
+        run: () => {
+          const sessionID = route.sessionID
+          const current = interrupt()
+          const count = current?.sessionID === sessionID ? current.count + 1 : 1
+          clearInterrupt()
+          if (count >= 2) return abort(sessionID)
+
+          setInterrupt({ sessionID, count })
+          interruptTimer = setTimeout(() => setInterrupt(undefined), 5000)
+        },
+      },
+    ],
+    bindings: tuiConfig.keybinds.gather("subagent.footer", ["session.interrupt"]),
+  }))
+
+  onCleanup(() => {
+    if (interruptTimer) clearTimeout(interruptTimer)
+  })
   useTerminalDimensions()
 
   return (
@@ -91,6 +139,16 @@ export function SubagentFooter() {
                   {[item().context, item().cost].filter(Boolean).join(" · ")}
                 </text>
               )}
+            </Show>
+            <Show when={interruptible()}>
+              <box
+                onMouseOver={() => setHover("stop")}
+                onMouseOut={() => setHover(null)}
+                onMouseUp={() => abort(route.sessionID)}
+                backgroundColor={hover() === "stop" ? theme.backgroundElement : theme.backgroundPanel}
+              >
+                <text fg={theme.text}>Stop</text>
+              </box>
             </Show>
           </box>
           <box flexDirection="row" gap={2}>

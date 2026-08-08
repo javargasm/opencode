@@ -85,6 +85,55 @@ test("stale session hydration does not overwrite live message parts", async () =
   }
 })
 
+test("live tool output deltas update running metadata", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  const { app, emit, sync } = await mount(() => undefined, tmp.path)
+
+  try {
+    emit(global({ id: "evt_message", type: "message.updated", properties: { sessionID, info: assistant } }))
+    emit(
+      global({
+        id: "evt_part",
+        type: "message.part.updated",
+        properties: {
+          sessionID,
+          time: 1,
+          part: {
+            id: partID,
+            sessionID,
+            messageID,
+            type: "tool",
+            callID: "call",
+            tool: "bash",
+            state: {
+              status: "running",
+              input: { command: "echo streamed" },
+              time: { start: 1 },
+            },
+          },
+        },
+      }),
+    )
+    emit(
+      global({
+        id: "evt_delta",
+        type: "message.part.delta",
+        properties: { sessionID, messageID, partID, field: "metadata.output", delta: " streamed" },
+      }),
+    )
+
+    await wait(() => {
+      const part = sync.data.part[messageID]?.[0]
+      return part?.type === "tool" && part.state.status === "running" && part.state.metadata?.output === " streamed"
+    })
+
+    expect(sync.data.part[messageID][0]).toMatchObject({ state: { metadata: { output: " streamed" } } })
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
 test("orphan live deltas do not suppress hydrated parts", async () => {
   await using tmp = await tmpdir()
   await Bun.write(`${tmp.path}/kv.json`, "{}")

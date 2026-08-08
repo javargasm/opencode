@@ -4,7 +4,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Deferred, Effect, Exit, Fiber, Layer, Schema, Scope } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema, Scope } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { BackgroundTaskExecution } from "@/background/task-execution"
@@ -1536,6 +1536,51 @@ describe("tool.task", () => {
     }),
   )
 
+  background.instance("re-enters durable terminal handling when a local running job is already inactive", () =>
+    Effect.gen(function* () {
+      const executions = yield* BackgroundTaskExecution.Service
+      const jobs = yield* BackgroundJob.Service
+      const runState = yield* SessionRunState.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) => (input.sessionID === chat.id ? Effect.succeed(reply(input, "notified")) : Effect.never),
+      }
+      const params = {
+        description: "inspect bug",
+        prompt: "look into the cache key path",
+        subagent_type: "general",
+        background: true,
+      } as const
+
+      const started = yield* def.execute(params, {
+        ...taskContext(chat.id, assistant.id, promptOps),
+        callID: "call-1",
+      })
+      const generation = started.metadata.backgroundTaskGeneration
+      if (!generation) throw new Error("background task generation was not recorded")
+      const settled = yield* executions.settle({
+        sessionID: started.metadata.sessionId,
+        generation,
+        state: "completed",
+        output: "settled remotely",
+      })
+      if (!settled) throw new Error("durable execution did not settle")
+      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
+
+      const relaunched = yield* def.execute(
+        { ...params, task_id: started.metadata.sessionId },
+        { ...taskContext(chat.id, assistant.id, promptOps), callID: "call-2" },
+      )
+
+      expect(relaunched.metadata.backgroundTaskGeneration).toBe(`${assistant.id}:call-2`)
+      expect(relaunched.output).toContain(`state="running"`)
+      yield* runState.cancel(relaunched.metadata.sessionId)
+    }),
+  )
+
   background.instance("explicit background false stays foreground", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
@@ -2040,7 +2085,7 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("serializes parallel terminal admission through each parent wake", () =>
+  background.instance("admits parallel terminals before either parent wake completes", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
@@ -2089,15 +2134,12 @@ describe("tool.task", () => {
       second.resolve()
       yield* Effect.promise(() => firstWoke.promise).pipe(Effect.timeout("1 second"))
 
-      expect((yield* Effect.promise(() => secondAdmitted.promise).pipe(Effect.timeoutOption("10 millis")))._tag).toBe(
-        "None",
-      )
-      expect(admissions).toBe(1)
-
-      releaseFirstWake.resolve()
+      yield* Effect.promise(() => secondAdmitted.promise).pipe(Effect.timeout("1 second"))
       yield* Effect.promise(() => secondWoke.promise).pipe(Effect.timeout("1 second"))
       expect(admissions).toBe(2)
       expect(wakes).toBe(2)
+
+      releaseFirstWake.resolve()
     }),
   )
 
@@ -2241,17 +2283,21 @@ describe("tool.task", () => {
         generation: "expired-generation",
         description: child.title,
         parentMessageID: assistant.id,
+        parentVariant: "xhigh",
       })
+      yield* sessions.removeMessage({ sessionID: chat.id, messageID: assistant.id })
       now = 1_021
 
       const woke = yield* Deferred.make<void>()
       let admissions = 0
       let wakes = 0
+      let variant: string | undefined
       const promptOps: TaskPromptOps = {
         ...stubOps(),
         prompt: (input) =>
           Effect.sync(() => {
             admissions++
+            variant = input.variant
             return reply(input, "recovered terminal")
           }),
         wake: () =>
@@ -2276,6 +2322,49 @@ describe("tool.task", () => {
       })
       expect(admissions).toBe(1)
       expect(wakes).toBe(1)
+      expect(variant).toBe("xhigh")
+    }),
+  )
+
+  background.instance("recovers a legacy terminal variant from its persisted parent message", () =>
+    Effect.gen(function* () {
+      const executions = yield* BackgroundTaskExecution.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "legacy child" })
+      const ownership = yield* executions.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation: "legacy-generation",
+        description: child.title,
+        parentMessageID: assistant.id,
+      })
+      if (ownership.status !== "claimed") throw new Error("legacy execution was not claimed")
+      const terminal = yield* executions.settle({
+        sessionID: child.id,
+        generation: "legacy-generation",
+        state: "completed",
+        output: "done",
+      })
+      if (!terminal) throw new Error("legacy execution did not settle")
+      let variant: string | undefined
+
+      expect(
+        yield* deliverBackgroundTerminal({
+          executions,
+          sessions,
+          terminal,
+          ops: {
+            ...stubOps(),
+            prompt: (input) =>
+              Effect.sync(() => {
+                variant = input.variant
+                return reply(input, "recovered")
+              }),
+          },
+        }),
+      ).toBe(true)
+      expect(variant).toBe("xhigh")
     }),
   )
 
@@ -2893,11 +2982,25 @@ describe("tool.task", () => {
         context,
       )
 
+      const rejected = yield* def
+        .execute(
+          {
+            description: "check progress again",
+            prompt: "any update on cancellation",
+            subagent_type: "general",
+            task_id: started.metadata.sessionId,
+          },
+          context,
+        )
+        .pipe(Effect.exit)
+
       expect(result.metadata.sessionId).toBe(started.metadata.sessionId)
       expect(result.metadata.background).toBe(true)
       expect(typeof started.metadata.backgroundTaskGeneration).toBe("string")
       expect(result.metadata.backgroundTaskGeneration).toBe(started.metadata.backgroundTaskGeneration)
       expect(result.output).toContain("Background task updated")
+      expect(Exit.isFailure(rejected)).toBe(true)
+      if (Exit.isFailure(rejected)) expect(Cause.pretty(rejected.cause)).toContain("will notify you automatically")
       first.resolve()
       expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
       expect((yield* Effect.promise(() => updated.promise)).parts).toEqual([

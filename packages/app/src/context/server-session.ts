@@ -33,6 +33,16 @@ const historyMessagePageSize = 200
 const sessionInfoLimit = 2_048
 const emptyIDs: ReadonlySet<string> = new Set()
 
+function deltaValue(part: Part, field: string) {
+  if (field === "metadata.output") {
+    if (part.type !== "tool" || part.state.status === "pending") return
+    const output = part.state.metadata?.output
+    return typeof output === "string" ? output : ""
+  }
+  const value = Reflect.get(part, field)
+  return typeof value === "string" ? value : undefined
+}
+
 function needsOlderTurnRoot(source: readonly SessionMessageInfo[]) {
   const boundary = source.find(
     (message) =>
@@ -217,7 +227,7 @@ export function createServerSession(
   const pendingParts = new Map<string, Map<string, Set<string>>>()
   const orphanParts = new Map<string, Set<string>>()
   const removedMessages = new Map<string, Set<string>>()
-  const deltaBases = new Map<string, { base: string; sessionID: string }>()
+  const deltaBases = new Map<string, { base: string; field: string; sessionID: string }>()
   const deleteMessageParts = (
     cache: { part: Record<string, Part[] | undefined>; part_text_accum_delta: Record<string, string | undefined> },
     messageID: string,
@@ -635,14 +645,15 @@ export function createServerSession(
       for (const part of fetched) {
         const accumulated = data.part_text_accum_delta[part.id]
         const base = deltaBases.get(part.id)?.base
+        const field = deltaBases.get(part.id)?.field
+        const current = field ? deltaValue(part, field) : undefined
         const preserveDelta =
           base !== undefined &&
           accumulated !== undefined &&
-          "text" in part &&
-          typeof part.text === "string" &&
-          part.text.startsWith(base) &&
-          accumulated.startsWith(part.text) &&
-          accumulated !== part.text
+          current !== undefined &&
+          current.startsWith(base) &&
+          accumulated.startsWith(current) &&
+          accumulated !== current
         if (preserveDelta) touched.add(part.id)
         if (load?.carriedDeltaParts.get(item.id)?.has(part.id) && !preserveDelta) touched.delete(part.id)
       }
@@ -1210,21 +1221,27 @@ export function createServerSession(
           carried?.delete(props.partID)
           if (carried?.size === 0) load.carriedDeltaParts.delete(props.messageID)
         }
-        const field = props.field as keyof (typeof parts)[number]
-        const current = parts[result.index]?.[field]
-        if (!deltaBases.has(props.partID) && typeof current === "string")
-          deltaBases.set(props.partID, { base: current, sessionID: props.sessionID })
-        setData(
-          "part_text_accum_delta",
-          props.partID,
-          (value) => (value ?? (typeof current === "string" ? current : "")) + props.delta,
-        )
+        const currentPart = parts[result.index]
+        if (!currentPart) return
+        const current = deltaValue(currentPart, props.field)
+        if (props.field === "metadata.output" && current === undefined) return
+        if (!deltaBases.has(props.partID) && current !== undefined)
+          deltaBases.set(props.partID, { base: current, field: props.field, sessionID: props.sessionID })
+        setData("part_text_accum_delta", props.partID, (value) => (value ?? current ?? "") + props.delta)
         setData(
           "part",
           props.messageID,
           produce((draft) => {
             if (!draft) return
             const part = draft[result.index]
+            if (!part) return
+            if (props.field === "metadata.output") {
+              if (part.type !== "tool" || part.state.status === "pending") return
+              const metadata = part.state.metadata ?? {}
+              const output = typeof metadata.output === "string" ? metadata.output : ""
+              part.state.metadata = { ...metadata, output: output + props.delta }
+              return
+            }
             const field = props.field as keyof typeof part
             ;(part[field] as string) = ((part[field] as string | undefined) ?? "") + props.delta
           }),

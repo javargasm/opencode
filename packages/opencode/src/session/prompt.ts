@@ -583,7 +583,13 @@ const layer = Layer.effect(
                   output += chunk
                   if (part.state.status === "running") {
                     part.state.metadata = { output }
-                    yield* sessions.updatePart(part)
+                    yield* sessions.updatePartDelta({
+                      sessionID: part.sessionID,
+                      messageID: part.messageID,
+                      partID: part.id,
+                      field: "metadata.output",
+                      delta: chunk,
+                    })
                   }
                 }),
               )
@@ -1229,6 +1235,7 @@ const layer = Layer.effect(
               assistantMessage: msg,
               sessionID,
               model,
+              history: msgs,
             })
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 

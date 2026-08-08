@@ -62,6 +62,21 @@ const textPart = (messageID: string, input: Partial<TextPart> = {}): TextPart =>
   ...input,
 })
 
+const toolPart = (messageID: string) =>
+  ({
+    id: "part",
+    sessionID: "child",
+    messageID,
+    type: "tool",
+    callID: "call",
+    tool: "bash",
+    state: {
+      status: "running",
+      input: { command: "echo streamed" },
+      time: { start: 1 },
+    },
+  }) as Part
+
 const response = (data: MessageResponse["data"] = [], cursor?: string): MessageResponse => ({
   data,
   response: { headers: new Headers(cursor ? { "x-next-cursor": cursor } : undefined) },
@@ -1026,6 +1041,31 @@ describe("server session", () => {
 
     expect(store.data.part[message.id]).toEqual([{ ...part, text: "stale delta" }])
     expect(store.data.part_text_accum_delta[part.id]).toBe("stale delta")
+  })
+
+  test("preserves a streamed tool output delta after refresh", async () => {
+    const message = userMessage("message")
+    const part = toolPart(message.id)
+    const fetched = structuredClone(part)
+    const store = createServerSession(
+      messageClient(response([{ info: message, parts: [part] }]), response([{ info: message, parts: [fetched] }])),
+    )
+    await store.sync("child")
+    store.apply({
+      type: "message.part.delta",
+      properties: {
+        sessionID: "child",
+        messageID: message.id,
+        partID: part.id,
+        field: "metadata.output",
+        delta: " streamed",
+      },
+    })
+
+    await store.sync("child", { force: true })
+
+    expect(store.data.part[message.id]).toMatchObject([{ state: { metadata: { output: " streamed" } } }])
+    expect(store.data.part_text_accum_delta[part.id]).toBe(" streamed")
   })
 
   test("accepts fetched text that intentionally replaces an accumulated prefix", async () => {

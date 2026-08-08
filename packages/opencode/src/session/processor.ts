@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { isDeepStrictEqual } from "node:util"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -22,10 +23,83 @@ import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
+export type DoomLoopReason = "unchanged_success" | "repeated_failure"
+
+export function detectDoomLoop(input: {
+  messages: SessionV1.WithParts[]
+  assistantMessageID: SessionV1.Assistant["id"]
+  tool: string
+  input: Record<string, unknown>
+}): DoomLoopReason | undefined {
+  const before = input.messages.filter((message) => message.info.id < input.assistantMessageID)
+  const boundary = before
+    .filter(isRealUser)
+    .map((message) => message.info.id)
+    .sort()
+    .at(-1)
+  const messages = before
+    .filter((message) => boundary === undefined || message.info.id > boundary)
+    .sort((a, b) => a.info.id.localeCompare(b.info.id))
+  const current = input.messages.find((message) => message.info.id === input.assistantMessageID)
+  const failures =
+    current?.parts
+      .filter(
+        (part): part is SessionV1.ToolPart =>
+          part.type === "tool" && (part.state.status === "completed" || part.state.status === "error"),
+      )
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .slice(-2) ?? []
+  if (
+    failures.length === 2 &&
+    failures.every(
+      (part) =>
+        part.type === "tool" &&
+        part.tool === input.tool &&
+        part.state.status === "error" &&
+        isDeepStrictEqual(part.state.input, input.input),
+    )
+  ) {
+    return "repeated_failure"
+  }
+
+  const terminals = messages
+    .filter((message) => message.info.role === "assistant")
+    .flatMap((message) => message.parts.toSorted((a, b) => a.id.localeCompare(b.id)))
+    .filter(
+      (part): part is SessionV1.ToolPart =>
+        part.type === "tool" && (part.state.status === "completed" || part.state.status === "error"),
+    )
+    .slice(-DOOM_LOOP_THRESHOLD)
+  if (
+    terminals.length !== DOOM_LOOP_THRESHOLD ||
+    !terminals.every(
+      (part) =>
+        part.tool === input.tool &&
+        part.state.status === "completed" &&
+        isDeepStrictEqual(part.state.input, input.input),
+    )
+  ) {
+    return undefined
+  }
+  const outcomes = terminals.map((part) => {
+    if (part.state.status !== "completed") return undefined
+    return { output: part.state.output, metadata: part.state.metadata }
+  })
+  return outcomes.every((outcome) => isDeepStrictEqual(outcome, outcomes[0])) ? "unchanged_success" : undefined
+}
+
+function isRealUser(message: SessionV1.WithParts) {
+  if (message.info.role !== "user") return false
+  if (message.parts.some((part) => part.type === "compaction")) return false
+  if (message.parts.some((part) => part.type === "text" && part.metadata?.compactionReplay === true)) {
+    return false
+  }
+  return message.parts.some((part) => !("synthetic" in part) || part.synthetic !== true)
+}
+
 export type Result = "compact" | "stop" | "continue"
 
 export interface Handle {
@@ -50,6 +124,7 @@ type Input = {
   assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
+  history?: SessionV1.WithParts[]
 }
 
 export interface Interface {
@@ -64,6 +139,7 @@ type ToolCall = {
 }
 
 interface ProcessorContext extends Input {
+  history: SessionV1.WithParts[]
   toolcalls: Record<string, ToolCall>
   shouldBreak: boolean
   snapshot: string | undefined
@@ -92,7 +168,6 @@ const layer = Layer.effect(
     const status = yield* SessionStatus.Service
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
-    const database = yield* Database.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -103,6 +178,7 @@ const layer = Layer.effect(
         assistantMessage: input.assistantMessage,
         sessionID: input.sessionID,
         model: input.model,
+        history: structuredClone(input.history ?? []),
         toolcalls: {},
         shouldBreak: false,
         snapshot: initialSnapshot,
@@ -349,30 +425,26 @@ const layer = Layer.effect(
                 : value.providerMetadata,
             }))
 
-            const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
-              Effect.provideService(Database.Service, database),
-            )
-            const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
-
-            if (
-              recentParts.length !== DOOM_LOOP_THRESHOLD ||
-              !recentParts.every(
-                (part) =>
-                  part.type === "tool" &&
-                  part.tool === value.name &&
-                  part.state.status !== "pending" &&
-                  JSON.stringify(part.state.input) === JSON.stringify(input),
-              )
-            ) {
-              return
-            }
+            const reason = detectDoomLoop({
+              messages: [
+                ...ctx.history,
+                yield* session.getMessage({
+                  sessionID: ctx.sessionID,
+                  messageID: ctx.assistantMessage.id,
+                }),
+              ],
+              assistantMessageID: ctx.assistantMessage.id,
+              tool: value.name,
+              input,
+            })
+            if (!reason) return
 
             const agent = yield* agents.get(ctx.assistantMessage.agent)
             yield* permission.ask({
               permission: "doom_loop",
               patterns: [value.name],
               sessionID: ctx.assistantMessage.sessionID,
-              metadata: { tool: value.name, input },
+              metadata: { tool: value.name, input, reason },
               always: [value.name],
               ruleset: agent.permission,
             })
@@ -710,7 +782,6 @@ export const node = LayerNode.make({
     SessionStatus.node,
     Image.node,
     EventV2Bridge.node,
-    Database.node,
   ],
 })
 

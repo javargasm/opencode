@@ -19,6 +19,19 @@ import { usePathFormatter } from "../../context/path-format"
 
 type PermissionStage = "permission" | "always" | "reject"
 
+export function doomLoopPermissionCopy(reason: unknown) {
+  if (reason === "unchanged_success") {
+    return {
+      title: "Continue after identical results",
+      description: "The tool returned the same result repeatedly. Continuing may loop.",
+    }
+  }
+  return {
+    title: "Continue after repeated failures",
+    description: "This keeps the session running despite repeated failures.",
+  }
+}
+
 function EditBody(props: { request: PermissionRequest }) {
   const themeState = useTheme()
   const theme = themeState.theme
@@ -358,12 +371,13 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
             }
 
             if (permission === "doom_loop") {
+              const copy = doomLoopPermissionCopy(props.request.metadata?.reason)
               return {
                 icon: "⟳",
-                title: "Continue after repeated failures",
+                title: copy.title,
                 body: (
                   <box paddingLeft={1}>
-                    <text fg={theme.textMuted}>This keeps the session running despite repeated failures.</text>
+                    <text fg={theme.textMuted}>{copy.description}</text>
                   </box>
                 ),
               }

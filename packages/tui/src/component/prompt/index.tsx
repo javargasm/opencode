@@ -19,8 +19,9 @@ import { tint, useTheme } from "../../context/theme"
 import { EmptyBorder, SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { useClipboard } from "../../context/clipboard"
-import { isSessionInterruptible } from "../../util/session"
+import { getActiveDescendantCount, getSessionActivity, isSessionActivityActive } from "../../util/session"
 import { Spinner } from "../spinner"
+import { ActiveDescendantLabel } from "../animated-activity-label"
 import { useSDK } from "../../context/sdk"
 import { useRoute } from "../../context/route"
 import { useProject } from "../../context/project"
@@ -170,9 +171,11 @@ export function Prompt(props: PromptProps) {
   const dialog = useDialog()
   const toast = useToast()
   const status = createMemo(() => sync.data.session_status?.[props.sessionID ?? ""] ?? { type: "idle" })
-  const interruptible = createMemo(() =>
-    isSessionInterruptible(props.sessionID, sync.data.session, sync.data.session_status),
+  const activity = createMemo(() => getSessionActivity(props.sessionID, sync.data.session, sync.data.session_status))
+  const activeDescendantCount = createMemo(() =>
+    getActiveDescendantCount(props.sessionID, sync.data.session, sync.data.session_status),
   )
+  const interruptible = createMemo(() => isSessionActivityActive(activity()))
   const history = usePromptHistory()
   const stash = usePromptStash()
   const keymap = useOpencodeKeymap()
@@ -1336,29 +1339,39 @@ export function Prompt(props: PromptProps) {
     return `Ask anything... "${list()[store.placeholder % list().length]}"`
   })
 
-  const spinnerDef = createMemo(() => {
+  const activityColor = createMemo(() => {
     const agent =
       status().type !== "idle"
         ? (local.agent.list().find((a) => a.name === lastUserMessage()?.agent) ?? local.agent.current())
         : local.agent.current()
-    const color = agent ? local.agent.color(agent.name) : theme.border
+    return agent ? local.agent.color(agent.name) : theme.border
+  })
+  const activityAnimationOptions = createMemo(() => ({
+    color: activityColor(),
+    inactiveFactor: 0.6,
+    minAlpha: 0.3,
+  }))
+  const spinnerDef = createMemo(() => {
     return {
       frames: createFrames({
-        color,
+        ...activityAnimationOptions(),
         style: "blocks",
-        inactiveFactor: 0.6,
         // enableFading: false,
-        minAlpha: 0.3,
       }),
       color: createColors({
-        color,
+        ...activityAnimationOptions(),
         style: "blocks",
-        inactiveFactor: 0.6,
         // enableFading: false,
-        minAlpha: 0.3,
       }),
     }
   })
+  const activitySpinner = () => (
+    <box marginLeft={1}>
+      <Show when={kv.get("animations_enabled", true)} fallback={<text fg={theme.textMuted}>[⋯]</text>}>
+        <spinner color={spinnerDef().color} frames={spinnerDef().frames} interval={40} />
+      </Show>
+    </box>
+  )
   const maxHeight = createMemo(() => tuiConfig.prompt?.max_height ?? Math.max(6, Math.floor(dimensions().height / 3)))
   const moveLabelWidth = createMemo(() => Math.max(12, Math.min(44, dimensions().width - 48)))
 
@@ -1527,7 +1540,7 @@ export function Prompt(props: PromptProps) {
         </box>
         <box width="100%" flexDirection="row" justifyContent="space-between">
           <Switch>
-            <Match when={interruptible()}>
+            <Match when={activity() === "current"}>
               <box
                 flexDirection="row"
                 gap={1}
@@ -1535,11 +1548,14 @@ export function Prompt(props: PromptProps) {
                 justifyContent={status().type === "retry" ? "space-between" : "flex-start"}
               >
                 <box flexShrink={0} flexDirection="row" gap={1}>
-                  <box marginLeft={1}>
-                    <Show when={kv.get("animations_enabled", true)} fallback={<text fg={theme.textMuted}>[⋯]</text>}>
-                      <spinner color={spinnerDef().color} frames={spinnerDef().frames} interval={40} />
-                    </Show>
-                  </box>
+                  {activitySpinner()}
+                  <ActiveDescendantLabel
+                    activity={activity()}
+                    activeDescendantCount={activeDescendantCount()}
+                    color={activityColor()}
+                    mutedColor={theme.textMuted}
+                    animated={animationsEnabled()}
+                  />
                   <box flexDirection="row" gap={1} flexShrink={0}>
                     {(() => {
                       const retry = createMemo(() => {
@@ -1599,6 +1615,24 @@ export function Prompt(props: PromptProps) {
                     })()}
                   </box>
                 </box>
+                <text fg={store.interrupt > 0 ? theme.primary : theme.text}>
+                  esc{" "}
+                  <span style={{ fg: store.interrupt > 0 ? theme.primary : theme.textMuted }}>
+                    {store.interrupt > 0 ? "again to interrupt" : "interrupt"}
+                  </span>
+                </text>
+              </box>
+            </Match>
+            <Match when={activity() === "descendant"}>
+              <box flexDirection="row" gap={1} flexShrink={0}>
+                {activitySpinner()}
+                <ActiveDescendantLabel
+                  activity={activity()}
+                  activeDescendantCount={activeDescendantCount()}
+                  color={activityColor()}
+                  mutedColor={theme.textMuted}
+                  animated={animationsEnabled()}
+                />
                 <text fg={store.interrupt > 0 ? theme.primary : theme.text}>
                   esc{" "}
                   <span style={{ fg: store.interrupt > 0 ? theme.primary : theme.textMuted }}>

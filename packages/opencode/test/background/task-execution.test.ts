@@ -46,6 +46,34 @@ describe("BackgroundTaskExecution", () => {
     }),
   )
 
+  it.live("allows one durable follow-up per active background generation", () =>
+    Effect.gen(function* () {
+      const ids = yield* seed()
+      const owner = yield* BackgroundTaskExecution.make({ ownerID: "runtime-a" })
+      const remote = yield* BackgroundTaskExecution.make({ ownerID: "runtime-b" })
+      yield* owner.claim({ ...claim(ids, "generation-1"), parentVariant: "xhigh" })
+
+      expect(yield* owner.claimFollowup({ sessionID: ids.child, generation: "generation-1" })).toBe("claimed")
+      expect(yield* remote.claimFollowup({ sessionID: ids.child, generation: "generation-1" })).toBe("already_claimed")
+      expect(yield* owner.get(ids.child)).toMatchObject({
+        parentVariant: "xhigh",
+        followupClaimedAt: expect.any(Number),
+      })
+
+      yield* owner.settle({
+        sessionID: ids.child,
+        generation: "generation-1",
+        state: "completed",
+        output: "done",
+      })
+      expect(yield* owner.claimFollowup({ sessionID: ids.child, generation: "generation-1" })).toBe("inactive")
+      yield* owner.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
+      yield* owner.completeDelivery({ sessionID: ids.child, generation: "generation-1" })
+      expect(yield* owner.claim(claim(ids, "generation-2"))).toMatchObject({ status: "claimed" })
+      expect(yield* owner.claimFollowup({ sessionID: ids.child, generation: "generation-2" })).toBe("claimed")
+    }),
+  )
+
   it.live("reconciles an expired lease when the former owner tries to settle", () =>
     Effect.gen(function* () {
       const ids = yield* seed()

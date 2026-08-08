@@ -384,6 +384,7 @@ const layer = Layer.effect(
         assistantMessage: msg,
         sessionID: input.sessionID,
         model,
+        history: msgs,
       })
       const result = yield* processor.process({
         user: userMessage,
@@ -432,6 +433,16 @@ const layer = Layer.effect(
             format: original.format,
             tools: original.tools,
             system: original.system,
+          })
+          yield* session.updatePart({
+            id: PartID.ascending(),
+            messageID: replayMsg.id,
+            sessionID: input.sessionID,
+            type: "text",
+            text: "",
+            synthetic: true,
+            ignored: true,
+            metadata: { compactionReplay: true },
           })
           for (const part of replay.parts) {
             if (part.type === "compaction") continue

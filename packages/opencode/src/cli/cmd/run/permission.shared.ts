@@ -109,10 +109,17 @@ export function permissionInfo(request: PermissionRequest): PermissionInfo {
   }
 
   if (request.permission === "doom_loop") {
+    if (request.metadata?.reason !== "unchanged_success") {
+      return {
+        icon: "⟳",
+        title: "Continue after repeated failures",
+        lines: ["This keeps the session running despite repeated failures."],
+      }
+    }
     return {
       icon: "⟳",
-      title: "Continue after repeated failures",
-      lines: ["This keeps the session running despite repeated failures."],
+      title: "Continue after identical results",
+      lines: ["The tool returned the same result repeatedly. Continuing may loop."],
     }
   }
 

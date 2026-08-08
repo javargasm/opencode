@@ -34,6 +34,21 @@ const textPart = (id: string, sessionID: string, messageID: string) =>
     text: id,
   }) as Part
 
+const toolPart = (id: string, sessionID: string, messageID: string) =>
+  ({
+    id,
+    sessionID,
+    messageID,
+    type: "tool",
+    callID: "call",
+    tool: "bash",
+    state: {
+      status: "running",
+      input: { command: "echo streamed" },
+      time: { start: 1 },
+    },
+  }) as Part
+
 const permissionRequest = (id: string, sessionID: string, title = id) =>
   ({
     id,
@@ -153,6 +168,26 @@ describe("applyDirectoryEvent", () => {
 
     expect(store.part_text_accum_delta.part).toBe("existing appended")
     expect((store.part.message?.[0] as { text: string }).text).toBe("existing appended")
+  })
+
+  test("applies nested tool output deltas", () => {
+    const part = toolPart("part", "session", "message")
+    const [store, setStore] = createStore(baseState({ part: { message: [part] } }))
+
+    applyDirectoryEvent({
+      event: {
+        type: "message.part.delta",
+        properties: { messageID: "message", partID: "part", field: "metadata.output", delta: " streamed" },
+      },
+      store,
+      setStore,
+      push() {},
+      directory: "/tmp",
+      loadLsp() {},
+    })
+
+    expect(store.part_text_accum_delta.part).toBe(" streamed")
+    expect(store.part.message?.[0]).toMatchObject({ state: { metadata: { output: " streamed" } } })
   })
 
   test("preserves a Home-specific retained session limit", () => {

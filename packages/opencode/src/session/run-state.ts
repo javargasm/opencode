@@ -4,10 +4,11 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
 import { BackgroundTaskExecution } from "@/background/task-execution"
-import { Effect, Latch, Layer, Scope, Context } from "effect"
+import { Effect, Exit, Latch, Layer, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
+import { SessionRunLease } from "./run-lease"
 
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
@@ -39,11 +40,13 @@ const layer = Layer.effect(
     const background = yield* BackgroundJob.Service
     const executions = yield* BackgroundTaskExecution.Service
     const status = yield* SessionStatus.Service
+    const leases = yield* SessionRunLease.Service
 
     const state = yield* InstanceState.make(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope
         const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
+        const statusWatchers = new Set<SessionID>()
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
             yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
@@ -51,11 +54,33 @@ const layer = Layer.effect(
               discard: true,
             })
             runners.clear()
+            statusWatchers.clear()
           }),
         )
-        return { runners, scope }
+        return { runners, scope, statusWatchers }
       }),
     )
+
+    const settleStatus = Effect.fn("SessionRunState.settleStatus")(function* (
+      sessionID: SessionID,
+      data: {
+        runners: Map<SessionID, Runner.Runner<SessionV1.WithParts>>
+        scope: Scope.Scope
+        statusWatchers: Set<SessionID>
+      },
+    ) {
+      if (data.statusWatchers.has(sessionID)) return
+      data.statusWatchers.add(sessionID)
+      yield* Scope.provide(data.scope)(
+        Effect.gen(function* () {
+          while (yield* leases.isBusy(sessionID)) yield* Effect.sleep("25 millis")
+          if (!data.runners.get(sessionID)?.busy) yield* status.set(sessionID, { type: "idle" })
+        }).pipe(
+          Effect.ensuring(Effect.sync(() => data.statusWatchers.delete(sessionID))),
+          Effect.forkScoped({ startImmediately: true }),
+        ),
+      )
+    })
 
     const runner = Effect.fn("SessionRunState.runner")(function* (
       sessionID: SessionID,
@@ -67,6 +92,10 @@ const layer = Layer.effect(
       const next = Runner.make<SessionV1.WithParts>(data.scope, {
         onIdle: Effect.gen(function* () {
           data.runners.delete(sessionID)
+          if (yield* leases.isBusy(sessionID)) {
+            yield* settleStatus(sessionID, data)
+            return
+          }
           yield* status.set(sessionID, { type: "idle" })
         }),
         onBusy: status.set(sessionID, { type: "busy" }),
@@ -79,23 +108,82 @@ const layer = Layer.effect(
     const assertNotBusy = Effect.fn("SessionRunState.assertNotBusy")(function* (sessionID: SessionID) {
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
-      if (existing?.busy) yield* busyError(sessionID)
+      if (existing?.busy || (yield* leases.isBusy(sessionID))) yield* busyError(sessionID)
     })
 
     const interrupt = Effect.fn("SessionRunState.interrupt")(function* (sessionID: SessionID) {
+      yield* leases.requestCancel(sessionID)
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
       if (!existing) {
-        yield* status.set(sessionID, { type: "idle" })
+        if (!(yield* leases.isBusy(sessionID))) yield* status.set(sessionID, { type: "idle" })
         return
       }
       yield* existing.cancel
+      if (yield* leases.isBusy(sessionID)) {
+        yield* settleStatus(sessionID, data)
+        return
+      }
+      yield* status.set(sessionID, { type: "idle" })
     })
 
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
-      yield* executions.requestCancel(sessionID)
+      const descendants = yield* executions.requestCancel(sessionID)
       yield* cancelBackgroundJobs(background, sessionID)
-      yield* interrupt(sessionID)
+      yield* Effect.forEach(new Set([sessionID, ...descendants.map((execution) => execution.sessionID)]), interrupt, {
+        concurrency: "unbounded",
+        discard: true,
+      })
+    })
+
+    const heartbeat = Effect.fn("SessionRunState.heartbeat")(function* (
+      sessionID: SessionID,
+      token: string,
+      work: Effect.Effect<SessionV1.WithParts>,
+    ) {
+      const watch = Effect.gen(function* () {
+        while (true) {
+          yield* Effect.sleep(Math.max(25, Math.min(250, Math.floor(leases.leaseMillis / 3))))
+          if ((yield* leases.heartbeat(sessionID, token)) !== "owned") return yield* Effect.interrupt
+        }
+      })
+      return yield* Effect.raceFirst(work, watch).pipe(
+        Effect.onExit((exit) =>
+          Exit.isFailure(exit) ? leases.release(sessionID, token).pipe(Effect.asVoid) : Effect.void,
+        ),
+      )
+    })
+
+    const drain = Effect.fn("SessionRunState.drain")(function* (
+      sessionID: SessionID,
+      revision: number,
+      onInterrupt: Effect.Effect<SessionV1.WithParts>,
+      work: Effect.Effect<SessionV1.WithParts>,
+    ) {
+      let result: SessionV1.WithParts | undefined
+      while (true) {
+        const current = yield* leases.get(sessionID)
+        if (current && current.wakeCompleted >= revision) return result ?? (yield* onInterrupt)
+        const outcome = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const claim = yield* leases.claimScoped(sessionID)
+            if (!claim) return { type: "unavailable" as const }
+            const value = yield* heartbeat(sessionID, claim.token, work)
+            if (!(yield* leases.complete(sessionID, claim.token, claim.targetRevision))) {
+              return { type: "interrupted" as const }
+            }
+            return { type: "completed" as const, value }
+          }),
+        )
+        if (outcome.type === "unavailable") {
+          yield* Effect.sleep("25 millis")
+          continue
+        }
+        if (outcome.type === "interrupted") return yield* onInterrupt
+        result = outcome.value
+        const completed = yield* leases.get(sessionID)
+        if (!completed || completed.wakeCompleted >= completed.wakeRequested) return result
+      }
     })
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
@@ -103,7 +191,8 @@ const layer = Layer.effect(
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
+      const revision = yield* leases.requestWake(sessionID)
+      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(drain(sessionID, revision, onInterrupt, work))
     })
 
     const wake = Effect.fn("SessionRunState.wake")(function* (
@@ -111,7 +200,8 @@ const layer = Layer.effect(
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt)).wake(work)
+      const revision = yield* leases.requestWake(sessionID)
+      return yield* (yield* runner(sessionID, onInterrupt)).wake(drain(sessionID, revision, onInterrupt, work))
     })
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
@@ -120,9 +210,15 @@ const layer = Layer.effect(
       work: Effect.Effect<SessionV1.WithParts>,
       ready?: Latch.Latch,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt))
-        .startShell(work, ready)
-        .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
+      return yield* Effect.scoped(
+        Effect.gen(function* () {
+          const claim = yield* leases.claimExclusiveScoped(sessionID)
+          if (!claim) return yield* busyError(sessionID)
+          return yield* (yield* runner(sessionID, onInterrupt))
+            .startShell(heartbeat(sessionID, claim.token, work), ready)
+            .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
+        }),
+      )
     })
 
     return Service.of({ assertNotBusy, cancel, interrupt, ensureRunning, wake, startShell })
@@ -170,7 +266,7 @@ function busyError(sessionID: SessionID) {
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [BackgroundJob.node, BackgroundTaskExecution.node, SessionStatus.node],
+  deps: [BackgroundJob.node, BackgroundTaskExecution.node, SessionStatus.node, SessionRunLease.node],
 })
 
 export * as SessionRunState from "./run-state"

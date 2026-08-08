@@ -5,6 +5,7 @@ import { Effect, Layer, Context } from "effect"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { BackgroundTaskExecution } from "@/background/task-execution"
+import { SessionRunLease } from "./run-lease"
 
 export const Info = SessionStatusEvent.Info
 export type Info = SessionStatusEvent.Info
@@ -24,6 +25,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
     const executions = yield* BackgroundTaskExecution.Service
+    const leases = yield* SessionRunLease.Service
 
     const state = yield* InstanceState.make(
       Effect.fn("SessionStatus.state")(() => Effect.succeed(new Map<SessionID, Info>())),
@@ -32,6 +34,7 @@ const layer = Layer.effect(
     const get = Effect.fn("SessionStatus.get")(function* (sessionID: SessionID) {
       const data = yield* InstanceState.get(state)
       const current = data.get(sessionID)
+      if (yield* leases.isBusy(sessionID)) return current ?? { type: "busy" as const }
       const execution = yield* executions.get(sessionID)
       if (execution && (execution.state !== "running" || execution.cancelRequestedAt !== undefined)) {
         return { type: "idle" as const }
@@ -49,6 +52,9 @@ const layer = Layer.effect(
           continue
         }
         if (!result.has(execution.sessionID)) result.set(execution.sessionID, { type: "busy" })
+      }
+      for (const lease of yield* leases.list({ projectID: ctx.project.id, directory: ctx.directory })) {
+        if (!result.has(lease.sessionID)) result.set(lease.sessionID, { type: "busy" })
       }
       return result
     })
@@ -71,7 +77,7 @@ const layer = Layer.effect(
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [EventV2Bridge.node, BackgroundTaskExecution.node],
+  deps: [EventV2Bridge.node, BackgroundTaskExecution.node, SessionRunLease.node],
 })
 
 export * as SessionStatus from "./status"

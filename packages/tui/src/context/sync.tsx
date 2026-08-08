@@ -400,6 +400,14 @@ export const {
             event.properties.messageID,
             produce((draft) => {
               const part = draft[result.index]
+              if (!part) return
+              if (event.properties.field === "metadata.output") {
+                if (part.type !== "tool" || part.state.status === "pending") return
+                const metadata = part.state.metadata ?? {}
+                const output = typeof metadata.output === "string" ? metadata.output : ""
+                part.state.metadata = { ...metadata, output: output + event.properties.delta }
+                return
+              }
               const field = event.properties.field as keyof typeof part
               const existing = part[field] as string | undefined
               ;(part[field] as string) = (existing ?? "") + event.properties.delta
