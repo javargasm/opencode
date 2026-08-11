@@ -49,6 +49,10 @@ export type ClaimResult = {
 
 export type FollowupClaim = "claimed" | "already_claimed" | "inactive"
 
+export type LeaseClaim = {
+  token: string
+}
+
 export interface Interface {
   readonly ownerID: string
   readonly leaseMillis: number
@@ -75,12 +79,20 @@ export interface Interface {
   readonly listPendingHandoffs: (parentSessionID: SessionID) => Effect.Effect<Info[]>
   readonly listRunning: (parentSessionID?: SessionID) => Effect.Effect<Info[]>
   readonly pendingTerminals: (sessionID?: SessionID) => Effect.Effect<Info[]>
-  readonly claimDelivery: (input: { sessionID: SessionID; generation: string }) => Effect.Effect<Info | undefined>
-  readonly completeDelivery: (input: { sessionID: SessionID; generation: string }) => Effect.Effect<boolean>
+  readonly claimDelivery: (input: { sessionID: SessionID; generation: string }) => Effect.Effect<LeaseClaim | undefined>
+  readonly completeDelivery: (input: {
+    sessionID: SessionID
+    generation: string
+    token: string
+  }) => Effect.Effect<boolean>
   readonly requireWake: (input: { sessionID: SessionID; generation: string }) => Effect.Effect<boolean>
-  readonly claimWake: (input: { sessionID: SessionID; generation: string }) => Effect.Effect<boolean>
-  readonly heartbeatWake: (input: { sessionID: SessionID; generation: string }) => Effect.Effect<"owned" | "lost">
-  readonly completeWake: (input: { sessionID: SessionID; generation: string }) => Effect.Effect<boolean>
+  readonly claimWake: (input: { sessionID: SessionID; generation: string }) => Effect.Effect<LeaseClaim | undefined>
+  readonly heartbeatWake: (input: {
+    sessionID: SessionID
+    generation: string
+    token: string
+  }) => Effect.Effect<"owned" | "lost">
+  readonly completeWake: (input: { sessionID: SessionID; generation: string; token: string }) => Effect.Effect<boolean>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/BackgroundTaskExecution") {}
@@ -470,31 +482,31 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
     const claimDelivery: Interface["claimDelivery"] = Effect.fn("BackgroundTaskExecution.claimDelivery")(
       function* (input) {
         const time = now()
-        return fromRow(
-          yield* db
-            .update(BackgroundTaskExecutionTable)
-            .set({
-              delivery_owner_id: ownerID,
-              delivery_lease_expires_at: time + leaseMillis,
-              time_updated: time,
-            })
-            .where(
-              and(
-                eq(BackgroundTaskExecutionTable.session_id, input.sessionID),
-                eq(BackgroundTaskExecutionTable.generation, input.generation),
-                sql`${BackgroundTaskExecutionTable.state} <> 'running'`,
-                isNull(BackgroundTaskExecutionTable.terminal_delivered_at),
-                or(
-                  isNull(BackgroundTaskExecutionTable.delivery_owner_id),
-                  isNull(BackgroundTaskExecutionTable.delivery_lease_expires_at),
-                  lte(BackgroundTaskExecutionTable.delivery_lease_expires_at, time),
-                ),
+        const token = `${ownerID}:${crypto.randomUUID()}`
+        const claimed = yield* db
+          .update(BackgroundTaskExecutionTable)
+          .set({
+            delivery_owner_id: token,
+            delivery_lease_expires_at: time + leaseMillis,
+            time_updated: time,
+          })
+          .where(
+            and(
+              eq(BackgroundTaskExecutionTable.session_id, input.sessionID),
+              eq(BackgroundTaskExecutionTable.generation, input.generation),
+              sql`${BackgroundTaskExecutionTable.state} <> 'running'`,
+              isNull(BackgroundTaskExecutionTable.terminal_delivered_at),
+              or(
+                isNull(BackgroundTaskExecutionTable.delivery_owner_id),
+                isNull(BackgroundTaskExecutionTable.delivery_lease_expires_at),
+                lte(BackgroundTaskExecutionTable.delivery_lease_expires_at, time),
               ),
-            )
-            .returning()
-            .get()
-            .pipe(Effect.orDie),
-        )
+            ),
+          )
+          .returning({ sessionID: BackgroundTaskExecutionTable.session_id })
+          .get()
+          .pipe(Effect.orDie)
+        return claimed ? { token } : undefined
       },
     )
 
@@ -509,7 +521,7 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
               and(
                 eq(BackgroundTaskExecutionTable.session_id, input.sessionID),
                 eq(BackgroundTaskExecutionTable.generation, input.generation),
-                eq(BackgroundTaskExecutionTable.delivery_owner_id, ownerID),
+                eq(BackgroundTaskExecutionTable.delivery_owner_id, input.token),
                 isNull(BackgroundTaskExecutionTable.terminal_delivered_at),
               ),
             )
@@ -522,29 +534,29 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
 
     const claimWake: Interface["claimWake"] = Effect.fn("BackgroundTaskExecution.claimWake")(function* (input) {
       const time = now()
-      return Boolean(
-        yield* db
-          .update(BackgroundTaskExecutionTable)
-          .set({ wake_owner_id: ownerID, wake_lease_expires_at: time + leaseMillis, time_updated: time })
-          .where(
-            and(
-              eq(BackgroundTaskExecutionTable.session_id, input.sessionID),
-              eq(BackgroundTaskExecutionTable.generation, input.generation),
-              sql`${BackgroundTaskExecutionTable.state} <> 'cancelled'`,
-              eq(BackgroundTaskExecutionTable.wake_required, true),
-              isNotNull(BackgroundTaskExecutionTable.terminal_delivered_at),
-              isNull(BackgroundTaskExecutionTable.wake_claimed_at),
-              or(
-                isNull(BackgroundTaskExecutionTable.wake_owner_id),
-                isNull(BackgroundTaskExecutionTable.wake_lease_expires_at),
-                lte(BackgroundTaskExecutionTable.wake_lease_expires_at, time),
-              ),
+      const token = `${ownerID}:${crypto.randomUUID()}`
+      const claimed = yield* db
+        .update(BackgroundTaskExecutionTable)
+        .set({ wake_owner_id: token, wake_lease_expires_at: time + leaseMillis, time_updated: time })
+        .where(
+          and(
+            eq(BackgroundTaskExecutionTable.session_id, input.sessionID),
+            eq(BackgroundTaskExecutionTable.generation, input.generation),
+            sql`${BackgroundTaskExecutionTable.state} <> 'cancelled'`,
+            eq(BackgroundTaskExecutionTable.wake_required, true),
+            isNotNull(BackgroundTaskExecutionTable.terminal_delivered_at),
+            isNull(BackgroundTaskExecutionTable.wake_claimed_at),
+            or(
+              isNull(BackgroundTaskExecutionTable.wake_owner_id),
+              isNull(BackgroundTaskExecutionTable.wake_lease_expires_at),
+              lte(BackgroundTaskExecutionTable.wake_lease_expires_at, time),
             ),
-          )
-          .returning({ sessionID: BackgroundTaskExecutionTable.session_id })
-          .get()
-          .pipe(Effect.orDie),
-      )
+          ),
+        )
+        .returning({ sessionID: BackgroundTaskExecutionTable.session_id })
+        .get()
+        .pipe(Effect.orDie)
+      return claimed ? { token } : undefined
     })
 
     const requireWake: Interface["requireWake"] = Effect.fn("BackgroundTaskExecution.requireWake")(function* (input) {
@@ -577,7 +589,7 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
             and(
               eq(BackgroundTaskExecutionTable.session_id, input.sessionID),
               eq(BackgroundTaskExecutionTable.generation, input.generation),
-              eq(BackgroundTaskExecutionTable.wake_owner_id, ownerID),
+              eq(BackgroundTaskExecutionTable.wake_owner_id, input.token),
               isNotNull(BackgroundTaskExecutionTable.terminal_delivered_at),
               isNull(BackgroundTaskExecutionTable.wake_claimed_at),
               gt(BackgroundTaskExecutionTable.wake_lease_expires_at, time),
@@ -601,7 +613,7 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
               and(
                 eq(BackgroundTaskExecutionTable.session_id, input.sessionID),
                 eq(BackgroundTaskExecutionTable.generation, input.generation),
-                eq(BackgroundTaskExecutionTable.wake_owner_id, ownerID),
+                eq(BackgroundTaskExecutionTable.wake_owner_id, input.token),
                 isNotNull(BackgroundTaskExecutionTable.terminal_delivered_at),
                 isNull(BackgroundTaskExecutionTable.wake_claimed_at),
                 gt(BackgroundTaskExecutionTable.wake_lease_expires_at, time),

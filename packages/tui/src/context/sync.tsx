@@ -37,6 +37,8 @@ const emptyConsoleState: ConsoleState = {
   consoleManagedProviders: [],
   switchableOrgCount: 0,
 }
+const sessionStatusRefreshInterval = 5_000
+const sessionStatusRequestTimeout = 4_000
 
 function search<T>(items: T[], target: string, key: (item: T) => string) {
   let left = 0
@@ -63,7 +65,7 @@ export const {
   provider: SyncProvider,
 } = createSimpleContext({
   name: "Sync",
-  init: () => {
+  init: (input: { sessionStatusTiming?: { refreshInterval?: number; requestTimeout?: number } }) => {
     const startup = useTuiStartup()
     const kv = useKV()
     const permission = usePermission()
@@ -146,6 +148,8 @@ export const {
     const event = useEvent()
     const project = useProject()
     const sdk = useSDK()
+    const statusRefreshInterval = input.sessionStatusTiming?.refreshInterval ?? sessionStatusRefreshInterval
+    const statusRequestTimeout = input.sessionStatusTiming?.requestTimeout ?? sessionStatusRequestTimeout
 
     const fullSyncedSessions = new Set<string>()
     const syncingSessions = new Map<string, Promise<void>>()
@@ -157,23 +161,80 @@ export const {
       hydratingSessions.get(sessionID)?.parts.add(partID)
     }
     let sessionStatusRevision = 0
-    let sessionStatusRefresh: Promise<void> | undefined
+    let sessionStatusWorkspace = project.workspace.current()
+    let sessionStatusNeedsRefresh = true
+    let sessionStatusRefresh:
+      | {
+          token: object
+          workspace: string | undefined
+          controller: AbortController
+          promise: Promise<void>
+        }
+      | undefined
 
-    function refreshSessionStatus(workspace = project.workspace.current()) {
-      if (sessionStatusRefresh) return sessionStatusRefresh
+    function adoptSessionStatusWorkspace(workspace: string | undefined) {
+      if (workspace === sessionStatusWorkspace) return
+      sessionStatusWorkspace = workspace
+      sessionStatusRevision++
+      sessionStatusNeedsRefresh = true
+      sessionStatusRefresh?.controller.abort()
+      setStore("session_status", reconcile({}))
+    }
+
+    function refreshSessionStatus(workspace = project.workspace.current(), restart = false) {
+      const current = project.workspace.current()
+      if (workspace !== current) {
+        adoptSessionStatusWorkspace(current)
+        sessionStatusNeedsRefresh = true
+        return Promise.resolve()
+      }
+      adoptSessionStatusWorkspace(workspace)
+      if (
+        sessionStatusRefresh &&
+        sessionStatusRefresh.workspace === workspace &&
+        !sessionStatusRefresh.controller.signal.aborted &&
+        !restart
+      ) {
+        return sessionStatusRefresh.promise
+      }
+      sessionStatusRefresh?.controller.abort()
+      const token = {}
+      const controller = new AbortController()
       const request = (async () => {
         while (true) {
           const revision = sessionStatusRevision
-          const response = await sdk.client.session.status({ workspace })
+          const timeout = setTimeout(() => controller.abort(), statusRequestTimeout)
+          const response = await sdk.client.session
+            .status({ workspace }, { signal: controller.signal, throwOnError: true })
+            .finally(() => clearTimeout(timeout))
+          if (controller.signal.aborted) return
+          if (sessionStatusRefresh?.token !== token) return
+          const current = project.workspace.current()
+          if (workspace !== current) {
+            adoptSessionStatusWorkspace(current)
+            sessionStatusNeedsRefresh = true
+            return
+          }
+          if (workspace !== sessionStatusWorkspace) {
+            sessionStatusNeedsRefresh = true
+            return
+          }
           if (revision !== sessionStatusRevision) continue
-          setStore("session_status", reconcile(response.data ?? {}))
+          setStore("session_status", reconcile(response.data))
+          sessionStatusNeedsRefresh = false
           return
         }
       })()
-      sessionStatusRefresh = request.finally(() => {
-        sessionStatusRefresh = undefined
-      })
-      return sessionStatusRefresh
+      const promise = request
+        .catch((error) => {
+          if (sessionStatusRefresh?.token === token) sessionStatusNeedsRefresh = true
+          throw error
+        })
+        .finally(() => {
+          if (sessionStatusRefresh?.token === token) sessionStatusRefresh = undefined
+        })
+      sessionStatusRefresh = { token, workspace, controller, promise }
+      return promise
     }
 
     function sessionListQuery(): { scope?: "project"; path?: string } {
@@ -194,11 +255,15 @@ export const {
 
     event.subscribe((event, { directory, workspace }) => {
       switch (event.type) {
-        case "server.connected":
+        case "server.connected": {
+          const current = project.workspace.current()
+          if (workspace !== undefined && workspace !== current) break
           sessionStatusRevision++
-          void refreshSessionStatus(workspace).catch(() => {})
+          void refreshSessionStatus(current, true).catch(() => {})
           break
+        }
         case "server.instance.disposed":
+          if (workspace !== undefined && workspace !== project.workspace.current()) break
           sessionStatusRevision++
           void bootstrap()
           break
@@ -338,6 +403,8 @@ export const {
         }
 
         case "session.status": {
+          if (workspace !== project.workspace.current()) break
+          adoptSessionStatusWorkspace(workspace)
           sessionStatusRevision++
           setStore("session_status", event.properties.sessionID, event.properties.status)
           break
@@ -484,6 +551,7 @@ export const {
     async function bootstrap(input: { fatal?: boolean } = {}) {
       const fatal = input.fatal ?? true
       const workspace = project.workspace.current()
+      adoptSessionStatusWorkspace(workspace)
       const projectPromise = project.sync()
       const sessionListPromise = projectPromise.then(() => listSessions())
 
@@ -560,7 +628,7 @@ export const {
               .list({ workspace })
               .then((x) => setStore("mcp_resource", reconcile(x.data ?? {}))),
             sdk.client.formatter.status({ workspace }).then((x) => setStore("formatter", reconcile(x.data ?? []))),
-            refreshSessionStatus(workspace),
+            refreshSessionStatus(workspace).catch(() => {}),
             sdk.client.provider.auth({ workspace }).then((x) => setStore("provider_auth", reconcile(x.data ?? {}))),
             sdk.client.vcs.get({ workspace }).then((x) => setStore("vcs", reconcile(x.data))),
             project.workspace.sync(),
@@ -587,10 +655,19 @@ export const {
     })
 
     const sessionStatusTimer = setInterval(() => {
-      if (!Object.values(store.session_status).some((status) => status.type !== "idle")) return
+      if (
+        !sessionStatusNeedsRefresh &&
+        sessionStatusWorkspace === project.workspace.current() &&
+        !Object.values(store.session_status).some((status) => status.type !== "idle")
+      ) {
+        return
+      }
       void refreshSessionStatus().catch(() => {})
-    }, 5_000)
-    onCleanup(() => clearInterval(sessionStatusTimer))
+    }, statusRefreshInterval)
+    onCleanup(() => {
+      clearInterval(sessionStatusTimer)
+      sessionStatusRefresh?.controller.abort()
+    })
 
     const result = {
       data: store,

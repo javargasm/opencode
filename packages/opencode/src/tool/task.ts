@@ -122,13 +122,14 @@ export const deliverBackgroundTerminal = Effect.fn("TaskTool.deliverBackgroundTe
 }) {
   const current = yield* input.executions.get(input.terminal.sessionID)
   if (!current || current.generation !== input.terminal.generation || current.state === "running") return false
-  const terminal =
+  const delivery =
     current.terminalDeliveredAt === undefined
       ? yield* input.executions.claimDelivery({ sessionID: current.sessionID, generation: current.generation })
-      : current
-  if (!terminal) return false
+      : undefined
+  if (current.terminalDeliveredAt === undefined && !delivery) return false
+  const terminal = current
 
-  if (terminal.terminalDeliveredAt === undefined) {
+  if (delivery) {
     const existing = yield* input.sessions.getPart({
       sessionID: terminal.parentSessionID,
       messageID: terminal.delivery.messageID,
@@ -197,16 +198,19 @@ export const deliverBackgroundTerminal = Effect.fn("TaskTool.deliverBackgroundTe
       if (input.afterAdmit) yield* input.afterAdmit({ activeTasks, event, parentAgent })
     }
     if (
-      !(yield* input.executions.completeDelivery({ sessionID: terminal.sessionID, generation: terminal.generation }))
+      !(yield* input.executions.completeDelivery({
+        sessionID: terminal.sessionID,
+        generation: terminal.generation,
+        token: delivery.token,
+      }))
     ) {
       return false
     }
   }
 
   if (terminal.state === "cancelled" || !terminal.wakeRequired) return true
-  if (!(yield* input.executions.claimWake({ sessionID: terminal.sessionID, generation: terminal.generation }))) {
-    return true
-  }
+  const wake = yield* input.executions.claimWake({ sessionID: terminal.sessionID, generation: terminal.generation })
+  if (!wake) return true
   const watch = Effect.gen(function* () {
     while (true) {
       yield* Effect.sleep(Duration.millis(Math.max(10, Math.floor(input.executions.leaseMillis / 3))))
@@ -214,6 +218,7 @@ export const deliverBackgroundTerminal = Effect.fn("TaskTool.deliverBackgroundTe
         (yield* input.executions.heartbeatWake({
           sessionID: terminal.sessionID,
           generation: terminal.generation,
+          token: wake.token,
         })) !== "owned"
       ) {
         return yield* Effect.interrupt
@@ -221,7 +226,11 @@ export const deliverBackgroundTerminal = Effect.fn("TaskTool.deliverBackgroundTe
     }
   })
   yield* Effect.raceFirst(input.ops.wake(terminal.parentSessionID), watch)
-  return yield* input.executions.completeWake({ sessionID: terminal.sessionID, generation: terminal.generation })
+  return yield* input.executions.completeWake({
+    sessionID: terminal.sessionID,
+    generation: terminal.generation,
+    token: wake.token,
+  })
 })
 
 export const recoverBackgroundTerminals = Effect.fn("TaskTool.recoverBackgroundTerminals")(function* (input: {
@@ -922,12 +931,23 @@ export const TaskTool = Tool.define(
                 generation: terminal.generation,
               })
               if (claimed) {
-                yield* executions.completeDelivery({ sessionID: terminal.sessionID, generation: terminal.generation })
-                if (
-                  terminal.state !== "cancelled" &&
-                  (yield* executions.claimWake({ sessionID: terminal.sessionID, generation: terminal.generation }))
-                ) {
-                  yield* executions.completeWake({ sessionID: terminal.sessionID, generation: terminal.generation })
+                yield* executions.completeDelivery({
+                  sessionID: terminal.sessionID,
+                  generation: terminal.generation,
+                  token: claimed.token,
+                })
+                if (terminal.state !== "cancelled") {
+                  const wake = yield* executions.claimWake({
+                    sessionID: terminal.sessionID,
+                    generation: terminal.generation,
+                  })
+                  if (wake) {
+                    yield* executions.completeWake({
+                      sessionID: terminal.sessionID,
+                      generation: terminal.generation,
+                      token: wake.token,
+                    })
+                  }
                 }
               }
             }

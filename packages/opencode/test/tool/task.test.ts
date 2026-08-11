@@ -1696,11 +1696,21 @@ describe("tool.task", () => {
         output: "nested done",
       })
       if (!terminal) throw new Error("nested terminal missing")
-      yield* executions.claimDelivery({ sessionID: descendant.sessionID, generation: descendant.generation })
-      yield* executions.completeDelivery({ sessionID: descendant.sessionID, generation: descendant.generation })
-      expect(yield* executions.claimWake({ sessionID: descendant.sessionID, generation: descendant.generation })).toBe(
-        true,
-      )
+      const delivery = yield* executions.claimDelivery({
+        sessionID: descendant.sessionID,
+        generation: descendant.generation,
+      })
+      if (!delivery) throw new Error("descendant terminal delivery was not claimed")
+      yield* executions.completeDelivery({
+        sessionID: descendant.sessionID,
+        generation: descendant.generation,
+        token: delivery.token,
+      })
+      const wake = yield* executions.claimWake({
+        sessionID: descendant.sessionID,
+        generation: descendant.generation,
+      })
+      if (!wake) throw new Error("descendant terminal wake was not claimed")
       const time = Date.now()
       const final = yield* sessions.updateMessage({
         ...assistant,
@@ -1719,7 +1729,11 @@ describe("tool.task", () => {
         type: "text",
         text: "final response after descendants",
       })
-      yield* executions.completeWake({ sessionID: descendant.sessionID, generation: descendant.generation })
+      yield* executions.completeWake({
+        sessionID: descendant.sessionID,
+        generation: descendant.generation,
+        token: wake.token,
+      })
 
       const result = yield* Fiber.join(fiber).pipe(Effect.timeout("1 second"))
       expect(result.output).toContain("final response after descendants")
@@ -2542,6 +2556,138 @@ describe("tool.task", () => {
     }),
   )
 
+  background.instance("fences a stale terminal-pump delivery after same-runtime reclaim", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed("delivery parent")
+      const child = yield* sessions.create({ parentID: chat.id, title: "delivery child" })
+      let now = 1_000
+      const executions = yield* BackgroundTaskExecution.make({
+        ownerID: "recovery",
+        leaseMillis: 100,
+        now: () => now,
+      })
+      yield* executions.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation: "delivery-generation",
+        description: child.title,
+        parentMessageID: assistant.id,
+        wakeRequired: true,
+      })
+      const terminal = yield* executions.settle({
+        sessionID: child.id,
+        generation: "delivery-generation",
+        state: "cancelled",
+        error: "cancelled",
+      })
+      if (!terminal) throw new Error("terminal execution missing")
+
+      const firstStarted = yield* Deferred.make<void>()
+      const secondStarted = yield* Deferred.make<void>()
+      const releaseFirst = yield* Deferred.make<void>()
+      const releaseSecond = yield* Deferred.make<void>()
+      let prompts = 0
+      const ops: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          Effect.gen(function* () {
+            prompts++
+            if (prompts === 1) {
+              yield* Deferred.succeed(firstStarted, undefined)
+              yield* Deferred.await(releaseFirst)
+              return reply(input, "stale delivery")
+            }
+            yield* Deferred.succeed(secondStarted, undefined)
+            yield* Deferred.await(releaseSecond)
+            return reply(input, "replacement delivery")
+          }),
+      }
+      const first = yield* deliverBackgroundTerminal({ executions, sessions, ops, terminal }).pipe(Effect.forkChild)
+      yield* Deferred.await(firstStarted).pipe(Effect.timeout("1 second"))
+      now = 1_101
+      const second = yield* deliverBackgroundTerminal({ executions, sessions, ops, terminal }).pipe(Effect.forkChild)
+      yield* Deferred.await(secondStarted).pipe(Effect.timeout("1 second"))
+
+      yield* Deferred.succeed(releaseFirst, undefined)
+      expect(yield* Fiber.join(first).pipe(Effect.timeout("1 second"))).toBe(false)
+      expect(yield* executions.get(child.id)).toMatchObject({ terminalDeliveredAt: undefined })
+
+      yield* Deferred.succeed(releaseSecond, undefined)
+      expect(yield* Fiber.join(second).pipe(Effect.timeout("1 second"))).toBe(true)
+      expect(yield* executions.get(child.id)).toMatchObject({ terminalDeliveredAt: expect.any(Number) })
+    }),
+  )
+
+  background.instance("fences a stale terminal-pump wake after same-runtime reclaim", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed("wake parent")
+      const child = yield* sessions.create({ parentID: chat.id, title: "wake child" })
+      let now = 1_000
+      const executions = yield* BackgroundTaskExecution.make({
+        ownerID: "recovery",
+        leaseMillis: 1_000_000,
+        now: () => now,
+      })
+      yield* executions.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation: "wake-generation",
+        description: child.title,
+        parentMessageID: assistant.id,
+        wakeRequired: true,
+      })
+      const terminal = yield* executions.settle({
+        sessionID: child.id,
+        generation: "wake-generation",
+        state: "completed",
+        output: "done",
+      })
+      if (!terminal) throw new Error("terminal execution missing")
+      const delivery = yield* executions.claimDelivery({ sessionID: child.id, generation: terminal.generation })
+      if (!delivery) throw new Error("terminal delivery was not claimed")
+      yield* executions.completeDelivery({
+        sessionID: child.id,
+        generation: terminal.generation,
+        token: delivery.token,
+      })
+
+      const firstStarted = yield* Deferred.make<void>()
+      const secondStarted = yield* Deferred.make<void>()
+      const releaseFirst = yield* Deferred.make<void>()
+      const releaseSecond = yield* Deferred.make<void>()
+      let wakes = 0
+      const ops: TaskPromptOps = {
+        ...stubOps(),
+        wake: () =>
+          Effect.gen(function* () {
+            wakes++
+            if (wakes === 1) {
+              yield* Deferred.succeed(firstStarted, undefined)
+              yield* Deferred.await(releaseFirst)
+              return
+            }
+            yield* Deferred.succeed(secondStarted, undefined)
+            yield* Deferred.await(releaseSecond)
+          }),
+      }
+      const first = yield* deliverBackgroundTerminal({ executions, sessions, ops, terminal }).pipe(Effect.forkChild)
+      yield* Deferred.await(firstStarted).pipe(Effect.timeout("1 second"))
+      now = 1_001_001
+      const second = yield* deliverBackgroundTerminal({ executions, sessions, ops, terminal }).pipe(Effect.forkChild)
+      yield* Deferred.await(secondStarted).pipe(Effect.timeout("1 second"))
+
+      yield* Deferred.succeed(releaseFirst, undefined)
+      expect(yield* Fiber.join(first).pipe(Effect.timeout("1 second"))).toBe(false)
+      expect(yield* executions.get(child.id)).toMatchObject({ wakeClaimedAt: undefined })
+
+      yield* Deferred.succeed(releaseSecond, undefined)
+      expect(yield* Fiber.join(second).pipe(Effect.timeout("1 second"))).toBe(true)
+      expect(yield* executions.get(child.id)).toMatchObject({ wakeClaimedAt: expect.any(Number) })
+    }),
+  )
+
   background.instance("does not rehydrate leased terminal work until each lease expires", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
@@ -2581,8 +2727,13 @@ describe("tool.task", () => {
         state: "completed",
         output: "done",
       })
-      yield* owner.claimDelivery({ sessionID: wakeChild.id, generation: "wake-generation" })
-      yield* owner.completeDelivery({ sessionID: wakeChild.id, generation: "wake-generation" })
+      const wakeDelivery = yield* owner.claimDelivery({ sessionID: wakeChild.id, generation: "wake-generation" })
+      if (!wakeDelivery) throw new Error("wake terminal delivery was not claimed")
+      yield* owner.completeDelivery({
+        sessionID: wakeChild.id,
+        generation: "wake-generation",
+        token: wakeDelivery.token,
+      })
 
       const hydrations = new Map<SessionID, number>()
       let prompts = 0
@@ -2707,7 +2858,7 @@ describe("tool.task", () => {
       yield* Deferred.await(secondWake).pipe(Effect.timeout("1 second"))
       yield* Effect.sleep("300 millis")
 
-      expect(yield* remote.claimWake({ sessionID: firstChild.id, generation: "slow-generation" })).toBe(false)
+      expect(yield* remote.claimWake({ sessionID: firstChild.id, generation: "slow-generation" })).toBeUndefined()
       yield* Deferred.succeed(releaseFirstWake, undefined)
       const deadline = Date.now() + 1_000
       while ((yield* recovery.get(firstChild.id))?.wakeClaimedAt === undefined) {
@@ -2787,8 +2938,16 @@ describe("tool.task", () => {
         state: "completed",
         output: "done",
       })
-      yield* recovery.claimDelivery({ sessionID: foregroundChild.id, generation: "foreground-generation" })
-      yield* recovery.completeDelivery({ sessionID: foregroundChild.id, generation: "foreground-generation" })
+      const foregroundDelivery = yield* recovery.claimDelivery({
+        sessionID: foregroundChild.id,
+        generation: "foreground-generation",
+      })
+      if (!foregroundDelivery) throw new Error("foreground terminal delivery was not claimed")
+      yield* recovery.completeDelivery({
+        sessionID: foregroundChild.id,
+        generation: "foreground-generation",
+        token: foregroundDelivery.token,
+      })
 
       yield* recovery.claim({
         sessionID: nestedChild.id,
@@ -2804,8 +2963,16 @@ describe("tool.task", () => {
         state: "completed",
         output: "done",
       })
-      yield* recovery.claimDelivery({ sessionID: nestedChild.id, generation: "nested-generation" })
-      yield* recovery.completeDelivery({ sessionID: nestedChild.id, generation: "nested-generation" })
+      const nestedDelivery = yield* recovery.claimDelivery({
+        sessionID: nestedChild.id,
+        generation: "nested-generation",
+      })
+      if (!nestedDelivery) throw new Error("nested terminal delivery was not claimed")
+      yield* recovery.completeDelivery({
+        sessionID: nestedChild.id,
+        generation: "nested-generation",
+        token: nestedDelivery.token,
+      })
 
       expect(yield* recovery.pendingTerminals()).toHaveLength(1)
       yield* startBackgroundTerminalPump({
@@ -3747,9 +3914,15 @@ describe("tool.task", () => {
         output: "incomplete",
       })
       if (!terminal) throw new Error("terminal execution missing")
-      yield* executions.claimDelivery({ sessionID: child.id, generation: terminal.generation })
-      yield* executions.completeDelivery({ sessionID: child.id, generation: terminal.generation })
-      expect(yield* executions.claimWake({ sessionID: child.id, generation: terminal.generation })).toBe(true)
+      const delivery = yield* executions.claimDelivery({ sessionID: child.id, generation: terminal.generation })
+      if (!delivery) throw new Error("terminal delivery was not claimed")
+      yield* executions.completeDelivery({
+        sessionID: child.id,
+        generation: terminal.generation,
+        token: delivery.token,
+      })
+      const wake = yield* executions.claimWake({ sessionID: child.id, generation: terminal.generation })
+      if (!wake) throw new Error("terminal wake was not claimed")
       const causal = yield* sessions.updateMessage({
         ...assistant,
         id: MessageID.ascending(),
@@ -3781,7 +3954,13 @@ describe("tool.task", () => {
         generation: `${causal.id}:causal-retry`,
         state: "running",
       })
-      expect(yield* executions.completeWake({ sessionID: child.id, generation: terminal.generation })).toBe(false)
+      expect(
+        yield* executions.completeWake({
+          sessionID: child.id,
+          generation: terminal.generation,
+          token: wake.token,
+        }),
+      ).toBe(false)
       yield* jobs.cancel(child.id)
     }),
   )

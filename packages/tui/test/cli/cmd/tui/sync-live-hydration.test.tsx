@@ -7,6 +7,7 @@ import { json, mount, wait } from "./sync-fixture"
 const sessionID = "ses_hydration_race"
 const messageID = "msg_hydration_race"
 const partID = "prt_hydration_race"
+const sessionStatusTiming = { refreshInterval: 50, requestTimeout: 40 }
 const session = {
   id: sessionID,
   title: "race",
@@ -29,8 +30,16 @@ const assistant = {
   time: { created: 1, completed: 2 },
 }
 
-function global(payload: GlobalEvent["payload"]): GlobalEvent {
-  return { directory: "/tmp/other", project: "proj_test", payload }
+function global(payload: GlobalEvent["payload"], workspace?: string): GlobalEvent {
+  return { directory: "/tmp/other", project: "proj_test", workspace, payload }
+}
+
+function untilAborted(signal: AbortSignal | null | undefined) {
+  return new Promise<Response>((_, reject) => {
+    const abort = () => reject(signal?.reason ?? new DOMException("Aborted", "AbortError"))
+    if (signal?.aborted) return abort()
+    signal?.addEventListener("abort", abort, { once: true })
+  })
 }
 
 test("live messages use creation time with an ID tie-break", async () => {
@@ -354,6 +363,54 @@ test("server reconnect replaces stale session statuses with the authoritative sn
   }
 })
 
+test("global reconnect refreshes the current named workspace", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  let requests = 0
+  const { app, emit, project, sync } = await mount((url) => {
+    if (url.pathname === "/experimental/workspace") return json([{ id: "second" }])
+    if (url.pathname !== "/session/status" || url.searchParams.get("workspace") !== "second") return undefined
+    requests++
+    return json(requests === 1 ? { child: { type: "busy" } } : {})
+  }, tmp.path)
+
+  try {
+    project.workspace.set("second")
+    await sync.bootstrap({ fatal: false })
+    await wait(() => sync.data.session_status.child?.type === "busy")
+
+    emit(global({ id: "evt_named_connected", type: "server.connected", properties: {} }))
+    await wait(() => requests === 2)
+    await wait(() => sync.data.session_status.child === undefined)
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("active session statuses reconcile periodically without a reconnect", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  let requests = 0
+  const { app, sync } = await mount(
+    (url) => {
+      if (url.pathname !== "/session/status") return undefined
+      requests++
+      return json(requests === 1 ? { child: { type: "busy" } } : {})
+    },
+    tmp.path,
+    sessionStatusTiming,
+  )
+
+  try {
+    expect(sync.data.session_status.child).toEqual({ type: "busy" })
+    await wait(() => sync.data.session_status.child === undefined)
+
+    expect(requests).toBeGreaterThanOrEqual(2)
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
 test("reconnect status refresh cannot overwrite a newer live status event", async () => {
   await using tmp = await tmpdir()
   await Bun.write(`${tmp.path}/kv.json`, "{}")
@@ -389,4 +446,292 @@ test("reconnect status refresh cannot overwrite a newer live status event", asyn
   } finally {
     app.renderer.destroy()
   }
+})
+
+test("workspace switch supersedes an in-flight status snapshot", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  let resolveFirst!: (response: Response) => void
+  const first = new Promise<Response>((resolve) => {
+    resolveFirst = resolve
+  })
+  let firstRequests = 0
+  let secondRequests = 0
+  const { app, project, sync } = await mount((url) => {
+    if (url.pathname === "/experimental/workspace") return json([{ id: "first" }, { id: "second" }])
+    if (url.pathname !== "/session/status") return undefined
+    const workspace = url.searchParams.get("workspace")
+    if (workspace === "first") {
+      firstRequests++
+      return first
+    }
+    if (workspace === "second") {
+      secondRequests++
+      return json({ second: { type: "busy" } })
+    }
+    return json({})
+  }, tmp.path)
+
+  try {
+    project.workspace.set("first")
+    void sync.bootstrap({ fatal: false })
+    await wait(() => firstRequests === 1)
+    project.workspace.set("second")
+    void sync.bootstrap({ fatal: false })
+    await wait(() => secondRequests === 1)
+    await wait(() => sync.data.session_status.second?.type === "busy")
+
+    resolveFirst(json({ first: { type: "busy" } }))
+    await Bun.sleep(20)
+    expect(sync.data.session_status.first).toBeUndefined()
+    expect(sync.data.session_status.second).toEqual({ type: "busy" })
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("delayed bootstrap cannot reclaim status ownership after a workspace switch", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  let releaseFirst!: (response: Response) => void
+  const firstProviders = new Promise<Response>((resolve) => {
+    releaseFirst = resolve
+  })
+  let firstBlocked = false
+  let firstRequests = 0
+  let secondRequests = 0
+  const { app, project, sync } = await mount((url) => {
+    if (url.pathname === "/experimental/workspace") return json([{ id: "first" }, { id: "second" }])
+    const workspace = url.searchParams.get("workspace")
+    if (url.pathname === "/config/providers" && workspace === "first") {
+      firstBlocked = true
+      return firstProviders
+    }
+    if (url.pathname !== "/session/status") return undefined
+    if (workspace === "first") {
+      firstRequests++
+      return json({ first: { type: "busy" } })
+    }
+    if (workspace === "second") {
+      secondRequests++
+      return json({ second: { type: "busy" } })
+    }
+    return json({})
+  }, tmp.path)
+
+  try {
+    project.workspace.set("first")
+    const stale = sync.bootstrap({ fatal: false })
+    await wait(() => firstBlocked)
+    project.workspace.set("second")
+    await sync.bootstrap({ fatal: false })
+    await wait(() => sync.data.session_status.second?.type === "busy")
+
+    releaseFirst(json({ providers: {}, default: {} }))
+    await stale
+    await Bun.sleep(20)
+
+    expect(firstRequests).toBe(0)
+    expect(secondRequests).toBe(1)
+    expect(sync.data.session_status.first).toBeUndefined()
+    expect(sync.data.session_status.second).toEqual({ type: "busy" })
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("selected workspace status refresh survives a stalled bootstrap", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  let releaseProviders!: (response: Response) => void
+  const providers = new Promise<Response>((resolve) => {
+    releaseProviders = resolve
+  })
+  let blocked = false
+  let requests = 0
+  const { app, project, sync } = await mount(
+    (url) => {
+      const workspace = url.searchParams.get("workspace")
+      if (url.pathname === "/experimental/workspace") return json([{ id: "second" }])
+      if (url.pathname === "/config/providers" && workspace === "second") {
+        blocked = true
+        return providers
+      }
+      if (url.pathname === "/session/status" && workspace === "second") {
+        requests++
+        return json({ child: { type: "busy" } })
+      }
+      return undefined
+    },
+    tmp.path,
+    sessionStatusTiming,
+  )
+
+  try {
+    project.workspace.set("second")
+    const bootstrap = sync.bootstrap({ fatal: false })
+    await wait(() => blocked)
+    await wait(() => requests === 1)
+    await wait(() => sync.data.session_status.child?.type === "busy")
+
+    releaseProviders(json({ providers: {}, default: {} }))
+    await bootstrap
+  } finally {
+    releaseProviders(json({ providers: {}, default: {} }))
+    app.renderer.destroy()
+  }
+})
+
+test("inactive workspace status events cannot mutate the active cache", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  const { app, emit, project, sync } = await mount((url) => {
+    if (url.pathname === "/experimental/workspace") return json([{ id: "first" }, { id: "second" }])
+    if (url.pathname !== "/session/status") return undefined
+    if (url.searchParams.get("workspace") === "second") return json({ second: { type: "busy" } })
+    return json({})
+  }, tmp.path)
+
+  try {
+    project.workspace.set("second")
+    await sync.bootstrap({ fatal: false })
+    await wait(() => sync.data.session_status.second?.type === "busy")
+
+    emit(
+      global(
+        {
+          id: "evt_inactive_status",
+          type: "session.status",
+          properties: { sessionID: "first", status: { type: "busy" } },
+        },
+        "first",
+      ),
+    )
+    await Bun.sleep(20)
+    expect(sync.data.session_status.first).toBeUndefined()
+    expect(sync.data.session_status.second).toEqual({ type: "busy" })
+
+    emit(
+      global(
+        {
+          id: "evt_active_status",
+          type: "session.status",
+          properties: { sessionID: "second", status: { type: "idle" } },
+        },
+        "second",
+      ),
+    )
+    await wait(() => sync.data.session_status.second?.type === "idle")
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("failed status refresh preserves cache and permits a later retry", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  let requests = 0
+  const { app, emit, sync } = await mount((url) => {
+    if (url.pathname !== "/session/status") return undefined
+    requests++
+    if (requests === 1) return json({ child: { type: "busy" } })
+    if (requests === 2) return json({ message: "unavailable" }, { status: 503 })
+    return json({})
+  }, tmp.path)
+
+  try {
+    emit(global({ id: "evt_failed_connected", type: "server.connected", properties: {} }))
+    await wait(() => requests === 2)
+    await Bun.sleep(20)
+    expect(sync.data.session_status.child).toEqual({ type: "busy" })
+
+    emit(global({ id: "evt_retry_connected", type: "server.connected", properties: {} }))
+    await wait(() => requests === 3)
+    await wait(() => sync.data.session_status.child === undefined)
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("new reconnect supersedes a hung status refresh", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  let resolveHung!: (response: Response) => void
+  const hung = new Promise<Response>((resolve) => {
+    resolveHung = resolve
+  })
+  let requests = 0
+  const { app, emit, sync } = await mount((url) => {
+    if (url.pathname !== "/session/status") return undefined
+    requests++
+    if (requests === 1) return json({ child: { type: "busy" } })
+    if (requests === 2) return hung
+    return json({})
+  }, tmp.path)
+
+  try {
+    emit(global({ id: "evt_hung_connected", type: "server.connected", properties: {} }))
+    await wait(() => requests === 2)
+    emit(global({ id: "evt_reconnected", type: "server.connected", properties: {} }))
+    await wait(() => requests === 3)
+    await wait(() => sync.data.session_status.child === undefined)
+
+    resolveHung(json({ child: { type: "busy" } }))
+    await Bun.sleep(20)
+    expect(sync.data.session_status.child).toBeUndefined()
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("hung status refresh is aborted and retried automatically", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  let hungSignal: AbortSignal | null | undefined
+  let requests = 0
+  const { app, emit, sync } = await mount(
+    (url, signal) => {
+      if (url.pathname !== "/session/status") return undefined
+      requests++
+      if (requests === 1) return json({})
+      if (requests === 2) {
+        hungSignal = signal
+        return untilAborted(signal)
+      }
+      return json({})
+    },
+    tmp.path,
+    sessionStatusTiming,
+  )
+
+  try {
+    emit(global({ id: "evt_timeout_connected", type: "server.connected", properties: {} }))
+    await wait(() => requests === 2)
+    await wait(() => requests >= 3)
+    await wait(() => sync.data.session_status.child === undefined)
+
+    expect(hungSignal?.aborted).toBe(true)
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("destroy aborts an in-flight status refresh", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  let hungSignal: AbortSignal | null | undefined
+  let requests = 0
+  const { app, emit } = await mount((url, signal) => {
+    if (url.pathname !== "/session/status") return undefined
+    requests++
+    if (requests === 1) return json({})
+    hungSignal = signal
+    return untilAborted(signal)
+  }, tmp.path)
+
+  emit(global({ id: "evt_destroy_connected", type: "server.connected", properties: {} }))
+  await wait(() => requests === 2)
+  app.renderer.destroy()
+
+  expect(hungSignal?.aborted).toBe(true)
 })

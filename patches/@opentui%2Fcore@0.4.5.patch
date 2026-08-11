@@ -1,0 +1,26 @@
+diff --git a/runtime-plugin.js b/runtime-plugin.js
+index c50cf3bd9ca39fbeb1b2b684dcba033ca27a70da..91f27cda3e079b1d3dba9f85d75a6a7ccfd862bd 100644
+--- a/runtime-plugin.js
++++ b/runtime-plugin.js
+@@ -239,7 +239,11 @@ const collectImportSpecifiers = (code) => {
+     }
+     return [...specifiers];
+ };
++let resolvingFromParent = false;
+ const resolveFromParent = (specifier, parent) => {
++    if (resolvingFromParent)
++        return null;
++    resolvingFromParent = true;
+     try {
+         const resolvedSpecifier = import.meta.resolve(specifier, parent);
+         if (resolvedSpecifier === specifier ||
+@@ -252,6 +256,9 @@ const resolveFromParent = (specifier, parent) => {
+     catch {
+         return null;
+     }
++    finally {
++        resolvingFromParent = false;
++    }
+ };
+ const resolveSourcePathFromSpecifier = (specifier, importer) => {
+     if (specifier.startsWith("node:") ||

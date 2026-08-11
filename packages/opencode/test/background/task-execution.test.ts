@@ -90,8 +90,13 @@ describe("BackgroundTaskExecution", () => {
         output: "done",
       })
       expect(yield* owner.claimFollowup({ sessionID: ids.child, generation: "generation-1" })).toBe("inactive")
-      yield* owner.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
-      yield* owner.completeDelivery({ sessionID: ids.child, generation: "generation-1" })
+      const delivery = yield* owner.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
+      if (!delivery) throw new Error("terminal delivery was not claimed")
+      yield* owner.completeDelivery({
+        sessionID: ids.child,
+        generation: "generation-1",
+        token: delivery.token,
+      })
       expect(yield* owner.claim(claim(ids, "generation-2"))).toMatchObject({ status: "claimed" })
       expect(yield* owner.claimFollowup({ sessionID: ids.child, generation: "generation-2" })).toBe("claimed")
     }),
@@ -145,10 +150,26 @@ describe("BackgroundTaskExecution", () => {
         { concurrency: "unbounded" },
       )
       expect(deliveryClaims.filter(Boolean)).toHaveLength(1)
-      const deliveryOwner = deliveryClaims[0] ? first : second
-      yield* deliveryOwner.completeDelivery({ sessionID: ids.child, generation: "generation-1" })
-      expect(yield* deliveryOwner.claimWake({ sessionID: ids.child, generation: "generation-1" })).toBe(true)
-      expect(yield* deliveryOwner.completeWake({ sessionID: ids.child, generation: "generation-1" })).toBe(true)
+      const delivery = deliveryClaims[0]
+        ? { owner: first, claim: deliveryClaims[0] }
+        : deliveryClaims[1]
+          ? { owner: second, claim: deliveryClaims[1] }
+          : undefined
+      if (!delivery) throw new Error("terminal delivery was not claimed")
+      yield* delivery.owner.completeDelivery({
+        sessionID: ids.child,
+        generation: "generation-1",
+        token: delivery.claim.token,
+      })
+      const wake = yield* delivery.owner.claimWake({ sessionID: ids.child, generation: "generation-1" })
+      if (!wake) throw new Error("terminal wake was not claimed")
+      expect(
+        yield* delivery.owner.completeWake({
+          sessionID: ids.child,
+          generation: "generation-1",
+          token: wake.token,
+        }),
+      ).toBe(true)
 
       const next = yield* second.claim(claim(ids, "generation-2"))
       expect(next.status).toBe("claimed")
@@ -188,6 +209,47 @@ describe("BackgroundTaskExecution", () => {
     }),
   )
 
+  it.live("fences an expired delivery claim from a stale same-runtime attempt", () =>
+    Effect.gen(function* () {
+      const ids = yield* seed()
+      let now = 1_000
+      const owner = yield* BackgroundTaskExecution.make({ ownerID: "runtime-a", leaseMillis: 100, now: () => now })
+      yield* owner.claim(claim(ids, "generation-1"))
+      yield* owner.settle({
+        sessionID: ids.child,
+        generation: "generation-1",
+        state: "completed",
+        output: "done",
+      })
+
+      const stale = yield* owner.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
+      if (!stale) throw new Error("initial delivery was not claimed")
+      now = 1_101
+      const replacement = yield* owner.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
+      if (!replacement) throw new Error("expired delivery was not reclaimed")
+
+      expect(replacement.token).not.toBe(stale.token)
+      expect(
+        yield* owner.completeDelivery({
+          sessionID: ids.child,
+          generation: "generation-1",
+          token: stale.token,
+        }),
+      ).toBe(false)
+      expect(yield* owner.get(ids.child)).toMatchObject({
+        deliveryOwnerID: replacement.token,
+        terminalDeliveredAt: undefined,
+      })
+      expect(
+        yield* owner.completeDelivery({
+          sessionID: ids.child,
+          generation: "generation-1",
+          token: replacement.token,
+        }),
+      ).toBe(true)
+    }),
+  )
+
   it.live("recovers an undelivered foreground terminal without scheduling a parent wake", () =>
     Effect.gen(function* () {
       const ids = yield* seed()
@@ -207,11 +269,16 @@ describe("BackgroundTaskExecution", () => {
           terminalDeliveredAt: undefined,
         }),
       ])
-      yield* owner.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
-      yield* owner.completeDelivery({ sessionID: ids.child, generation: "generation-1" })
+      const delivery = yield* owner.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
+      if (!delivery) throw new Error("terminal delivery was not claimed")
+      yield* owner.completeDelivery({
+        sessionID: ids.child,
+        generation: "generation-1",
+        token: delivery.token,
+      })
 
       expect(yield* owner.pendingTerminals(ids.parent)).toEqual([])
-      expect(yield* owner.claimWake({ sessionID: ids.child, generation: "generation-1" })).toBe(false)
+      expect(yield* owner.claimWake({ sessionID: ids.child, generation: "generation-1" })).toBeUndefined()
     }),
   )
 
@@ -230,16 +297,24 @@ describe("BackgroundTaskExecution", () => {
         state: "completed",
         output: "done",
       })
-      yield* first.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
-      yield* first.completeDelivery({ sessionID: ids.child, generation: "generation-1" })
-      expect(yield* first.claimWake({ sessionID: ids.child, generation: "generation-1" })).toBe(true)
+      const delivery = yield* first.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
+      if (!delivery) throw new Error("terminal delivery was not claimed")
+      yield* first.completeDelivery({
+        sessionID: ids.child,
+        generation: "generation-1",
+        token: delivery.token,
+      })
+      const wake = yield* first.claimWake({ sessionID: ids.child, generation: "generation-1" })
+      if (!wake) throw new Error("terminal wake was not claimed")
 
       expect(yield* second.claim(claim(ids, "generation-2"))).toMatchObject({
         status: "terminal",
         info: { generation: "generation-1" },
       })
 
-      expect(yield* first.completeWake({ sessionID: ids.child, generation: "generation-1" })).toBe(true)
+      expect(yield* first.completeWake({ sessionID: ids.child, generation: "generation-1", token: wake.token })).toBe(
+        true,
+      )
       expect(yield* second.claim(claim(ids, "generation-2"))).toMatchObject({
         status: "claimed",
         info: { generation: "generation-2" },
@@ -260,9 +335,15 @@ describe("BackgroundTaskExecution", () => {
         output: "done",
       })
       if (!terminal) throw new Error("terminal execution missing")
-      yield* first.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
-      yield* first.completeDelivery({ sessionID: ids.child, generation: "generation-1" })
-      expect(yield* first.claimWake({ sessionID: ids.child, generation: "generation-1" })).toBe(true)
+      const delivery = yield* first.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
+      if (!delivery) throw new Error("terminal delivery was not claimed")
+      yield* first.completeDelivery({
+        sessionID: ids.child,
+        generation: "generation-1",
+        token: delivery.token,
+      })
+      const wake = yield* first.claimWake({ sessionID: ids.child, generation: "generation-1" })
+      if (!wake) throw new Error("terminal wake was not claimed")
 
       expect(
         yield* second.claimAfterObservedTerminal({
@@ -278,7 +359,9 @@ describe("BackgroundTaskExecution", () => {
           observedDeliveryMessageID: terminal.delivery.messageID,
         }),
       ).toMatchObject({ status: "claimed", info: { generation: "generation-2", state: "running" } })
-      expect(yield* first.completeWake({ sessionID: ids.child, generation: "generation-1" })).toBe(false)
+      expect(yield* first.completeWake({ sessionID: ids.child, generation: "generation-1", token: wake.token })).toBe(
+        false,
+      )
     }),
   )
 
@@ -295,18 +378,88 @@ describe("BackgroundTaskExecution", () => {
         state: "completed",
         output: "done",
       })
-      yield* first.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
-      yield* first.completeDelivery({ sessionID: ids.child, generation: "generation-1" })
-      expect(yield* first.claimWake({ sessionID: ids.child, generation: "generation-1" })).toBe(true)
+      const delivery = yield* first.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
+      if (!delivery) throw new Error("terminal delivery was not claimed")
+      yield* first.completeDelivery({
+        sessionID: ids.child,
+        generation: "generation-1",
+        token: delivery.token,
+      })
+      const wake = yield* first.claimWake({ sessionID: ids.child, generation: "generation-1" })
+      if (!wake) throw new Error("terminal wake was not claimed")
 
       now = 1_050
-      expect(yield* first.heartbeatWake({ sessionID: ids.child, generation: "generation-1" })).toBe("owned")
+      expect(yield* first.heartbeatWake({ sessionID: ids.child, generation: "generation-1", token: wake.token })).toBe(
+        "owned",
+      )
       now = 1_101
-      expect(yield* second.claimWake({ sessionID: ids.child, generation: "generation-1" })).toBe(false)
+      expect(yield* second.claimWake({ sessionID: ids.child, generation: "generation-1" })).toBeUndefined()
       now = 1_151
-      expect(yield* second.claimWake({ sessionID: ids.child, generation: "generation-1" })).toBe(true)
-      expect(yield* first.completeWake({ sessionID: ids.child, generation: "generation-1" })).toBe(false)
-      expect(yield* second.completeWake({ sessionID: ids.child, generation: "generation-1" })).toBe(true)
+      const replacement = yield* second.claimWake({ sessionID: ids.child, generation: "generation-1" })
+      if (!replacement) throw new Error("expired wake was not reclaimed")
+      expect(yield* first.completeWake({ sessionID: ids.child, generation: "generation-1", token: wake.token })).toBe(
+        false,
+      )
+      expect(
+        yield* second.completeWake({
+          sessionID: ids.child,
+          generation: "generation-1",
+          token: replacement.token,
+        }),
+      ).toBe(true)
+    }),
+  )
+
+  it.live("fences an expired wake claim from a stale same-runtime attempt", () =>
+    Effect.gen(function* () {
+      const ids = yield* seed()
+      let now = 1_000
+      const owner = yield* BackgroundTaskExecution.make({ ownerID: "runtime-a", leaseMillis: 100, now: () => now })
+      yield* owner.claim({ ...claim(ids, "generation-1"), wakeRequired: true })
+      yield* owner.settle({
+        sessionID: ids.child,
+        generation: "generation-1",
+        state: "completed",
+        output: "done",
+      })
+      const delivery = yield* owner.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
+      if (!delivery) throw new Error("terminal delivery was not claimed")
+      yield* owner.completeDelivery({
+        sessionID: ids.child,
+        generation: "generation-1",
+        token: delivery.token,
+      })
+      const stale = yield* owner.claimWake({ sessionID: ids.child, generation: "generation-1" })
+      if (!stale) throw new Error("initial wake was not claimed")
+      now = 1_101
+      const replacement = yield* owner.claimWake({ sessionID: ids.child, generation: "generation-1" })
+      if (!replacement) throw new Error("expired wake was not reclaimed")
+
+      expect(replacement.token).not.toBe(stale.token)
+      expect(yield* owner.heartbeatWake({ sessionID: ids.child, generation: "generation-1", token: stale.token })).toBe(
+        "lost",
+      )
+      expect(yield* owner.completeWake({ sessionID: ids.child, generation: "generation-1", token: stale.token })).toBe(
+        false,
+      )
+      expect(yield* owner.get(ids.child)).toMatchObject({
+        wakeOwnerID: replacement.token,
+        wakeClaimedAt: undefined,
+      })
+      expect(
+        yield* owner.heartbeatWake({
+          sessionID: ids.child,
+          generation: "generation-1",
+          token: replacement.token,
+        }),
+      ).toBe("owned")
+      expect(
+        yield* owner.completeWake({
+          sessionID: ids.child,
+          generation: "generation-1",
+          token: replacement.token,
+        }),
+      ).toBe(true)
     }),
   )
 
@@ -387,8 +540,13 @@ test("coordinates recovery through independent SQLite connections", async () => 
             output: "cancel raced with completion",
           }),
         ).toMatchObject({ state: "cancelled" })
-        yield* remote.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
-        yield* remote.completeDelivery({ sessionID: ids.child, generation: "generation-1" })
+        const cancelledDelivery = yield* remote.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
+        if (!cancelledDelivery) throw new Error("cancelled terminal delivery was not claimed")
+        yield* remote.completeDelivery({
+          sessionID: ids.child,
+          generation: "generation-1",
+          token: cancelledDelivery.token,
+        })
 
         expect(
           yield* remote.claim({
@@ -401,14 +559,27 @@ test("coordinates recovery through independent SQLite connections", async () => 
           expect.objectContaining({ generation: "generation-2", state: "error" }),
         ])
 
-        yield* owner.claimDelivery({ sessionID: ids.child, generation: "generation-2" })
-        yield* owner.completeDelivery({ sessionID: ids.child, generation: "generation-2" })
-        expect(yield* owner.claimWake({ sessionID: ids.child, generation: "generation-2" })).toBe(true)
-        expect(yield* second.claimWake({ sessionID: ids.child, generation: "generation-2" })).toBe(false)
+        const delivery = yield* owner.claimDelivery({ sessionID: ids.child, generation: "generation-2" })
+        if (!delivery) throw new Error("terminal delivery was not claimed")
+        yield* owner.completeDelivery({
+          sessionID: ids.child,
+          generation: "generation-2",
+          token: delivery.token,
+        })
+        const wake = yield* owner.claimWake({ sessionID: ids.child, generation: "generation-2" })
+        if (!wake) throw new Error("terminal wake was not claimed")
+        expect(yield* second.claimWake({ sessionID: ids.child, generation: "generation-2" })).toBeUndefined()
         now = 1_202
-        expect(yield* second.claimWake({ sessionID: ids.child, generation: "generation-2" })).toBe(true)
-        expect(yield* second.completeWake({ sessionID: ids.child, generation: "generation-2" })).toBe(true)
-        expect(yield* first.claimWake({ sessionID: ids.child, generation: "generation-2" })).toBe(false)
+        const replacement = yield* second.claimWake({ sessionID: ids.child, generation: "generation-2" })
+        if (!replacement) throw new Error("expired wake was not reclaimed")
+        expect(
+          yield* second.completeWake({
+            sessionID: ids.child,
+            generation: "generation-2",
+            token: replacement.token,
+          }),
+        ).toBe(true)
+        expect(yield* first.claimWake({ sessionID: ids.child, generation: "generation-2" })).toBeUndefined()
 
         expect(yield* second.claim(claim(ids, "generation-3"))).toMatchObject({
           status: "claimed",
