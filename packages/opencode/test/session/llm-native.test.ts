@@ -3,6 +3,7 @@ import { LLMEvent, ToolFailure } from "@opencode-ai/llm"
 import { LLMClient, RequestExecutor, WebSocketExecutor, type LLMClientShape } from "@opencode-ai/llm/route"
 import { jsonSchema, tool, type ModelMessage, type Tool } from "ai"
 import { Effect, Fiber, Layer, Stream } from "effect"
+import { TestClock } from "effect/testing"
 import { FetchHttpClient } from "effect/unstable/http"
 import { LLMNative } from "@/session/llm/native-request"
 import { LLMNativeRuntime } from "@/session/llm/native-runtime"
@@ -537,6 +538,35 @@ describe("session.llm-native.request", () => {
       const failure = yield* Effect.flip(wrapped.incomplete.execute({}, { id: "call-1", name: "incomplete" }))
       expect(failure).toBeInstanceOf(ToolFailure)
       expect(failure.message).toContain("incomplete")
+    }),
+  )
+
+  it.effect("fails and cancels a silent native provider stream after 120 seconds", () =>
+    Effect.gen(function* () {
+      let cancelled = false
+      const native = LLMNativeRuntime.stream({
+        model: baseModel,
+        provider: providerInfo,
+        auth: undefined,
+        llmClient: {
+          prepare: () => Effect.die("unused"),
+          stream: () => Stream.never.pipe(Stream.ensuring(Effect.sync(() => (cancelled = true)))),
+          generate: () => Effect.die("unused"),
+        } as LLMClientShape,
+        messages: [],
+        tools: {},
+        headers: {},
+        abort: new AbortController().signal,
+      })
+      expect(native.type).toBe("supported")
+      if (native.type === "unsupported") throw new Error(native.reason)
+
+      const fiber = yield* native.stream.pipe(Stream.runCollect, Effect.flip, Effect.forkChild)
+      yield* TestClock.adjust("120 seconds")
+      const failure = yield* Fiber.join(fiber)
+      expect(failure).toBeInstanceOf(Error)
+      expect(failure).toEqual(expect.objectContaining({ message: "Native LLM stream timed out after 120 seconds" }))
+      expect(cancelled).toBe(true)
     }),
   )
 

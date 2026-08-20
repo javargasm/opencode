@@ -1,10 +1,73 @@
 import { FinishReason, LLMEvent, ProviderMetadata, ToolResultValue } from "@opencode-ai/llm"
 import { Effect, Schema } from "effect"
-import { type streamText } from "ai"
+import { type LanguageModelMiddleware, type streamText } from "ai"
+import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { errorMessage } from "@/util/error"
+import { ProviderError } from "@/provider/error"
 
 type Result = Awaited<ReturnType<typeof streamText>>
 type AISDKEvent = Result["fullStream"] extends AsyncIterable<infer T> ? T : never
+
+const PROVIDER_FRAME_TIMEOUT_MS = 120_000
+
+export function providerFrameWatchdog(options?: {
+  schedule?: (run: () => void, ms: number) => () => void
+}): LanguageModelMiddleware {
+  const schedule =
+    options?.schedule ??
+    ((run, ms) => {
+      const timer = setTimeout(run, ms)
+      return () => clearTimeout(timer)
+    })
+
+  return {
+    specificationVersion: "v3",
+    async wrapStream({ doStream, params }) {
+      const abort = new AbortController()
+      params.abortSignal = params.abortSignal ? AbortSignal.any([params.abortSignal, abort.signal]) : abort.signal
+      let reader: ReadableStreamDefaultReader<LanguageModelV3StreamPart>
+      const watchdog = () => {
+        const timeout = Promise.withResolvers<never>()
+        const clear = schedule(() => {
+          const error = new ProviderError.ResponseStreamError("Provider stream timed out after 120 seconds")
+          timeout.reject(error)
+          abort.abort(error)
+          void reader?.cancel(error).catch(() => undefined)
+        }, PROVIDER_FRAME_TIMEOUT_MS)
+        return { clear, timeout: timeout.promise }
+      }
+      let pending = watchdog()
+      const result = await Promise.race([doStream(), pending.timeout]).catch((error) => {
+        pending.clear()
+        throw error
+      })
+      reader = result.stream.getReader()
+
+      return {
+        ...result,
+        stream: new ReadableStream({
+          async pull(controller) {
+            try {
+              const part = await Promise.race([reader.read(), pending.timeout])
+              pending.clear()
+              if (part.done) return controller.close()
+              controller.enqueue(part.value)
+              pending = watchdog()
+            } catch (error) {
+              pending.clear()
+              controller.error(error)
+            }
+          },
+          cancel(reason) {
+            pending.clear()
+            abort.abort(reason)
+            return reader.cancel(reason)
+          },
+        }),
+      }
+    },
+  }
+}
 
 export function adapterState() {
   return {

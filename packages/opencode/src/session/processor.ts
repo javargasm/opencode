@@ -688,6 +688,7 @@ const layer = Layer.effect(
           return
         }
         ctx.assistantMessage.error = error
+        ctx.assistantMessage.finish = "error"
         yield* events.publish(Session.Event.Error, {
           sessionID: ctx.assistantMessage.sessionID,
           error: ctx.assistantMessage.error,
@@ -702,6 +703,7 @@ const layer = Layer.effect(
         })
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+        let retrySafe = true
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
@@ -711,7 +713,19 @@ const layer = Layer.effect(
             const stream = llm.stream(streamInput)
 
             yield* stream.pipe(
-              Stream.tap((event) => handleEvent(event)),
+              Stream.tap((event) => {
+                if (
+                  event.type === "reasoning-start" ||
+                  event.type === "text-start" ||
+                  event.type === "tool-input-start" ||
+                  event.type === "tool-call" ||
+                  event.type === "tool-result" ||
+                  event.type === "tool-error"
+                ) {
+                  retrySafe = false
+                }
+                return handleEvent(event)
+              }),
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )
@@ -732,6 +746,7 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
+                shouldRetry: () => retrySafe,
                 set: (info) => {
                   return status.set(ctx.sessionID, {
                     type: "retry",

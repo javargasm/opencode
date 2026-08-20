@@ -12,6 +12,7 @@ export interface CreateWebSocketFetchOptions {
   idleTimeout?: number
   maxConnectionAge?: number
   streamRetries?: number
+  log?: (message: string, fields: Record<string, string | number | boolean>) => void
 }
 
 interface PoolEntry {
@@ -27,6 +28,7 @@ const DEFAULT_CONNECT_TIMEOUT = 15_000
 const DEFAULT_IDLE_TIMEOUT = 5 * 60 * 1000
 const DEFAULT_MAX_CONNECTION_AGE = 55 * 60 * 1000
 const CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached"
+const PROVIDER_STREAM_TIMEOUT_MESSAGE = "Provider stream timed out after 120 seconds"
 
 export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const httpFetch = options?.httpFetch ?? globalThis.fetch
@@ -35,6 +37,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const idleTimeout = options?.idleTimeout ?? DEFAULT_IDLE_TIMEOUT
   const maxConnectionAge = options?.maxConnectionAge ?? DEFAULT_MAX_CONNECTION_AGE
   const streamRetries = options?.streamRetries ?? 5
+  const log = options?.log
   const pruneTimer = setInterval(() => prune(), Math.min(idleTimeout, 60_000))
   if (typeof pruneTimer === "object" && "unref" in pruneTimer && typeof pruneTimer.unref === "function") {
     pruneTimer.unref()
@@ -73,6 +76,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     pool.set(key, entry)
 
     if (entry.fallback) {
+      log?.("openai websocket transport", { "session.id": sessionID, transport: "http", reason: "fallback" })
       return httpFetch(input, httpInit)
     }
     if (entry.busy) {
@@ -81,6 +85,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
 
     entry.busy = true
     entry.lastUsedAt = Date.now()
+    log?.("openai websocket transport", { "session.id": sessionID, transport: "websocket" })
     try {
       entry.socket = await socket(
         entry,
@@ -120,9 +125,17 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         onAbort: (error) => {
           entry.busy = false
           entry.lastUsedAt = Date.now()
-          entry.streamFailures = 0
+          const timeout = providerStreamTimeout(init?.signal)
+          if (timeout && recordProviderStreamTimeout(entry)) {
+            log?.("openai websocket fallback activated", {
+              "session.id": sessionID,
+              reason: "provider_stream_timeout",
+              streamFailures: entry.streamFailures,
+            })
+          }
+          if (!timeout) entry.streamFailures = 0
           invalidate(entry)
-          rejectFirstEvent(error)
+          rejectFirstEvent(timeout ?? error)
         },
         onRetryableTerminal: async (event) => {
           const error = connectionLimitError(event)
@@ -143,6 +156,18 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     } catch (error) {
       entry.busy = false
       entry.lastUsedAt = Date.now()
+      const timeout = providerStreamTimeout(init?.signal)
+      if (timeout) {
+        if (recordProviderStreamTimeout(entry)) {
+          log?.("openai websocket fallback activated", {
+            "session.id": sessionID,
+            reason: "provider_stream_timeout",
+            streamFailures: entry.streamFailures,
+          })
+        }
+        invalidate(entry)
+        return failedResponse(timeout)
+      }
       if (OpenAIWebSocket.isAbortError(error)) {
         entry.streamFailures = 0
         invalidate(entry)
@@ -192,6 +217,20 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   }
 
   return Object.assign(websocketFetch, { close, remove })
+}
+
+function providerStreamTimeout(signal: AbortSignal | null | undefined) {
+  const reason = signal?.reason
+  if (!(reason instanceof ProviderError.ResponseStreamError)) return
+  if (reason.message !== PROVIDER_STREAM_TIMEOUT_MESSAGE) return
+  return reason
+}
+
+function recordProviderStreamTimeout(entry: PoolEntry) {
+  if (entry.fallback) return false
+  entry.streamFailures++
+  entry.fallback = true
+  return true
 }
 
 function connectionLimitError(event: Record<string, unknown>) {

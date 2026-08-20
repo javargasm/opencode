@@ -5,7 +5,7 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
-import { Context, Effect, Fiber, Latch, Layer } from "effect"
+import { Context, Effect, Fiber, Latch, Layer, Logger } from "effect"
 import { BackgroundTaskExecution } from "@/background/task-execution"
 import { MessageID, SessionID } from "@/session/schema"
 import path from "path"
@@ -121,7 +121,94 @@ describe("BackgroundTaskExecution", () => {
     }),
   )
 
-  it.live("reconciles an expired owner once and rejects a late prior-generation terminal", () =>
+  it.live("logs lease acquisition, renewal, loss, and expiration", () => {
+    const logs: Array<{ level: string; message: unknown }> = []
+    const logger = Logger.make((options) => {
+      logs.push({ level: options.logLevel, message: options.message })
+    })
+    return Effect.gen(function* () {
+      const ids = yield* seed()
+      let now = 1_000
+      const owner = yield* BackgroundTaskExecution.make({ ownerID: "runtime-a", leaseMillis: 100, now: () => now })
+
+      yield* owner.claim(claim(ids, "generation-1"))
+      now = 1_010
+      expect(yield* owner.heartbeat({ sessionID: ids.child, generation: "generation-1" })).toBe("owned")
+      now = 1_111
+      expect(yield* owner.heartbeat({ sessionID: ids.child, generation: "generation-1" })).toBe("lost")
+      expect(
+        yield* owner.settle({
+          sessionID: ids.child,
+          generation: "generation-1",
+          state: "completed",
+          output: "late result",
+        }),
+      ).toMatchObject({ state: "error" })
+
+      expect(logs).toContainEqual({
+        level: "Info",
+        message: [
+          "background task lease acquired",
+          expect.objectContaining({
+            sessionID: ids.child,
+            parentSessionID: ids.parent,
+            generation: "generation-1",
+            ownerID: "runtime-a",
+            acquiredAt: 1_000,
+            leaseExpiresAt: 1_100,
+            leaseMillis: 100,
+          }),
+        ],
+      })
+      expect(logs).toContainEqual({
+        level: "Info",
+        message: [
+          "background task lease renewed",
+          expect.objectContaining({
+            sessionID: ids.child,
+            generation: "generation-1",
+            ownerID: "runtime-a",
+            renewedAt: 1_010,
+            leaseExpiresAt: 1_110,
+            leaseMillis: 100,
+          }),
+        ],
+      })
+      expect(logs).toContainEqual({
+        level: "Warn",
+        message: [
+          "background task lease heartbeat failed",
+          expect.objectContaining({
+            sessionID: ids.child,
+            generation: "generation-1",
+            ownerID: "runtime-a",
+            failedAt: 1_111,
+            reason: "lease_expired",
+            leaseExpiresAt: 1_110,
+            leaseRemainingMillis: -1,
+          }),
+        ],
+      })
+      expect(logs).toContainEqual({
+        level: "Warn",
+        message: [
+          "background task lease reconciled as expired",
+          expect.objectContaining({
+            sessionID: ids.child,
+            parentSessionID: ids.parent,
+            generation: "generation-1",
+            ownerID: "runtime-a",
+            expiredAt: 1_111,
+            leaseExpiresAt: 1_110,
+            executionAgeMillis: 111,
+            reason: "owner_lease_expired",
+          }),
+        ],
+      })
+    }).pipe(Effect.provide(Logger.layer([logger])))
+  })
+
+  it.live("keeps an expired owner's terminal local and rejects a late prior-generation terminal", () =>
     Effect.gen(function* () {
       const ids = yield* seed()
       let now = 1_000
@@ -138,33 +225,22 @@ describe("BackgroundTaskExecution", () => {
       yield* first.claim({ ...claim(ids, "generation-1"), wakeRequired: true })
       now = 1_101
 
-      const pending = yield* second.pendingTerminals(ids.parent)
-      expect(pending).toHaveLength(1)
-      expect(pending[0]).toMatchObject({ generation: "generation-1", state: "error" })
+      expect(yield* second.pendingTerminals(ids.parent)).toEqual([])
+      expect(yield* first.pendingTerminals(ids.parent)).toEqual([
+        expect.objectContaining({ generation: "generation-1", state: "error" }),
+      ])
 
-      const deliveryClaims = yield* Effect.all(
-        [
-          first.claimDelivery({ sessionID: ids.child, generation: "generation-1" }),
-          second.claimDelivery({ sessionID: ids.child, generation: "generation-1" }),
-        ],
-        { concurrency: "unbounded" },
-      )
-      expect(deliveryClaims.filter(Boolean)).toHaveLength(1)
-      const delivery = deliveryClaims[0]
-        ? { owner: first, claim: deliveryClaims[0] }
-        : deliveryClaims[1]
-          ? { owner: second, claim: deliveryClaims[1] }
-          : undefined
+      const delivery = yield* first.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
       if (!delivery) throw new Error("terminal delivery was not claimed")
-      yield* delivery.owner.completeDelivery({
+      yield* first.completeDelivery({
         sessionID: ids.child,
         generation: "generation-1",
-        token: delivery.claim.token,
+        token: delivery.token,
       })
-      const wake = yield* delivery.owner.claimWake({ sessionID: ids.child, generation: "generation-1" })
+      const wake = yield* first.claimWake({ sessionID: ids.child, generation: "generation-1" })
       if (!wake) throw new Error("terminal wake was not claimed")
       expect(
-        yield* delivery.owner.completeWake({
+        yield* first.completeWake({
           sessionID: ids.child,
           generation: "generation-1",
           token: wake.token,
@@ -555,18 +631,18 @@ test("coordinates recovery through independent SQLite connections", async () => 
           }),
         ).toMatchObject({ status: "claimed" })
         now = 1_101
-        expect(yield* owner.pendingTerminals(ids.parent)).toEqual([
+        expect(yield* remote.pendingTerminals(ids.parent)).toEqual([
           expect.objectContaining({ generation: "generation-2", state: "error" }),
         ])
 
-        const delivery = yield* owner.claimDelivery({ sessionID: ids.child, generation: "generation-2" })
+        const delivery = yield* remote.claimDelivery({ sessionID: ids.child, generation: "generation-2" })
         if (!delivery) throw new Error("terminal delivery was not claimed")
-        yield* owner.completeDelivery({
+        yield* remote.completeDelivery({
           sessionID: ids.child,
           generation: "generation-2",
           token: delivery.token,
         })
-        const wake = yield* owner.claimWake({ sessionID: ids.child, generation: "generation-2" })
+        const wake = yield* remote.claimWake({ sessionID: ids.child, generation: "generation-2" })
         if (!wake) throw new Error("terminal wake was not claimed")
         expect(yield* second.claimWake({ sessionID: ids.child, generation: "generation-2" })).toBeUndefined()
         now = 1_202

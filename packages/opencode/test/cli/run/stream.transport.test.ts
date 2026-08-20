@@ -348,13 +348,14 @@ function textDelta(messageID: string, partID: string, delta: string, sessionID =
   }
 }
 
-function child(id: string): SessionChild {
+function child(id: string, parentID?: string): SessionChild {
   return {
     id,
     slug: id,
     projectID: "project-1",
     directory: "/tmp",
     title: id,
+    ...(parentID ? { parentID } : {}),
     version: "1",
     time: {
       created: 1,
@@ -1393,6 +1394,148 @@ describe("run stream transport", () => {
           }),
         },
       })
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("surfaces and resolves a nested subagent permission before its tool executes", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    let nested = false
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        messages: async ({ sessionID }) => {
+          if (sessionID === "session-1") {
+            return ok([
+              assistantMessage({
+                sessionID,
+                id: "msg-root",
+                parts: [
+                  runningTool({
+                    sessionID,
+                    messageID: "msg-root",
+                    id: "task-child",
+                    callID: "call-child",
+                    tool: "task",
+                    body: { description: "Inspect repository", subagent_type: "explore" },
+                    metadata: { sessionId: "child-1" },
+                  }),
+                ],
+              }),
+            ])
+          }
+
+          if (sessionID === "grandchild-1") {
+            return ok([
+              assistantMessage({
+                sessionID,
+                id: "msg-grandchild",
+                parts: [
+                  runningTool({
+                    sessionID,
+                    messageID: "msg-grandchild",
+                    id: "bash-grandchild",
+                    callID: "call-bash-grandchild",
+                    tool: "bash",
+                    body: { command: "git rev-parse HEAD" },
+                  }),
+                ],
+              }),
+            ])
+          }
+
+          return ok([])
+        },
+        children: async ({ sessionID }) => {
+          if (!nested) return ok([])
+          if (sessionID === "session-1") return ok([child("child-1", sessionID)])
+          if (sessionID === "child-1") return ok([child("grandchild-1", sessionID)])
+          return ok([])
+        },
+        permissions: async () => ok([]),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      nested = true
+      src.push({
+        id: "evt-perm-grandchild-asked",
+        type: "permission.asked",
+        properties: {
+          id: "perm-grandchild",
+          sessionID: "grandchild-1",
+          permission: "bash",
+          patterns: ["git rev-parse HEAD"],
+          metadata: {},
+          always: [],
+          tool: { messageID: "msg-grandchild", callID: "call-bash-grandchild" },
+        },
+      })
+      const blocked = await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        const state = item?.type === "stream.subagent" ? item.state : undefined
+        return state?.permissions.some((request) => request.id === "perm-grandchild") ? state : undefined
+      })
+
+      expect(blocked.tabs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ sessionID: "grandchild-1", description: "Pending permission" }),
+        ]),
+      )
+      expect(
+        ui.events.some(
+          (event) => event.type === "stream.view" && event.view.type === "permission" && event.view.request.id === "perm-grandchild",
+        ),
+      ).toBe(true)
+
+      src.push({
+        id: "evt-perm-grandchild-replied",
+        type: "permission.replied",
+        properties: { sessionID: "grandchild-1", requestID: "perm-grandchild", reply: "once" },
+      })
+      await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        const state = item?.type === "stream.subagent" ? item.state : undefined
+        return state && !state.permissions.some((request) => request.id === "perm-grandchild") ? state : undefined
+      })
+      src.push(
+        toolUpdated(
+          completedTool({
+            sessionID: "grandchild-1",
+            messageID: "msg-grandchild",
+            id: "bash-grandchild",
+            callID: "call-bash-grandchild",
+            tool: "bash",
+            body: { command: "git rev-parse HEAD" },
+            output: "abc123",
+          }),
+        ),
+      )
+
+      transport.selectSubagent("grandchild-1")
+      const resolved = await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        const state = item?.type === "stream.subagent" ? item.state : undefined
+        const detail = state?.details["grandchild-1"]
+        return state &&
+          !state.permissions.some((request) => request.id === "perm-grandchild") &&
+          detail?.commits.some(
+            (commit) => commit.kind === "tool" && commit.tool === "bash" && commit.phase === "progress" && commit.text === "abc123",
+          )
+          ? state
+          : undefined
+      })
+
+      expect(resolved.details["grandchild-1"]?.commits).toEqual(
+        expect.arrayContaining([expect.objectContaining({ kind: "tool", tool: "bash", phase: "progress", text: "abc123" })]),
+      )
     } finally {
       src.close()
       await transport.close()

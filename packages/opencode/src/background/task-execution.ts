@@ -107,7 +107,14 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
     const reconcileExpired = Effect.fn("BackgroundTaskExecution.reconcileExpired")(function* () {
       const time = now()
       const expired = yield* db
-        .select({ sessionID: BackgroundTaskExecutionTable.session_id })
+        .select({
+          sessionID: BackgroundTaskExecutionTable.session_id,
+          parentSessionID: BackgroundTaskExecutionTable.parent_session_id,
+          generation: BackgroundTaskExecutionTable.generation,
+          ownerID: BackgroundTaskExecutionTable.owner_id,
+          leaseExpiresAt: BackgroundTaskExecutionTable.lease_expires_at,
+          timeCreated: BackgroundTaskExecutionTable.time_created,
+        })
         .from(BackgroundTaskExecutionTable)
         .where(
           and(
@@ -115,11 +122,10 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
             lte(BackgroundTaskExecutionTable.lease_expires_at, time),
           ),
         )
-        .limit(1)
-        .get()
+        .all()
         .pipe(Effect.orDie)
-      if (!expired) return
-      yield* db
+      if (expired.length === 0) return
+      const reconciled = yield* db
         .update(BackgroundTaskExecutionTable)
         .set({
           state: sql`CASE WHEN ${BackgroundTaskExecutionTable.cancel_requested_at} IS NULL THEN 'error' ELSE 'cancelled' END`,
@@ -134,8 +140,39 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
             lte(BackgroundTaskExecutionTable.lease_expires_at, time),
           ),
         )
-        .run()
+        .returning({
+          sessionID: BackgroundTaskExecutionTable.session_id,
+          parentSessionID: BackgroundTaskExecutionTable.parent_session_id,
+          generation: BackgroundTaskExecutionTable.generation,
+          ownerID: BackgroundTaskExecutionTable.owner_id,
+          state: BackgroundTaskExecutionTable.state,
+        })
+        .all()
         .pipe(Effect.orDie)
+      yield* Effect.forEach(
+        reconciled,
+        (execution) => {
+          const previous = expired.find(
+            (item) => item.sessionID === execution.sessionID && item.generation === execution.generation,
+          )
+          return Effect.logWarning("background task lease reconciled as expired", {
+            sessionID: execution.sessionID,
+            parentSessionID: execution.parentSessionID,
+            generation: execution.generation,
+            ownerID: execution.ownerID,
+            expiredAt: time,
+            ...(previous
+              ? {
+                  leaseExpiresAt: previous.leaseExpiresAt,
+                  leaseExpiredByMillis: time - previous.leaseExpiresAt,
+                  executionAgeMillis: time - previous.timeCreated,
+                }
+              : {}),
+            reason: execution.state === "cancelled" ? "cancel_requested" : "owner_lease_expired",
+          })
+        },
+        { discard: true },
+      )
     })
 
     const get: Interface["get"] = Effect.fn("BackgroundTaskExecution.get")(function* (sessionID) {
@@ -184,6 +221,17 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
       time_updated: time,
     })
 
+    const logLeaseAcquired = (info: Info, acquiredAt: number) =>
+      Effect.logInfo("background task lease acquired", {
+        sessionID: info.sessionID,
+        parentSessionID: info.parentSessionID,
+        generation: info.generation,
+        ownerID: info.ownerID,
+        acquiredAt,
+        leaseExpiresAt: info.leaseExpiresAt,
+        leaseMillis,
+      })
+
     const replace = Effect.fn("BackgroundTaskExecution.replace")(function* (
       current: Info,
       values: ReturnType<typeof claimValues>,
@@ -229,7 +277,8 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
     })
 
     const claim: Interface["claim"] = Effect.fn("BackgroundTaskExecution.claim")(function* (input) {
-      const values = claimValues(input, now())
+      const time = now()
+      const values = claimValues(input, time)
 
       const inserted = yield* db
         .insert(BackgroundTaskExecutionTable)
@@ -238,7 +287,11 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
         .returning()
         .get()
         .pipe(Effect.orDie)
-      if (inserted) return { status: "claimed", info: fromRow(inserted)! }
+      if (inserted) {
+        const info = fromRow(inserted)!
+        yield* logLeaseAcquired(info, time)
+        return { status: "claimed", info }
+      }
 
       yield* reconcileExpired()
       const current = yield* get(input.sessionID)
@@ -258,7 +311,10 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
       }
 
       const replaced = yield* replace(current, values, false)
-      if (replaced) return { status: "claimed", info: replaced }
+      if (replaced) {
+        yield* logLeaseAcquired(replaced, time)
+        return { status: "claimed", info: replaced }
+      }
       return yield* claim(input)
     })
 
@@ -270,8 +326,12 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
       if (ownership.info.generation === input.generation) return ownership
       if (ownership.info.terminalDeliveredAt === undefined) return ownership
       if (ownership.info.delivery.messageID !== input.observedDeliveryMessageID) return ownership
-      const replaced = yield* replace(ownership.info, claimValues(input, now()), true)
-      if (replaced) return { status: "claimed", info: replaced }
+      const time = now()
+      const replaced = yield* replace(ownership.info, claimValues(input, time), true)
+      if (replaced) {
+        yield* logLeaseAcquired(replaced, time)
+        return { status: "claimed", info: replaced }
+      }
       return yield* claim(input)
     })
 
@@ -293,17 +353,55 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
         .returning({ sessionID: BackgroundTaskExecutionTable.session_id })
         .get()
         .pipe(Effect.orDie)
-      if (renewed) return "owned"
+      if (renewed) {
+        yield* Effect.logInfo("background task lease renewed", {
+          sessionID: input.sessionID,
+          generation: input.generation,
+          ownerID,
+          renewedAt: time,
+          leaseExpiresAt: time + leaseMillis,
+          leaseMillis,
+        })
+        return "owned"
+      }
       const current = yield* get(input.sessionID)
-      if (
+      const result =
         current?.generation === input.generation &&
         current.ownerID === ownerID &&
         current.state === "running" &&
         current.cancelRequestedAt !== undefined
-      ) {
-        return "cancelled"
-      }
-      return "lost"
+          ? "cancelled"
+          : "lost"
+      const reason =
+        current?.generation !== input.generation
+          ? "generation_changed"
+          : current.ownerID !== ownerID
+            ? "ownership_changed"
+            : current.state !== "running"
+              ? "execution_not_running"
+              : current.cancelRequestedAt !== undefined
+                ? "cancel_requested"
+                : current.leaseExpiresAt <= time
+                  ? "lease_expired"
+                  : "heartbeat_condition_failed"
+      yield* Effect.logWarning("background task lease heartbeat failed", {
+        sessionID: input.sessionID,
+        generation: input.generation,
+        ownerID,
+        failedAt: time,
+        result,
+        reason,
+        ...(current
+          ? {
+              currentOwnerID: current.ownerID,
+              currentState: current.state,
+              leaseExpiresAt: current.leaseExpiresAt,
+              leaseRemainingMillis: current.leaseExpiresAt - time,
+              ...(current.cancelRequestedAt === undefined ? {} : { cancelRequestedAt: current.cancelRequestedAt }),
+            }
+          : {}),
+      })
+      return result
     })
 
     const settle: Interface["settle"] = Effect.fn("BackgroundTaskExecution.settle")(function* (input) {
@@ -446,6 +544,7 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
           .from(BackgroundTaskExecutionTable)
           .where(
             and(
+              eq(BackgroundTaskExecutionTable.owner_id, ownerID),
               sql`${BackgroundTaskExecutionTable.state} <> 'running'`,
               or(
                 and(

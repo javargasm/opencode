@@ -3,7 +3,8 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import path from "path"
-import { tool, type ModelMessage } from "ai"
+import { streamText, tool, wrapLanguageModel, type ModelMessage } from "ai"
+import { MockLanguageModelV3 } from "ai/test"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
@@ -21,6 +22,7 @@ import { SessionID, MessageID } from "../../src/session/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Permission } from "@/permission"
 import { LLMAISDK } from "@/session/llm/ai-sdk"
+import { ProviderError } from "@/provider/error"
 import { Session as SessionNs } from "@/session/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -566,6 +568,66 @@ describe("session.llm.ai-sdk adapter", () => {
     expect(events[1]).toMatchObject({ type: "step-finish", providerMetadata: { anthropic: {} } })
     if (events[1].type !== "step-finish") throw new Error("expected step-finish")
     expect(events[1].providerMetadata?.copilot).toBeUndefined()
+  })
+})
+
+describe("session.llm.ai-sdk provider watchdog", () => {
+  test("fails a pending provider read and consumes cancellation rejection", async () => {
+    let timeout: (() => void) | undefined
+    let aborted = false
+    let cancelled = false
+    let pulls = 0
+    const readStarted = Promise.withResolvers<void>()
+    const cancelStarted = Promise.withResolvers<void>()
+    const model = new MockLanguageModelV3({
+      doStream: async (options) => {
+        options.abortSignal?.addEventListener("abort", () => (aborted = true), { once: true })
+        return {
+          stream: new ReadableStream({
+            pull() {
+              // ReadableStream pulls once eagerly; the second pull proves the watchdog reader.read() is pending.
+              if (++pulls === 2) readStarted.resolve()
+            },
+            cancel() {
+              cancelled = true
+              cancelStarted.resolve()
+              return Promise.reject(new Error("provider cancel failed"))
+            },
+          }),
+        }
+      },
+    })
+    const result = streamText({
+      onError() {},
+      model: wrapLanguageModel({
+        model,
+        middleware: LLMAISDK.providerFrameWatchdog({
+          schedule(run, ms) {
+            expect(ms).toBe(120_000)
+            timeout = run
+            return () => undefined
+          },
+        }),
+      }),
+      prompt: "hello",
+    })
+    const failure = (async () => {
+      try {
+        for await (const event of result.fullStream) {
+          if (event.type === "error") return event.error
+        }
+      } catch (error) {
+        return error
+      }
+    })()
+
+    await readStarted.promise
+    timeout?.()
+
+    expect(await failure).toBeInstanceOf(ProviderError.ResponseStreamError)
+    await cancelStarted.promise
+    expect(aborted).toBe(true)
+    expect(cancelled).toBe(true)
   })
 })
 

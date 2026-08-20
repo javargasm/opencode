@@ -609,6 +609,32 @@ function createLayer(input: StreamInput) {
             Effect.orElseSucceed(() => []),
           )
 
+        const subagentChildren = () =>
+          Effect.promise(async () => {
+            const children = []
+            const seen = new Set([input.sessionID])
+            const queue = [input.sessionID]
+
+            while (queue.length > 0) {
+              const parents = queue.splice(0)
+              const responses = await Promise.allSettled(
+                parents.map((sessionID) => input.sdk.session.children({ sessionID })),
+              )
+              const next = responses
+                .flatMap((response) => (response.status === "fulfilled" ? (response.value.data ?? []) : []))
+                .filter((child) => {
+                  if (seen.has(child.id)) return false
+                  seen.add(child.id)
+                  return true
+                })
+
+              children.push(...next)
+              queue.push(...next.map((child) => child.id))
+            }
+
+            return children
+          })
+
         const replayMessages = () =>
           Effect.promise(() =>
             input.sdk.session.messages({
@@ -673,6 +699,41 @@ function createLayer(input: StreamInput) {
           )
         })
 
+        const discoverSubagentBlocker = Effect.fn("RunStreamTransport.discoverSubagentBlocker")(function* (
+          event: Event,
+        ) {
+          if (
+            (event.type !== "permission.asked" && event.type !== "question.asked") ||
+            tracked(event.properties.sessionID)
+          ) {
+            return false
+          }
+
+          const children = yield* subagentChildren()
+          if (!children.some((child) => child.id === event.properties.sessionID)) {
+            return false
+          }
+
+          const previous = listSubagentTabs(state.subagent)
+          const changed = bootstrapSubagentData({
+            data: state.subagent,
+            messages: [],
+            children,
+            permissions: event.type === "permission.asked" ? [event.properties] : [],
+            questions: event.type === "question.asked" ? [event.properties] : [],
+          })
+          if (changed) {
+            traceTabs(input.trace, previous, listSubagentTabs(state.subagent))
+            syncFooter([], undefined, currentSubagentState())
+          }
+
+          yield* bootstrapSubagentHistory([event.properties.sessionID]).pipe(
+            Effect.forkIn(scope, { startImmediately: true }),
+            Effect.asVoid,
+          )
+          return true
+        })
+
         const bootstrap = Effect.fn("RunStreamTransport.bootstrap")(function* () {
           const [messagesList, children, permissions, questions] = yield* Effect.all(
             [
@@ -684,14 +745,7 @@ function createLayer(input: StreamInput) {
                     : Math.max(input.replayLimit, SUBAGENT_BOOTSTRAP_LIMIT)
                   : SUBAGENT_BOOTSTRAP_LIMIT,
               ),
-              Effect.promise(() =>
-                input.sdk.session.children({
-                  sessionID: input.sessionID,
-                }),
-              ).pipe(
-                Effect.map((item) => item.data ?? []),
-                Effect.orElseSucceed(() => []),
-              ),
+              subagentChildren(),
               Effect.promise(() => input.sdk.permission.list()).pipe(
                 Effect.map((item) => item.data ?? []),
                 Effect.orElseSucceed(() => []),
@@ -957,8 +1011,11 @@ function createLayer(input: StreamInput) {
             let changed = false
             for (const event of pending) {
               if (!tracked(sid(event))) {
-                next.push(event)
-                continue
+                yield* discoverSubagentBlocker(event)
+                if (!tracked(sid(event))) {
+                  next.push(event)
+                  continue
+                }
               }
 
               changed = true
@@ -1157,11 +1214,8 @@ function createLayer(input: StreamInput) {
                 }
 
                 if (!tracked(sessionID)) {
-                  if (sessionID) {
-                    input.trace?.write("recv.event", event)
-                    buffered.push(event)
-                  }
-                  return
+                  yield* discoverSubagentBlocker(event)
+                  if (!tracked(sessionID)) return
                 }
 
                 input.trace?.write("recv.event", event)

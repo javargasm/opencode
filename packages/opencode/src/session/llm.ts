@@ -341,6 +341,7 @@ const live: Layer.Layer<
                   return args.params
                 },
               },
+              LLMAISDK.providerFrameWatchdog(),
             ],
           }),
           experimental_telemetry: {

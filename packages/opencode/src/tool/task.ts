@@ -189,7 +189,7 @@ export const deliverBackgroundTerminal = Effect.fn("TaskTool.deliverBackgroundTe
               terminal.state === "cancelled"
                 ? "This task was cancelled intentionally. Do not relaunch it unless the user asks."
                 : terminal.state === "error"
-                  ? `React to this event now. If retry is appropriate, relaunch it with task_id="${terminal.sessionID}". Do not poll the active tasks.`
+                  ? "React to this event now. Report this failure to the user. Do not relaunch or recreate this background task without a new explicit request from the user. Do not poll the active tasks."
                   : "React to this event now. Do not poll the active tasks.",
             ].join("\n"),
           },
@@ -522,6 +522,13 @@ export const TaskTool = Tool.define(
           parts,
         })
         const initial = result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        if (result.info.role === "assistant" && result.info.error && !initial) {
+          return yield* Effect.fail(
+            new Error(
+              "message" in result.info.error.data ? String(result.info.error.data.message) : result.info.error.name,
+            ),
+          )
+        }
         while ((yield* executions.listPendingHandoffs(nextSession.id)).length > 0) {
           yield* Effect.sleep("250 millis")
         }
