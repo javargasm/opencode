@@ -8,7 +8,7 @@ import { ProviderError } from "@/provider/error"
 type Result = Awaited<ReturnType<typeof streamText>>
 type AISDKEvent = Result["fullStream"] extends AsyncIterable<infer T> ? T : never
 
-const PROVIDER_FRAME_TIMEOUT_MS = 120_000
+const PROVIDER_FRAME_TIMEOUT_MS = 30_000
 
 export function providerFrameWatchdog(options?: {
   schedule?: (run: () => void, ms: number) => () => void
@@ -29,7 +29,7 @@ export function providerFrameWatchdog(options?: {
       const watchdog = () => {
         const timeout = Promise.withResolvers<never>()
         const clear = schedule(() => {
-          const error = new ProviderError.ResponseStreamError("Provider stream timed out after 120 seconds")
+          const error = new ProviderError.ResponseStreamError("Provider stream timed out after 30 seconds")
           timeout.reject(error)
           abort.abort(error)
           void reader?.cancel(error).catch(() => undefined)

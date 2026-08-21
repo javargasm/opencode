@@ -541,7 +541,7 @@ describe("session.llm-native.request", () => {
     }),
   )
 
-  it.effect("fails and cancels a silent native provider stream after 120 seconds", () =>
+  it.effect("fails and cancels a silent native provider stream after 30 seconds", () =>
     Effect.gen(function* () {
       let cancelled = false
       const native = LLMNativeRuntime.stream({
@@ -562,10 +562,10 @@ describe("session.llm-native.request", () => {
       if (native.type === "unsupported") throw new Error(native.reason)
 
       const fiber = yield* native.stream.pipe(Stream.runCollect, Effect.flip, Effect.forkChild)
-      yield* TestClock.adjust("120 seconds")
+      yield* TestClock.adjust("30 seconds")
       const failure = yield* Fiber.join(fiber)
       expect(failure).toBeInstanceOf(Error)
-      expect(failure).toEqual(expect.objectContaining({ message: "Native LLM stream timed out after 120 seconds" }))
+      expect(failure).toEqual(expect.objectContaining({ message: "Native LLM stream timed out after 30 seconds" }))
       expect(cancelled).toBe(true)
     }),
   )

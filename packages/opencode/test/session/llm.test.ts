@@ -603,7 +603,7 @@ describe("session.llm.ai-sdk provider watchdog", () => {
         model,
         middleware: LLMAISDK.providerFrameWatchdog({
           schedule(run, ms) {
-            expect(ms).toBe(120_000)
+            expect(ms).toBe(30_000)
             timeout = run
             return () => undefined
           },
