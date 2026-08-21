@@ -114,6 +114,7 @@ export const deliverBackgroundTerminal = Effect.fn("TaskTool.deliverBackgroundTe
   ops: TaskPromptOps
   terminal: BackgroundTaskExecution.Info
   variant?: string
+  wakeParent?: boolean
   afterAdmit?: (input: {
     activeTasks: { task_id: SessionID; description: string }[]
     event: SessionV1.WithParts
@@ -211,6 +212,13 @@ export const deliverBackgroundTerminal = Effect.fn("TaskTool.deliverBackgroundTe
   if (terminal.state === "cancelled" || !terminal.wakeRequired) return true
   const wake = yield* input.executions.claimWake({ sessionID: terminal.sessionID, generation: terminal.generation })
   if (!wake) return true
+  if (input.wakeParent === false) {
+    return yield* input.executions.completeWake({
+      sessionID: terminal.sessionID,
+      generation: terminal.generation,
+      token: wake.token,
+    })
+  }
   const watch = Effect.gen(function* () {
     while (true) {
       yield* Effect.sleep(Duration.millis(Math.max(10, Math.floor(input.executions.leaseMillis / 3))))
@@ -521,14 +529,18 @@ export const TaskTool = Tool.define(
           agent: next.name,
           parts,
         })
-        const initial = result.parts.findLast((item) => item.type === "text")?.text ?? ""
-        if (result.info.role === "assistant" && result.info.error && !initial) {
-          return yield* Effect.fail(
-            new Error(
-              "message" in result.info.error.data ? String(result.info.error.data.message) : result.info.error.name,
-            ),
-          )
+        if (result.info.role === "assistant" && result.info.error) {
+          const message =
+            "message" in result.info.error.data && typeof result.info.error.data.message === "string"
+              ? result.info.error.data.message
+              : result.info.error.name
+          return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${message}`))
         }
+        const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
+        if (failed?.type === "tool" && failed.state.status === "error") {
+          return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${failed.state.error}`))
+        }
+        const initial = result.parts.findLast((item) => item.type === "text")?.text ?? ""
         while ((yield* executions.listPendingHandoffs(nextSession.id)).length > 0) {
           yield* Effect.sleep("250 millis")
         }
@@ -732,7 +744,15 @@ export const TaskTool = Tool.define(
             ? yield* executions.claimAfterObservedTerminal({ ...claimInput, observedDeliveryMessageID })
             : yield* executions.claim(claimInput)
           if (ownership.status === "terminal") {
-            const delivered = yield* deliverBackgroundTerminal({ executions, sessions, ops, terminal: ownership.info })
+            const delivered = yield* deliverBackgroundTerminal({
+              executions,
+              sessions,
+              ops,
+              terminal: ownership.info,
+              // This replay runs inside the parent's active TaskTool call; waking it synchronously queues a successor
+              // that cannot start until this call returns.
+              wakeParent: false,
+            })
             if (ownership.info.generation === requestedGeneration) {
               if (!delivered) {
                 if (!runInBackground) {

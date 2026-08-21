@@ -146,7 +146,12 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
   return { chat, assistant }
 })
 
-function stubOps(opts?: { onPrompt?: (input: SessionPrompt.PromptInput) => void; text?: string }): TaskPromptOps {
+function stubOps(opts?: {
+  onPrompt?: (input: SessionPrompt.PromptInput) => void
+  text?: string
+  error?: NonNullable<SessionV1.Assistant["error"]>
+  toolError?: string
+}): TaskPromptOps {
   return {
     cancel: () => Effect.void,
     interrupt: () => Effect.void,
@@ -154,7 +159,7 @@ function stubOps(opts?: { onPrompt?: (input: SessionPrompt.PromptInput) => void;
     prompt: (input) =>
       Effect.sync(() => {
         opts?.onPrompt?.(input)
-        return reply(input, opts?.text ?? "done")
+        return reply(input, opts?.text ?? "done", opts?.error, opts?.toolError)
       }),
     wake: () => Effect.void,
   }
@@ -173,7 +178,12 @@ function taskContext(sessionID: SessionID, messageID: MessageID, promptOps: Task
   }
 }
 
-function reply(input: SessionPrompt.PromptInput, text: string): SessionV1.WithParts {
+function reply(
+  input: SessionPrompt.PromptInput,
+  text: string,
+  error?: NonNullable<SessionV1.Assistant["error"]>,
+  toolError?: string,
+): SessionV1.WithParts {
   const id = MessageID.ascending()
   return {
     info: {
@@ -190,6 +200,7 @@ function reply(input: SessionPrompt.PromptInput, text: string): SessionV1.WithPa
       providerID: input.model?.providerID ?? ref.providerID,
       time: { created: Date.now() },
       finish: "stop",
+      error,
     },
     parts: [
       {
@@ -199,6 +210,24 @@ function reply(input: SessionPrompt.PromptInput, text: string): SessionV1.WithPa
         type: "text",
         text,
       },
+      ...(toolError
+        ? [
+            {
+              id: PartID.ascending(),
+              messageID: id,
+              sessionID: input.sessionID,
+              type: "tool" as const,
+              tool: "read",
+              callID: "call-1",
+              state: {
+                status: "error" as const,
+                input: { filePath: "/external" },
+                error: toolError,
+                time: { start: Date.now(), end: Date.now() },
+              },
+            },
+          ]
+        : []),
     ],
   }
 }
@@ -458,6 +487,93 @@ describe("tool.task", () => {
 
       expect(Exit.isFailure(exit)).toBe(true)
       expect(yield* sessions.children(chat.id)).toHaveLength(0)
+    }),
+  )
+
+  it.instance("execute surfaces child errors with a resumable task_id", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: stubOps({
+                text: "",
+                error: new SessionV1.APIError({ message: "Network connection lost", isRetryable: false }).toObject(),
+              }),
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected task failure")
+      const child = (yield* sessions.children(chat.id))[0]
+      expect(child).toBeDefined()
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (!(failure instanceof Error)) throw new Error("expected Error defect")
+      expect(failure.message).toBe(`Subagent failed (task_id: ${child?.id}): Network connection lost`)
+    }),
+  )
+
+  it.instance("execute surfaces terminal child tool errors with a resumable task_id", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect external directory",
+            prompt: "read the external directory",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: stubOps({
+                text: "I will inspect the directory.",
+                toolError: "The user rejected permission to use this specific tool call.",
+              }),
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected task failure")
+      const child = (yield* sessions.children(chat.id))[0]
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (!(failure instanceof Error)) throw new Error("expected Error defect")
+      expect(failure.message).toBe(
+        `Subagent failed (task_id: ${child?.id}): The user rejected permission to use this specific tool call.`,
+      )
     }),
   )
 
@@ -1995,6 +2111,90 @@ describe("tool.task", () => {
       ]
       expect(projectBackgroundTasks(messages).size).toBe(0)
       expect(projectBackgroundTasks(messages).size).toBe(0)
+    }),
+  )
+
+  background.instance("does not synchronously wake an active parent when replaying a terminal", () =>
+    Effect.gen(function* () {
+      const executions = yield* BackgroundTaskExecution.Service
+      const sessions = yield* Session.Service
+      const scope = yield* Scope.Scope
+      const { chat, assistant } = yield* seed("active parent")
+      const child = yield* sessions.create({ parentID: chat.id, title: "recovered child" })
+      const oldOwner = yield* BackgroundTaskExecution.make({ ownerID: "old-process" })
+      const callID = "resume-call"
+      const generation = `${assistant.id}:${callID}`
+      yield* oldOwner.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation,
+        description: child.title,
+        parentMessageID: assistant.id,
+        wakeRequired: true,
+      })
+      yield* oldOwner.settle({
+        sessionID: child.id,
+        generation,
+        state: "completed",
+        output: "recovered",
+      })
+
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const runner = Runner.make<void>(scope)
+      const started = yield* Deferred.make<void>()
+      const releaseRetry = yield* Deferred.make<void>()
+      let wakes = 0
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          input.sessionID === child.id
+            ? Deferred.await(releaseRetry).pipe(Effect.as(reply(input, "replayed")))
+            : Effect.succeed(reply(input, "replayed")),
+        wake: () =>
+          Effect.gen(function* () {
+            wakes++
+            yield* runner.wake(Effect.void)
+          }),
+      }
+      const work = def
+        .execute(
+          {
+            description: child.title,
+            prompt: "resume",
+            subagent_type: "general",
+            background: true,
+            task_id: child.id,
+          },
+          { ...taskContext(chat.id, assistant.id, promptOps), callID },
+        )
+        .pipe(Effect.asVoid)
+      const current = yield* runner
+        .ensureRunning(Deferred.succeed(started, undefined).pipe(Effect.andThen(work)))
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+      const result = yield* Fiber.join(current).pipe(Effect.timeout("1 second"), Effect.exit)
+      expect(Exit.isSuccess(result)).toBe(true)
+      expect(wakes).toBe(0)
+      expect(runner.state._tag).toBe("Idle")
+      expect(yield* executions.get(child.id)).toMatchObject({ wakeClaimedAt: expect.any(Number) })
+      const retry = yield* def.execute(
+        {
+          description: child.title,
+          prompt: "resume with a new generation",
+          subagent_type: "general",
+          background: true,
+          task_id: child.id,
+        },
+        { ...taskContext(chat.id, assistant.id, promptOps), callID: "resume-new-call" },
+      )
+      expect(retry.metadata.backgroundTaskGeneration).not.toBe(generation)
+      expect(yield* executions.get(child.id)).toMatchObject({
+        generation: retry.metadata.backgroundTaskGeneration,
+        state: "running",
+      })
+      expect(wakes).toBe(0)
+      yield* Deferred.succeed(releaseRetry, undefined)
     }),
   )
 

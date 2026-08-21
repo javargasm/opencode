@@ -16,7 +16,7 @@
 // We also re-check live session status before resolving an idle event so a
 // delayed idle from an older turn cannot complete a newer busy turn.
 import type { Event, GlobalEvent, OpencodeClient } from "@opencode-ai/sdk/v2"
-import { Context, Deferred, Effect, Exit, Layer, Scope, Stream } from "effect"
+import { Context, Deferred, Effect, Exit, Layer, Scope, Semaphore, Stream } from "effect"
 import { makeRuntime } from "@/effect/run-service"
 import {
   blockerStatus,
@@ -128,6 +128,12 @@ type TransportService = {
   readonly selectSubagent: (sessionID: string | undefined) => Effect.Effect<void>
   readonly replayOnResize: (input: SessionResizeReplayInput) => Effect.Effect<boolean>
   readonly close: () => Effect.Effect<void>
+}
+
+type ResizeSignal = {
+  active: boolean
+  requested: boolean
+  pending?: SessionResizeReplayInput
 }
 
 class Service extends Context.Service<Service, TransportService>()("@opencode/RunStreamTransport") {}
@@ -388,7 +394,7 @@ function traceTabs(trace: Trace | undefined, prev: FooterSubagentTab[], next: Fo
   }
 }
 
-function createLayer(input: StreamInput) {
+function createLayer(input: StreamInput, resize: ResizeSignal) {
   return Layer.fresh(
     Layer.effect(
       Service,
@@ -453,13 +459,57 @@ function createLayer(input: StreamInput) {
         }
         let booting = true
         let replaying = false
+        let catchingUp = true
         let replayDisabled = false
-        let replayPending: SessionResizeReplayInput | undefined
         const buffered: Event[] = []
+        const eventGate = Semaphore.makeUnsafe(1)
         const replayedParts = new Set<string>()
         const recovering = new Set<string>()
         const tracked = (sessionID: string | undefined) =>
           sessionID === input.sessionID || (!!sessionID && state.subagent.tabs.has(sessionID))
+        const taskDiscovery = (event: Event) =>
+          event.type === "message.part.updated" &&
+          event.properties.part.sessionID === input.sessionID &&
+          event.properties.part.type === "tool" &&
+          event.properties.part.tool === "task" &&
+          (("metadata" in event.properties.part.state &&
+            (typeof event.properties.part.state.metadata?.sessionId === "string" ||
+              typeof event.properties.part.state.metadata?.sessionID === "string")) ||
+            typeof event.properties.part.metadata?.sessionId === "string" ||
+            typeof event.properties.part.metadata?.sessionID === "string")
+        const catchUpBoundary = (event: Event) =>
+          event.type === "session.status" &&
+          event.properties.sessionID === input.sessionID &&
+          event.properties.status.type === "idle"
+        const bufferRank = (event: Event) => {
+          if (catchUpBoundary(event)) return 4
+          if (event.type.startsWith("permission.") || event.type.startsWith("question.") || taskDiscovery(event))
+            return 3
+          const sessionID = sid(event)
+          if (tracked(sessionID)) return 2
+          return 0
+        }
+        const bufferEvent = (event: Event) => {
+          if (buffered.length < SUBAGENT_BOOTSTRAP_LIMIT) {
+            buffered.push(event)
+            return
+          }
+
+          const rank = bufferRank(event)
+          const dropped = buffered.reduce(
+            (index, item, next) => (bufferRank(item) < bufferRank(buffered[index]) ? next : index),
+            0,
+          )
+          if (rank < bufferRank(buffered[dropped])) {
+            input.trace?.write("recv.buffer.drop", { type: event.type, sessionID: sid(event) })
+            return
+          }
+
+          const removed = buffered[dropped]
+          buffered.splice(dropped, 1)
+          buffered.push(event)
+          input.trace?.write("recv.buffer.drop", { type: removed.type, sessionID: sid(removed) })
+        }
         const currentSubagentState = () => {
           if (state.selectedSubagent && !state.subagent.tabs.has(state.selectedSubagent)) {
             state.selectedSubagent = undefined
@@ -839,8 +889,12 @@ function createLayer(input: StreamInput) {
             yield* Effect.promise(() => input.footer.idle()).pipe(Effect.orElseSucceed(() => undefined))
           }
 
-          booting = false
-          yield* drainBuffered()
+          yield* eventGate.withPermits(1)(
+            Effect.gen(function* () {
+              booting = false
+              yield* drainBuffered()
+            }),
+          )
 
           const sessions = [...state.subagent.tabs.keys()]
           if (sessions.length === 0) {
@@ -889,16 +943,17 @@ function createLayer(input: StreamInput) {
 
         const complete = Effect.fn("RunStreamTransport.complete")(function* (next: Wait, fallback: boolean) {
           if (state.wait !== next || !next.armed || !next.live) {
-            return
+            return false
           }
 
           if (!(yield* idle(fallback)) || state.wait !== next) {
-            return
+            return false
           }
 
           state.tick = next.tick + 1
           state.wait = undefined
           yield* Deferred.succeed(next.done, undefined).pipe(Effect.ignore)
+          return true
         })
 
         const mark = Effect.fn("RunStreamTransport.mark")(function* (event: Event) {
@@ -921,7 +976,13 @@ function createLayer(input: StreamInput) {
         const poll = Effect.fn("RunStreamTransport.poll")(function* (next: Wait, signal: AbortSignal) {
           while (state.wait === next && !signal.aborted && !input.footer.isClosed && !closed) {
             yield* Effect.sleep("250 millis")
-            yield* complete(next, false)
+            if (!(yield* complete(next, false))) continue
+            yield* eventGate.withPermits(1)(
+              Effect.gen(function* () {
+                catchingUp = false
+                yield* drainBuffered()
+              }),
+            )
           }
         })
 
@@ -1009,7 +1070,13 @@ function createLayer(input: StreamInput) {
           while (pending.length > 0) {
             const next: Event[] = []
             let changed = false
-            for (const event of pending) {
+            for (let index = 0; index < pending.length; index++) {
+              const event = pending[index]
+              if (resize.requested && !replayDisabled) {
+                buffered.push(...next, ...pending.slice(index))
+                return
+              }
+
               if (!tracked(sid(event))) {
                 yield* discoverSubagentBlocker(event)
                 if (!tracked(sid(event))) {
@@ -1018,13 +1085,22 @@ function createLayer(input: StreamInput) {
                 }
               }
 
+              if (resize.requested && !replayDisabled) {
+                buffered.push(...next, ...pending.slice(index))
+                return
+              }
+
               changed = true
               yield* applyEvent(event)
+              if (catchUpBoundary(event)) catchingUp = false
             }
 
             const arrived = buffered.splice(0)
             if (!changed && arrived.length === 0) {
-              buffered.push(...next)
+              for (const event of next) {
+                if (catchingUp) bufferEvent(event)
+                else input.trace?.write("recv.buffer.drop", { type: event.type, sessionID: sid(event) })
+              }
               return
             }
 
@@ -1035,30 +1111,68 @@ function createLayer(input: StreamInput) {
         const replayOnResize: (next: SessionResizeReplayInput) => Effect.Effect<boolean> = Effect.fn(
           "RunStreamTransport.replayOnResize",
         )(function* (next: SessionResizeReplayInput) {
-          if (!input.replay || replayDisabled || booting || closed || input.footer.isClosed) {
-            return false
-          }
+          const started = yield* eventGate.withPermits(1)(
+            Effect.gen(function* () {
+              if (!input.replay || booting || closed || input.footer.isClosed) {
+                resize.requested = false
+                resize.pending = undefined
+                return false
+              }
 
-          if (replaying) {
-            replayPending = next
+              if (replayDisabled) {
+                resize.requested = false
+                resize.pending = undefined
+                yield* drainBuffered()
+                resize.requested = false
+                resize.pending = undefined
+                return false
+              }
+
+              if (replaying) {
+                resize.pending = next
+                return false
+              }
+
+              replayedParts.clear()
+              replaying = true
+              resize.requested = false
+              return true
+            }),
+          )
+          if (!started) {
             return false
           }
 
           const finish: () => Effect.Effect<void> = Effect.fnUntraced(function* () {
-            yield* drainBuffered()
-            const pending = replayPending
-            replayPending = undefined
-            if (!pending || replayDisabled || closed || input.footer.isClosed) {
-              replaying = false
-              return
-            }
+            const pending = yield* eventGate.withPermits(1)(
+              Effect.gen(function* () {
+                const pending = resize.pending
+                resize.pending = undefined
+                if (pending && !replayDisabled && !closed && !input.footer.isClosed) {
+                  resize.requested = true
+                  replaying = false
+                  return pending
+                }
 
-            replaying = false
+                resize.requested = false
+                yield* drainBuffered()
+                const trailing = resize.pending
+                resize.pending = undefined
+                if (trailing && !replayDisabled && !closed && !input.footer.isClosed) {
+                  resize.requested = true
+                  replaying = false
+                  return trailing
+                }
+
+                replaying = false
+                return undefined
+              }),
+            )
+            if (!pending) return
+
             yield* replayOnResize(pending).pipe(Effect.asVoid)
           })
 
-          replayedParts.clear()
-          replaying = true
           input.trace?.write("replay.resize.start", {
             sessionID: input.sessionID,
           })
@@ -1187,41 +1301,52 @@ function createLayer(input: StreamInput) {
           ).pipe(
             Stream.takeUntil(() => input.footer.isClosed || abort.signal.aborted),
             Stream.runForEach(
-              Effect.fn("RunStreamTransport.event")(function* (item: unknown) {
-                if (input.footer.isClosed) {
-                  abort.abort()
-                  return
-                }
+              Effect.fn("RunStreamTransport.event")((item: unknown) =>
+                eventGate.withPermits(1)(
+                  Effect.gen(function* () {
+                    if (input.footer.isClosed) {
+                      abort.abort()
+                      return
+                    }
 
-                if (isMatchingDisposeEvent(item, input.directory)) {
-                  yield* fail(new Error("instance disposed"))
-                  yield* closeScope()
-                  return
-                }
+                    if (isMatchingDisposeEvent(item, input.directory)) {
+                      yield* fail(new Error("instance disposed"))
+                      yield* closeScope()
+                      return
+                    }
 
-                const event = globalPayloadEvent(item)
-                if (!event) {
-                  return
-                }
+                    const event = globalPayloadEvent(item)
+                    if (!event) {
+                      return
+                    }
 
-                const sessionID = sid(event)
-                if (booting || replaying) {
-                  if (sessionID) {
+                    const sessionID = sid(event)
+                    if (booting || replaying || resize.requested) {
+                      if (sessionID) {
+                        input.trace?.write("recv.event", event)
+                        bufferEvent(event)
+                      }
+                      return
+                    }
+
+                    if (!tracked(sessionID)) {
+                      yield* discoverSubagentBlocker(event)
+                      if (!tracked(sessionID)) {
+                        if (catchingUp && sessionID) {
+                          input.trace?.write("recv.event", event)
+                          bufferEvent(event)
+                        }
+                        return
+                      }
+                    }
+
                     input.trace?.write("recv.event", event)
-                    buffered.push(event)
-                  }
-                  return
-                }
-
-                if (!tracked(sessionID)) {
-                  yield* discoverSubagentBlocker(event)
-                  if (!tracked(sessionID)) return
-                }
-
-                input.trace?.write("recv.event", event)
-                yield* applyEvent(event)
-                yield* drainBuffered()
-              }),
+                    yield* applyEvent(event)
+                    if (catchUpBoundary(event)) catchingUp = false
+                    yield* drainBuffered()
+                  }),
+                ),
+              ),
             ),
             Effect.catch((error) => (abort.signal.aborted ? Effect.void : fail(error))),
             Effect.ensuring(
@@ -1504,13 +1629,31 @@ function createLayer(input: StreamInput) {
 // The transport is single-turn: only one runPromptTurn() call can be active
 // at a time. The prompt queue enforces this from above.
 export async function createSessionTransport(input: StreamInput): Promise<SessionTransport> {
-  const runtime = makeRuntime(Service, createLayer(input))
+  const resize: ResizeSignal = { active: false, requested: false }
+  const runtime = makeRuntime(Service, createLayer(input, resize))
   await runtime.runPromise(() => Effect.void)
 
   return {
     runPromptTurn: (next) => runtime.runPromise((svc) => svc.runPromptTurn(next)),
     selectSubagent: (sessionID) => runtime.runSync((svc) => svc.selectSubagent(sessionID)),
-    replayOnResize: (next) => runtime.runPromise((svc) => svc.replayOnResize(next)),
+    replayOnResize: (next) => {
+      if (!input.replay) return Promise.resolve(false)
+      if (resize.active) {
+        resize.requested = true
+        resize.pending = next
+        return Promise.resolve(false)
+      }
+
+      resize.active = true
+      resize.requested = true
+      return runtime
+        .runPromise((svc) => svc.replayOnResize(next))
+        .finally(() => {
+          resize.active = false
+          resize.requested = false
+          resize.pending = undefined
+        })
+    },
     close: () => runtime.runPromise((svc) => svc.close()),
   }
 }

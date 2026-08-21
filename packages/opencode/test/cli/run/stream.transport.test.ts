@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test"
 import { OpencodeClient, type GlobalEvent } from "@opencode-ai/sdk/v2"
 import { createSessionTransport } from "@/cli/cmd/run/stream.transport"
+import { SUBAGENT_BOOTSTRAP_LIMIT } from "@/cli/cmd/run/subagent-data"
 import type { FooterApi, FooterEvent, LocalReplayRow, RunFilePart, StreamCommit } from "@/cli/cmd/run/types"
 
 type EventStream = Awaited<ReturnType<OpencodeClient["event"]["subscribe"]>>["stream"]
@@ -921,12 +922,91 @@ describe("run stream transport", () => {
           }),
         ]),
       ).toBe(true)
-      expect(resetB).not.toHaveBeenCalled()
+      expect(resetB).toHaveBeenCalledTimes(1)
       expect(resetC).toHaveBeenCalledTimes(1)
     } finally {
       src.close()
       await transport.close()
       await turn
+    }
+  })
+
+  test("applies catch-up events after an immediate resize snapshot", async () => {
+    const global = globalFeed()
+    const ui = footer()
+    const bootstrapGate = defer<void>()
+    const snapshotGate = defer<void>()
+    const snapshotStarted = defer<void>()
+    const trace = mock((_type: string, _data?: unknown) => {})
+    let calls = 0
+    let transport: Awaited<ReturnType<typeof createSessionTransport>> | undefined
+    const task = createSessionTransport({
+      sdk: sdk({
+        globalStream: global.stream,
+        messages: async () => {
+          calls += 1
+          if (calls === 1) {
+            await bootstrapGate.promise
+            return ok([])
+          }
+
+          snapshotStarted.resolve()
+          global.push(
+            globalEvent({
+              id: "evt-catch-up-error",
+              type: "session.error",
+              properties: {
+                sessionID: "session-1",
+                error: {
+                  name: "UnknownError",
+                  data: {
+                    message: "keep catch-up error",
+                  },
+                },
+              },
+            }),
+          )
+          await snapshotGate.promise
+          return ok([])
+        },
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      replay: true,
+      limits: () => ({}),
+      footer: ui.api,
+      trace: { write: trace },
+    })
+
+    try {
+      bootstrapGate.resolve()
+      transport = await task
+      const replay = transport.replayOnResize({
+        localRows: () => [],
+        reset: () => {
+          ui.commits.length = 0
+          return Promise.resolve()
+        },
+      })
+      await snapshotStarted.promise
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) => call[0] === "recv.event" && (call[1] as { id?: string } | undefined)?.id === "evt-catch-up-error",
+        )
+          ? true
+          : undefined,
+      )
+      expect(ui.commits).toEqual([])
+      snapshotGate.resolve()
+
+      expect(await replay).toBe(true)
+      await waitFor(() => ui.commits.find((commit) => commit.kind === "error" && commit.text === "keep catch-up error"))
+    } finally {
+      global.close()
+      bootstrapGate.resolve()
+      snapshotGate.resolve()
+      await task
+      await transport?.close()
     }
   })
 
@@ -1145,6 +1225,88 @@ describe("run stream transport", () => {
       })
     } finally {
       src.close()
+      await transport.close()
+    }
+  })
+
+  test("drains an event buffered by a disabled resize replay", async () => {
+    const global = globalFeed()
+    const ui = footer()
+    const childrenStarted = defer<void>()
+    const childrenGate = defer<void>()
+    const replayStarted = defer<void>()
+    const trace = mock((_type: string, _data?: unknown) => {})
+    let drain = false
+    const reset = mock(() => Promise.reject(new Error("clear failed")))
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        globalStream: global.stream,
+        children: async () => {
+          if (!drain) return ok([])
+          childrenStarted.resolve()
+          await childrenGate.promise
+          return ok([child("child-disabled")])
+        },
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      replay: true,
+      limits: () => ({}),
+      footer: ui.api,
+      trace: { write: trace },
+    })
+
+    try {
+      global.push(globalEvent(retry("child-disabled", 1, "keep disabled drain")))
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) =>
+            call[0] === "recv.event" && (call[1] as { id?: string } | undefined)?.id === "evt-child-disabled-retry-1",
+        )
+          ? true
+          : undefined,
+      )
+      expect(await transport.replayOnResize({ localRows: () => [], reset })).toBe(false)
+      let replay: Promise<boolean> | undefined
+      drain = true
+      global.push(
+        globalEvent({
+          id: "evt-disabled-resize-permission",
+          type: "permission.asked",
+          properties: {
+            get sessionID() {
+              if (!replay) {
+                replay = transport.replayOnResize({ localRows: () => [], reset })
+                replayStarted.resolve()
+              }
+              return "child-disabled"
+            },
+            id: "perm-disabled-resize",
+            permission: "bash",
+            patterns: ["git status"],
+            metadata: {},
+            always: [],
+          },
+        }),
+      )
+      await replayStarted.promise
+      await childrenStarted.promise
+      expect(await transport.replayOnResize({ localRows: () => [], reset })).toBe(false)
+      childrenGate.resolve()
+      expect(await replay).toBe(false)
+      transport.selectSubagent("child-disabled")
+
+      await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        const commits = item?.type === "stream.subagent" ? item.state.details["child-disabled"]?.commits : undefined
+        return commits?.some((commit) => commit.kind === "error" && commit.text === "keep disabled drain")
+          ? true
+          : undefined
+      })
+      expect(reset).toHaveBeenCalledTimes(1)
+    } finally {
+      global.close()
+      childrenGate.resolve()
       await transport.close()
     }
   })
@@ -1491,7 +1653,10 @@ describe("run stream transport", () => {
       )
       expect(
         ui.events.some(
-          (event) => event.type === "stream.view" && event.view.type === "permission" && event.view.request.id === "perm-grandchild",
+          (event) =>
+            event.type === "stream.view" &&
+            event.view.type === "permission" &&
+            event.view.request.id === "perm-grandchild",
         ),
       ).toBe(true)
 
@@ -1527,14 +1692,20 @@ describe("run stream transport", () => {
         return state &&
           !state.permissions.some((request) => request.id === "perm-grandchild") &&
           detail?.commits.some(
-            (commit) => commit.kind === "tool" && commit.tool === "bash" && commit.phase === "progress" && commit.text === "abc123",
+            (commit) =>
+              commit.kind === "tool" &&
+              commit.tool === "bash" &&
+              commit.phase === "progress" &&
+              commit.text === "abc123",
           )
           ? state
           : undefined
       })
 
       expect(resolved.details["grandchild-1"]?.commits).toEqual(
-        expect.arrayContaining([expect.objectContaining({ kind: "tool", tool: "bash", phase: "progress", text: "abc123" })]),
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "tool", tool: "bash", phase: "progress", text: "abc123" }),
+        ]),
       )
     } finally {
       src.close()
@@ -1794,6 +1965,514 @@ describe("run stream transport", () => {
       })
     } finally {
       global.close()
+      await transport?.close()
+    }
+  })
+
+  test("keeps an unknown child blocker until its queued Task discovery event", async () => {
+    const global = globalFeed()
+    const ui = footer()
+    const bootstrapGate = defer<void>()
+    const trace = mock((_type: string, _data?: unknown) => {})
+    let transport: Awaited<ReturnType<typeof createSessionTransport>> | undefined
+    const task = createSessionTransport({
+      sdk: sdk({
+        globalStream: global.stream,
+        messages: async ({ sessionID }) => {
+          if (sessionID !== "session-1") return ok([])
+          await bootstrapGate.promise
+          return ok([])
+        },
+        children: async () => ok([]),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+      trace: { write: trace },
+    })
+
+    try {
+      bootstrapGate.resolve()
+      transport = await task
+      global.push(
+        globalEvent({
+          id: "evt-catch-up-permission",
+          type: "permission.asked",
+          properties: {
+            id: "perm-catch-up",
+            sessionID: "child-catch-up",
+            permission: "bash",
+            patterns: ["git status"],
+            metadata: {},
+            always: [],
+          },
+        }),
+      )
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) =>
+            call[0] === "recv.event" && (call[1] as { id?: string } | undefined)?.id === "evt-catch-up-permission",
+        )
+          ? true
+          : undefined,
+      )
+      global.push(globalEvent(busy()))
+      global.push(
+        globalEvent(
+          toolUpdated(
+            runningTool({
+              sessionID: "session-1",
+              messageID: "msg-catch-up",
+              id: "task-catch-up",
+              callID: "call-catch-up",
+              tool: "task",
+              body: {
+                description: "Catch up child",
+                subagent_type: "explore",
+              },
+              metadata: {
+                sessionId: "child-catch-up",
+              },
+            }),
+          ),
+        ),
+      )
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) =>
+            call[0] === "recv.event" && (call[1] as { id?: string } | undefined)?.id === "evt-task-catch-up-updated",
+        )
+          ? true
+          : undefined,
+      )
+      await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        return item?.type === "stream.subagent" &&
+          item.state.permissions.some((request) => request.id === "perm-catch-up")
+          ? true
+          : undefined
+      })
+    } finally {
+      global.close()
+      bootstrapGate.resolve()
+      await task
+      await transport?.close()
+    }
+  })
+
+  test("keeps child B events after discovering child A during catch-up", async () => {
+    const global = globalFeed()
+    const ui = footer()
+    const bootstrapGate = defer<void>()
+    const childBChecked = defer<void>()
+    let checkingChildB = false
+    let transport: Awaited<ReturnType<typeof createSessionTransport>> | undefined
+    const task = createSessionTransport({
+      sdk: sdk({
+        globalStream: global.stream,
+        messages: async ({ sessionID }) => {
+          if (sessionID !== "session-1") return ok([])
+          await bootstrapGate.promise
+          return ok([])
+        },
+        children: async () => {
+          if (checkingChildB) childBChecked.resolve()
+          return ok([])
+        },
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    const taskEvent = (sessionID: string, suffix: string) =>
+      globalEvent(
+        toolUpdated(
+          runningTool({
+            sessionID: "session-1",
+            messageID: `msg-${suffix}`,
+            id: `task-${suffix}`,
+            callID: `call-${suffix}`,
+            tool: "task",
+            body: {
+              description: `Catch up ${suffix}`,
+              subagent_type: "explore",
+            },
+            metadata: { sessionId: sessionID },
+          }),
+        ),
+      )
+
+    try {
+      bootstrapGate.resolve()
+      transport = await task
+      global.push(taskEvent("child-a", "a"))
+      await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        return item?.type === "stream.subagent" && item.state.tabs.some((tab) => tab.sessionID === "child-a")
+          ? true
+          : undefined
+      })
+
+      checkingChildB = true
+      global.push(
+        globalEvent({
+          id: "evt-child-b-permission",
+          type: "permission.asked",
+          properties: {
+            id: "perm-child-b",
+            sessionID: "child-b",
+            permission: "bash",
+            patterns: ["git status"],
+            metadata: {},
+            always: [],
+          },
+        }),
+      )
+      await childBChecked.promise
+      global.push(taskEvent("child-b", "b"))
+
+      await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        return item?.type === "stream.subagent" &&
+          item.state.permissions.some((request) => request.id === "perm-child-b")
+          ? true
+          : undefined
+      })
+    } finally {
+      global.close()
+      bootstrapGate.resolve()
+      await task
+      await transport?.close()
+    }
+  })
+
+  test("bounds bootstrap events while preserving child blockers and parent discovery", async () => {
+    const global = globalFeed()
+    const ui = footer()
+    const trace = mock((_type: string, _data?: unknown) => {})
+    const gate = defer<void>()
+    let transport: Awaited<ReturnType<typeof createSessionTransport>> | undefined
+    const task = createSessionTransport({
+      sdk: sdk({
+        globalStream: global.stream,
+        messages: async ({ sessionID }) => {
+          if (sessionID !== "session-1") return ok([])
+          await gate.promise
+          return ok([])
+        },
+        children: async () => ok([]),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+      trace: { write: trace },
+    })
+
+    try {
+      for (let attempt = 0; attempt < SUBAGENT_BOOTSTRAP_LIMIT; attempt++) {
+        global.push(globalEvent(retry("session-1", attempt, `parent retry ${attempt}`)))
+      }
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) =>
+            call[0] === "recv.event" &&
+            (call[1] as { id?: string } | undefined)?.id === `evt-session-1-retry-${SUBAGENT_BOOTSTRAP_LIMIT - 1}`,
+        )
+          ? true
+          : undefined,
+      )
+      global.push(
+        globalEvent({
+          id: "evt-child-permission",
+          type: "permission.asked",
+          properties: {
+            id: "perm-child",
+            sessionID: "child-1",
+            permission: "bash",
+            patterns: ["git status"],
+            metadata: {},
+            always: [],
+          },
+        }),
+      )
+      global.push(
+        globalEvent(
+          toolUpdated(
+            runningTool({
+              sessionID: "session-1",
+              messageID: "msg-1",
+              id: "task-1",
+              callID: "call-1",
+              tool: "task",
+              body: {
+                description: "Explore run.ts",
+                subagent_type: "explore",
+              },
+              metadata: {
+                sessionId: "child-1",
+              },
+            }),
+          ),
+        ),
+      )
+      gate.resolve()
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) => call[0] === "recv.event" && (call[1] as { id?: string } | undefined)?.id === "evt-task-1-updated",
+        )
+          ? true
+          : undefined,
+      )
+      transport = await task
+
+      await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        return item?.type === "stream.subagent" && item.state.permissions.some((item) => item.id === "perm-child")
+          ? true
+          : undefined
+      })
+      const dropped = trace.mock.calls
+        .filter((call) => call[0] === "recv.buffer.drop")
+        .map((call) => call[1] as { type?: string; sessionID?: string })
+      expect(dropped.length).toBeGreaterThanOrEqual(1)
+      expect(dropped.every((item) => item?.type === "session.status" && item.sessionID === "session-1")).toBe(true)
+    } finally {
+      global.close()
+      await transport?.close()
+    }
+  })
+
+  test("keeps buffered event order when a full buffer evicts an older entry", async () => {
+    const global = globalFeed()
+    const ui = footer()
+    const trace = mock((_type: string, _data?: unknown) => {})
+    const gate = defer<void>()
+    let transport: Awaited<ReturnType<typeof createSessionTransport>> | undefined
+    const task = createSessionTransport({
+      sdk: sdk({
+        globalStream: global.stream,
+        messages: async ({ sessionID }) => {
+          if (sessionID !== "session-1") return ok([])
+          await gate.promise
+          return ok([])
+        },
+        children: async () => ok([child("child-1")]),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+      trace: { write: trace },
+    })
+
+    try {
+      global.push(
+        globalEvent(
+          toolUpdated(
+            runningTool({
+              sessionID: "session-1",
+              messageID: "msg-order",
+              id: "task-order",
+              callID: "call-order",
+              tool: "task",
+              body: {
+                description: "Preserve event order",
+                subagent_type: "explore",
+              },
+              metadata: {
+                sessionId: "child-1",
+              },
+            }),
+          ),
+        ),
+      )
+      for (let attempt = 0; attempt < SUBAGENT_BOOTSTRAP_LIMIT - 1; attempt++) {
+        global.push(globalEvent(retry("child-1", attempt, `ordered ${attempt}`)))
+      }
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) =>
+            call[0] === "recv.event" &&
+            (call[1] as { id?: string } | undefined)?.id === `evt-child-1-retry-${SUBAGENT_BOOTSTRAP_LIMIT - 2}`,
+        )
+          ? true
+          : undefined,
+      )
+      global.push(
+        globalEvent(retry("child-1", SUBAGENT_BOOTSTRAP_LIMIT - 1, `ordered ${SUBAGENT_BOOTSTRAP_LIMIT - 1}`)),
+      )
+      global.push(globalEvent(retry("child-1", SUBAGENT_BOOTSTRAP_LIMIT, `ordered ${SUBAGENT_BOOTSTRAP_LIMIT}`)))
+      gate.resolve()
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) =>
+            call[0] === "recv.event" &&
+            (call[1] as { id?: string } | undefined)?.id === `evt-child-1-retry-${SUBAGENT_BOOTSTRAP_LIMIT}`,
+        )
+          ? true
+          : undefined,
+      )
+      transport = await task
+      transport.selectSubagent("child-1")
+
+      const commits = await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        const items = item?.type === "stream.subagent" ? item.state.details["child-1"]?.commits : undefined
+        return items && items.length > 0 ? items : undefined
+      })
+      const attempts = commits.map((commit) => Number(commit.text.replace("ordered ", "")))
+      expect(attempts).toEqual([...attempts].sort((left, right) => left - right))
+      expect(commits.at(-1)?.text).toBe(`ordered ${SUBAGENT_BOOTSTRAP_LIMIT}`)
+    } finally {
+      global.close()
+      await transport?.close()
+    }
+  })
+
+  test("drops unknown sessions when bootstrap catch-up ends", async () => {
+    const global = globalFeed()
+    const trace = mock((_type: string, _data?: unknown) => {})
+    const gate = defer<void>()
+    let transport: Awaited<ReturnType<typeof createSessionTransport>> | undefined
+    const task = createSessionTransport({
+      sdk: sdk({
+        globalStream: global.stream,
+        messages: async ({ sessionID }) => {
+          if (sessionID !== "session-1") return ok([])
+          await gate.promise
+          return ok([])
+        },
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: footer().api,
+      trace: { write: trace },
+    })
+
+    try {
+      global.push(globalEvent(retry("unknown", 1, "ignore me")))
+      gate.resolve()
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) => call[0] === "recv.event" && (call[1] as { id?: string } | undefined)?.id === "evt-unknown-retry-1",
+        )
+          ? true
+          : undefined,
+      )
+      transport = await task
+      global.push(globalEvent(idle()))
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) =>
+            call[0] === "recv.buffer.drop" && (call[1] as { sessionID?: string } | undefined)?.sessionID === "unknown",
+        )
+          ? true
+          : undefined,
+      )
+
+      global.push(globalEvent(retry("unknown", 2, "still ignore me")))
+      global.push(globalEvent(busy()))
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) => call[0] === "recv.event" && (call[1] as { id?: string } | undefined)?.id === "evt-session-1-busy",
+        )
+          ? true
+          : undefined,
+      )
+      expect(
+        trace.mock.calls.some(
+          (call) => call[0] === "recv.event" && (call[1] as { id?: string } | undefined)?.id === "evt-unknown-retry-2",
+        ),
+      ).toBe(false)
+    } finally {
+      global.close()
+      gate.resolve()
+      await task
+      await transport?.close()
+    }
+  })
+
+  test("keeps catch-up closed after root idle and resize", async () => {
+    const global = globalFeed()
+    const trace = mock((_type: string, _data?: unknown) => {})
+    const gate = defer<void>()
+    let transport: Awaited<ReturnType<typeof createSessionTransport>> | undefined
+    const task = createSessionTransport({
+      sdk: sdk({
+        globalStream: global.stream,
+        messages: async ({ sessionID }) => {
+          if (sessionID !== "session-1") return ok([])
+          await gate.promise
+          return ok([])
+        },
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      replay: true,
+      limits: () => ({}),
+      footer: footer().api,
+      trace: { write: trace },
+    })
+
+    try {
+      for (let index = 0; index < SUBAGENT_BOOTSTRAP_LIMIT; index++) {
+        global.push(
+          globalEvent({
+            id: `evt-priority-permission-${index}`,
+            type: "permission.asked",
+            properties: {
+              id: `perm-priority-${index}`,
+              sessionID: `unknown-priority-${index}`,
+              permission: "bash",
+              patterns: ["git status"],
+              metadata: {},
+              always: [],
+            },
+          }),
+        )
+      }
+      await waitFor(() =>
+        trace.mock.calls.filter((call) => call[0] === "recv.event").length === SUBAGENT_BOOTSTRAP_LIMIT
+          ? true
+          : undefined,
+      )
+      global.push(globalEvent(idle()))
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) => call[0] === "recv.event" && (call[1] as { id?: string } | undefined)?.id === "evt-session-1-idle",
+        )
+          ? true
+          : undefined,
+      )
+      gate.resolve()
+      transport = await task
+      expect(await transport.replayOnResize({ localRows: () => [], reset: () => Promise.resolve() })).toBe(true)
+
+      global.push(globalEvent(retry("unknown-after-resize", 1, "ignore after resize")))
+      global.push(globalEvent(busy()))
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) => call[0] === "recv.event" && (call[1] as { id?: string } | undefined)?.id === "evt-session-1-busy",
+        )
+          ? true
+          : undefined,
+      )
+      expect(
+        trace.mock.calls.some(
+          (call) =>
+            call[0] === "recv.event" &&
+            (call[1] as { id?: string } | undefined)?.id === "evt-unknown-after-resize-retry-1",
+        ),
+      ).toBe(false)
+    } finally {
+      global.close()
+      gate.resolve()
+      await task
       await transport?.close()
     }
   })
@@ -2213,6 +2892,7 @@ describe("run stream transport", () => {
   test("falls back to session status polling when idle events are missing", async () => {
     const src = eventFeed()
     const ui = footer()
+    const trace = mock((_type: string, _data?: unknown) => {})
     let busy = true
     const transport = await createSessionTransport({
       sdk: sdk({
@@ -2230,9 +2910,19 @@ describe("run stream transport", () => {
       thinking: true,
       limits: () => ({}),
       footer: ui.api,
+      trace: { write: trace },
     })
 
     try {
+      src.push(retry("unknown-poll", 1, "ignore after polling"))
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) =>
+            call[0] === "recv.event" && (call[1] as { id?: string } | undefined)?.id === "evt-unknown-poll-retry-1",
+        )
+          ? true
+          : undefined,
+      )
       await Promise.race([
         transport.runPromptTurn({
           agent: undefined,
@@ -2244,6 +2934,15 @@ describe("run stream transport", () => {
         }),
         new Promise((_, reject) => setTimeout(() => reject(new Error("turn timed out")), 1_000)),
       ])
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) =>
+            call[0] === "recv.buffer.drop" &&
+            (call[1] as { sessionID?: string } | undefined)?.sessionID === "unknown-poll",
+        )
+          ? true
+          : undefined,
+      )
     } finally {
       src.close()
       await transport.close()

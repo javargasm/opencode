@@ -707,10 +707,15 @@ export const RunCommand = effectCmd({
         ) {
           const toggles = new Map<string, boolean>()
           const backgroundTasks = new Map(initialBackgroundTasks)
+          const sessions = new Set([sessionID])
           let error: string | undefined
           let parentIdle = false
 
           for await (const event of events.stream) {
+            if (event.type === "session.created" && event.properties.info.parentID) {
+              if (sessions.has(event.properties.info.parentID)) sessions.add(event.properties.info.id)
+            }
+
             if (
               event.type === "message.updated" &&
               event.properties.sessionID === sessionID &&
@@ -809,7 +814,7 @@ export const RunCommand = effectCmd({
 
             if (event.type === "permission.asked") {
               const permission = event.properties
-              if (permission.sessionID !== sessionID) continue
+              if (!sessions.has(permission.sessionID)) continue
 
               if (auto) {
                 await client.permission.reply({
