@@ -237,7 +237,7 @@ const watchdogLLM = Layer.succeed(
         Ref.updateAndGet(watchdogCalls, (calls) => calls + 1).pipe(
           Effect.map((calls) =>
             calls === 1
-              ? Stream.fail(new ProviderError.ResponseStreamError("Provider stream timed out after 30 seconds"))
+              ? Stream.fail(new ProviderError.ResponseStreamError("Provider stream timed out after 60 seconds"))
               : Stream.make(
                   LLMEvent.textStart({ id: "text-1" }),
                   LLMEvent.textDelta({ id: "text-1", text: "after retry" }),
@@ -260,7 +260,7 @@ const partialWatchdogLLM = Layer.succeed(
       Stream.make(LLMEvent.textStart({ id: "text-1" }), LLMEvent.textDelta({ id: "text-1", text: "visible" })).pipe(
         Stream.concat(Stream.fromEffect(Ref.update(partialWatchdogCalls, (calls) => calls + 1)).pipe(Stream.drain)),
         Stream.concat(
-          Stream.fail(new ProviderError.ResponseStreamError("Provider stream timed out after 30 seconds")),
+          Stream.fail(new ProviderError.ResponseStreamError("Provider stream timed out after 60 seconds")),
         ),
       ),
   }),

@@ -28,7 +28,7 @@ const DEFAULT_CONNECT_TIMEOUT = 15_000
 const DEFAULT_IDLE_TIMEOUT = 5 * 60 * 1000
 const DEFAULT_MAX_CONNECTION_AGE = 55 * 60 * 1000
 const CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached"
-const PROVIDER_STREAM_TIMEOUT_MESSAGE = "Provider stream timed out after 30 seconds"
+const PROVIDER_STREAM_TIMEOUT_MESSAGE = "Provider stream timed out after 60 seconds"
 
 export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const httpFetch = options?.httpFetch ?? globalThis.fetch

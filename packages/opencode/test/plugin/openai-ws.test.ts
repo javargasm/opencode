@@ -785,7 +785,7 @@ describe("plugin.openai.ws-pool", () => {
       url: server.url,
       log: (message, fields) => logs.push({ message, fields }),
     })
-    const timeout = new ProviderError.ResponseStreamError("Provider stream timed out after 30 seconds")
+    const timeout = new ProviderError.ResponseStreamError("Provider stream timed out after 60 seconds")
 
     const first = fetch(server.url, streamRequest({}, abort.signal))
     await waitFor(() => connections === 1, "first websocket did not connect")
