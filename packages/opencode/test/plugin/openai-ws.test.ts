@@ -753,7 +753,6 @@ describe("plugin.openai.ws-pool", () => {
     const abort = new AbortController()
     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
       url: server.url,
-      streamRetries: 0,
     })
 
     const first = await fetch(server.url, streamRequest({}, abort.signal))
@@ -767,51 +766,6 @@ describe("plugin.openai.ws-pool", () => {
     expect(await second.text()).toContain("data: [DONE]")
     expect(connections).toBe(2)
     expect(server.httpRequests).toHaveLength(0)
-    fetch.close()
-  })
-
-  test("uses HTTP on the next request after the provider stream watchdog aborts", async () => {
-    let connections = 0
-    const logs: Array<{ message: string; fields: Record<string, string | number | boolean> }> = []
-    await using server = await createWebSocketServer((socket) => {
-      connections += 1
-      socket.once("message", () => {
-        if (connections === 1) return
-        socket.send(JSON.stringify({ type: "response.completed", response: { id: "unexpected_ws_retry" } }))
-      })
-    })
-    const abort = new AbortController()
-    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
-      url: server.url,
-      log: (message, fields) => logs.push({ message, fields }),
-    })
-    const timeout = new ProviderError.ResponseStreamError("Provider stream timed out after 60 seconds")
-
-    const first = fetch(server.url, streamRequest({}, abort.signal))
-    await waitFor(() => connections === 1, "first websocket did not connect")
-    abort.abort(timeout)
-    const failed = await first
-    expect(await readTextError(failed.text())).toBe(timeout)
-
-    const second = await fetch(server.url, streamRequest())
-
-    expect(await second.text()).toBe("http")
-    expect(connections).toBe(1)
-    expect(server.httpRequests).toHaveLength(1)
-    expect(logs).toEqual([
-      {
-        message: "openai websocket transport",
-        fields: { "session.id": "session-1", transport: "websocket" },
-      },
-      {
-        message: "openai websocket fallback activated",
-        fields: { "session.id": "session-1", reason: "provider_stream_timeout", streamFailures: 1 },
-      },
-      {
-        message: "openai websocket transport",
-        fields: { "session.id": "session-1", transport: "http", reason: "fallback" },
-      },
-    ])
     fetch.close()
   })
 

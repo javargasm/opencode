@@ -112,10 +112,6 @@ export function stream(input: StreamInput): StreamResult {
             }),
           )
           .pipe(
-            Stream.timeoutOrElse({
-              duration: "60 seconds",
-              orElse: () => Stream.fail(new Error("Native LLM stream timed out after 60 seconds")),
-            }),
             Stream.flatMap((event) =>
               event.type !== "tool-call" || event.providerExecuted
                 ? Stream.make(event)

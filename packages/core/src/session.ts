@@ -148,7 +148,7 @@ export interface Interface {
     id?: SessionMessage.ID
     sessionID: SessionSchema.ID
     prompt: PromptInput.Prompt
-    delivery?: SessionInput.Delivery
+    delivery?: SessionInput.V2Delivery
     resume?: boolean
   }) => Effect.Effect<SessionInput.Admitted, NotFoundError | PromptConflictError>
   readonly shell: (input: {

@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "3c6d6411-34cb-419e-a348-e8b9e8956834",
+  "id": "b73452e0-7e5d-43f6-a0f7-bff88a797a33",
   "prevIds": [
-    "657812ee-c46e-4584-b441-c2f111933ab7"
+    "3c6d6411-34cb-419e-a348-e8b9e8956834"
   ],
   "ddl": [
     {
@@ -877,6 +877,26 @@
       "default": null,
       "generated": null,
       "name": "followup_claimed_at",
+      "entityType": "columns",
+      "table": "background_task_execution"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "followup_message_id",
+      "entityType": "columns",
+      "table": "background_task_execution"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "followup_hash",
       "entityType": "columns",
       "table": "background_task_execution"
     },

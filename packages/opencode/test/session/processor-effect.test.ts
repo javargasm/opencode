@@ -4,8 +4,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { tool } from "ai"
-import { Cause, Effect, Exit, Fiber, Layer, Ref, Stream } from "effect"
-import { TestClock } from "effect/testing"
+import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -27,7 +26,6 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent } from "@opencode-ai/llm"
-import { ProviderError } from "@/provider/error"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -228,46 +226,6 @@ const fragmentFailureLLM = Layer.succeed(
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
-const watchdogCalls = Effect.runSync(Ref.make(0))
-const watchdogLLM = Layer.succeed(
-  LLM.Service,
-  LLM.Service.of({
-    stream: () =>
-      Stream.unwrap(
-        Ref.updateAndGet(watchdogCalls, (calls) => calls + 1).pipe(
-          Effect.map((calls) =>
-            calls === 1
-              ? Stream.fail(new ProviderError.ResponseStreamError("Provider stream timed out after 60 seconds"))
-              : Stream.make(
-                  LLMEvent.textStart({ id: "text-1" }),
-                  LLMEvent.textDelta({ id: "text-1", text: "after retry" }),
-                  LLMEvent.textEnd({ id: "text-1" }),
-                  LLMEvent.finish({ reason: "stop" }),
-                ),
-          ),
-        ),
-      ),
-  }),
-)
-const watchdogEnv = LayerNode.compile(root, [...replacements, [LLM.node, watchdogLLM]])
-const itWatchdog = testEffect(watchdogEnv)
-
-const partialWatchdogCalls = Effect.runSync(Ref.make(0))
-const partialWatchdogLLM = Layer.succeed(
-  LLM.Service,
-  LLM.Service.of({
-    stream: () =>
-      Stream.make(LLMEvent.textStart({ id: "text-1" }), LLMEvent.textDelta({ id: "text-1", text: "visible" })).pipe(
-        Stream.concat(Stream.fromEffect(Ref.update(partialWatchdogCalls, (calls) => calls + 1)).pipe(Stream.drain)),
-        Stream.concat(
-          Stream.fail(new ProviderError.ResponseStreamError("Provider stream timed out after 60 seconds")),
-        ),
-      ),
-  }),
-)
-const partialWatchdogEnv = LayerNode.compile(root, [...replacements, [LLM.node, partialWatchdogLLM]])
-const itPartialWatchdog = testEffect(partialWatchdogEnv)
-
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
   const session = yield* Session.Service
@@ -324,91 +282,6 @@ it.live("session.processor effect tests capture llm input cleanly", () =>
         expect(parts.some((part) => part.type === "text" && part.text === "hello")).toBe(true)
       }),
     { config: (url) => providerCfg(url) },
-  ),
-)
-
-itWatchdog.effect("session.processor retries a provider watchdog before observable output", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        yield* Ref.set(watchdogCalls, 0)
-        const { processors, session, provider } = yield* boot()
-        const chat = yield* session.create({})
-        const parent = yield* user(chat.id, "retry watchdog")
-        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
-        const fiber = yield* handle
-          .process({
-            user: {
-              id: parent.id,
-              sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies SessionV1.User,
-            sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "retry watchdog" }],
-            tools: {},
-          })
-          .pipe(Effect.forkChild)
-
-        yield* TestClock.adjust("3 seconds")
-
-        expect(yield* Fiber.join(fiber)).toBe("continue")
-        expect(yield* Ref.get(watchdogCalls)).toBe(2)
-        expect(handle.message.error).toBeUndefined()
-        expect(
-          (yield* MessageV2.parts(msg.id)).some((part) => part.type === "text" && part.text === "after retry"),
-        ).toBe(true)
-      }),
-    { config: cfg },
-  ),
-)
-
-itPartialWatchdog.effect("session.processor terminalizes a watchdog after observable output without retrying", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        yield* Ref.set(partialWatchdogCalls, 0)
-        const { processors, session, provider } = yield* boot()
-        const chat = yield* session.create({})
-        const parent = yield* user(chat.id, "terminal watchdog")
-        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
-
-        const value = yield* handle.process({
-          user: {
-            id: parent.id,
-            sessionID: chat.id,
-            role: "user",
-            time: parent.time,
-            agent: parent.agent,
-            model: { providerID: ref.providerID, modelID: ref.modelID },
-          } satisfies SessionV1.User,
-          sessionID: chat.id,
-          model: mdl,
-          agent: agent(),
-          system: [],
-          messages: [{ role: "user", content: "terminal watchdog" }],
-          tools: {},
-        })
-
-        expect(value).toBe("stop")
-        expect(yield* Ref.get(partialWatchdogCalls)).toBe(1)
-        expect(handle.message.error).toMatchObject({ name: "APIError" })
-        expect(handle.message.finish).toBe("error")
-        expect(handle.message.time.completed).toBeNumber()
-        expect((yield* MessageV2.parts(msg.id)).some((part) => part.type === "text" && part.text === "visible")).toBe(
-          true,
-        )
-      }),
-    { config: cfg },
   ),
 )
 

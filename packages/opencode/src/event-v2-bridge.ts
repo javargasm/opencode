@@ -7,9 +7,32 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { Location } from "@opencode-ai/core/location"
 import { Project } from "@opencode-ai/core/project"
 import { AbsolutePath } from "@opencode-ai/core/schema"
-import { Context, Effect, Layer } from "effect"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { Context, Effect, Layer, Schema } from "effect"
 
 export class Service extends Context.Service<Service, EventV2.Interface>()("@opencode/EventV2Bridge") {}
+
+const isLegacyPromptMaterialized = Schema.is(SessionV1.Event.LegacyPromptMaterialized)
+
+function liveEvents(event: EventV2.Payload): ReadonlyArray<EventV2.Payload> {
+  if (!isLegacyPromptMaterialized(event)) return [event]
+  const location = event.location ? { location: event.location } : {}
+  return [
+    event,
+    {
+      id: EventV2.ID.create(),
+      type: SessionV1.Event.MessageUpdated.type,
+      ...location,
+      data: { sessionID: event.data.sessionID, info: event.data.info },
+    },
+    ...event.data.parts.map((part) => ({
+      id: EventV2.ID.create(),
+      type: SessionV1.Event.PartUpdated.type,
+      ...location,
+      data: { sessionID: event.data.sessionID, part, time: event.data.info.time.created },
+    })),
+  ]
+}
 
 const layer = Layer.effect(
   Service,
@@ -36,33 +59,38 @@ const layer = Layer.effect(
       Effect.gen(function* () {
         const ctx = yield* InstanceRef
         const workspaceID = (yield* WorkspaceRef) ?? event.location?.workspaceID
-        GlobalBus.emit("event", {
-          directory: event.location?.directory ?? ctx?.directory,
-          project: ctx?.project.id,
-          workspace: workspaceID,
-          payload: { id: event.id, type: event.type, properties: event.data },
-        })
-        if (event.durable === undefined) return
-        GlobalBus.emit("event", {
-          directory: event.location?.directory ?? ctx?.directory,
-          project: ctx?.project.id,
-          workspace: workspaceID,
-          payload: {
-            type: "sync",
-            syncEvent: {
-              id: event.id,
-              type: EventV2.versionedType(event.type, event.durable.version),
-              seq: event.durable.seq,
-              aggregateID: event.durable.aggregateID,
-              data: event.data,
+        for (const live of liveEvents(event)) {
+          GlobalBus.emit("event", {
+            directory: live.location?.directory ?? ctx?.directory,
+            project: ctx?.project.id,
+            workspace: workspaceID,
+            payload: { id: live.id, type: live.type, properties: live.data },
+          })
+          if (live.durable === undefined) continue
+          GlobalBus.emit("event", {
+            directory: live.location?.directory ?? ctx?.directory,
+            project: ctx?.project.id,
+            workspace: workspaceID,
+            payload: {
+              type: "sync",
+              syncEvent: {
+                id: live.id,
+                type: EventV2.versionedType(live.type, live.durable.version),
+                seq: live.durable.seq,
+                aggregateID: live.durable.aggregateID,
+                data: live.data,
+              },
             },
-          },
-        })
+          })
+        }
       }),
     )
     yield* Effect.addFinalizer(() => unsubscribe)
 
-    return Service.of({ ...events, publish })
+    const listen: EventV2.Interface["listen"] = (listener) =>
+      events.listen((event) => Effect.forEach(liveEvents(event), listener, { discard: true }))
+
+    return Service.of({ ...events, publish, listen })
   }),
 )
 

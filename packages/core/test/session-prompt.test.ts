@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import { DateTime, Effect, Fiber, Layer, Stream } from "effect"
-import { eq } from "drizzle-orm"
+import { asc, eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -16,8 +16,11 @@ import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
-import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import { testEffect } from "./lib/effect"
 
 const executionCalls: SessionV2.ID[] = []
@@ -380,6 +383,181 @@ describe("SessionV2.prompt", () => {
       expect(yield* session.messages({ sessionID })).toMatchObject([
         { id: messageID, type: "user", text: "Promote once" },
       ])
+    }),
+  )
+
+  it.effect("promotes one selected pending input without promoting its sibling", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const first = yield* session.prompt({
+        id: SessionMessage.ID.create(),
+        sessionID,
+        prompt: Prompt.make({ text: "Promote this input" }),
+        resume: false,
+      })
+      const sibling = yield* session.prompt({
+        id: SessionMessage.ID.create(),
+        sessionID,
+        prompt: Prompt.make({ text: "Keep this pending" }),
+        resume: false,
+      })
+
+      yield* SessionInput.promoteOne(db, events, { sessionID, id: first.id })
+
+      expect(yield* admitted(first.id)).toHaveProperty("promotedSeq")
+      expect(yield* admitted(sibling.id)).not.toHaveProperty("promotedSeq")
+    }),
+  )
+
+  it.effect("rolls back a prompt admission when its local commit aborts", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const id = SessionMessage.ID.create()
+      const before = yield* eventCount(EventV2.versionedType(SessionEvent.PromptAdmitted.type, 1))
+
+      const exit = yield* SessionInput.admit(db, events, {
+        id,
+        sessionID,
+        prompt: Prompt.make({ text: "Abort this admission" }),
+        delivery: "steer",
+        commit: () => Effect.die("abort admission"),
+      }).pipe(Effect.exit)
+
+      expect(exit._tag).toBe("Failure")
+      expect(yield* admitted(id)).toBeUndefined()
+      expect(yield* eventCount(EventV2.versionedType(SessionEvent.PromptAdmitted.type, 1))).toBe(before)
+    }),
+  )
+
+  it.effect("materializes legacy input atomically without projecting it into V2 history", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const store = yield* SessionStore.Service
+      const id = SessionMessage.ID.create()
+
+      const input = yield* SessionInput.admit(db, events, {
+        id,
+        sessionID,
+        prompt: Prompt.make({ text: "Legacy V1 bridge input" }),
+        delivery: "legacy",
+      })
+      yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER)
+
+      expect(yield* admitted(id)).not.toHaveProperty("promotedSeq")
+      expect(yield* SessionInput.promoteOne(db, events, { sessionID, id })).toBe(false)
+      const info: SessionV1.User = {
+        id: SessionV1.MessageID.make(id),
+        role: "user",
+        sessionID,
+        time: { created: Date.now() },
+        agent: "build",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+      }
+      const parts: SessionV1.Part[] = [
+        {
+          id: SessionV1.PartID.ascending(),
+          messageID: info.id,
+          sessionID,
+          type: "text",
+          text: "Legacy V1 bridge input",
+        },
+      ]
+
+      const failed = yield* SessionInput.consumeLegacy(db, events, {
+        sessionID,
+        id,
+        info,
+        parts,
+        commit: () => Effect.die("abort legacy materialization"),
+      }).pipe(Effect.exit)
+      expect(failed._tag).toBe("Failure")
+      expect(yield* db.select().from(MessageTable).where(eq(MessageTable.id, info.id)).get().pipe(Effect.orDie)).toBeUndefined()
+      expect(yield* db.select().from(PartTable).where(eq(PartTable.message_id, info.id)).all().pipe(Effect.orDie)).toEqual([])
+      expect(yield* admitted(id)).not.toHaveProperty("promotedSeq")
+
+      expect(
+        yield* SessionInput.consumeLegacy(db, events, {
+          sessionID,
+          id,
+          info,
+          parts,
+        }),
+      ).toBe(true)
+      expect(yield* admitted(id)).toMatchObject({ promotedSeq: expect.any(Number) })
+      expect(yield* db.select().from(MessageTable).where(eq(MessageTable.id, info.id)).get().pipe(Effect.orDie)).toBeDefined()
+      expect(yield* db.select().from(PartTable).where(eq(PartTable.message_id, info.id)).all().pipe(Effect.orDie)).toHaveLength(1)
+      expect(yield* store.message(id)).toBeUndefined()
+      expect(yield* eventCount(EventV2.versionedType(SessionEvent.Prompted.type, 1))).toBe(0)
+    }),
+  )
+
+  it.effect("replays materialized legacy input with its durable promoted sequence", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const store = yield* SessionStore.Service
+      const id = SessionMessage.ID.create()
+      const info: SessionV1.User = {
+        id: SessionV1.MessageID.make(id),
+        role: "user",
+        sessionID,
+        time: { created: Date.now() },
+        agent: "build",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+      }
+      const parts: SessionV1.Part[] = [
+        {
+          id: SessionV1.PartID.ascending(),
+          messageID: info.id,
+          sessionID,
+          type: "text",
+          text: "Replay legacy V1 bridge input",
+        },
+      ]
+      yield* SessionInput.admit(db, events, {
+        id,
+        sessionID,
+        prompt: Prompt.make({ text: "Replay legacy V1 bridge input" }),
+        delivery: "legacy",
+      })
+      yield* SessionInput.consumeLegacy(db, events, { sessionID, id, info, parts })
+      const before = yield* admitted(id)
+      if (before?.promotedSeq === undefined) return yield* Effect.die("legacy input was not promoted")
+      const recorded = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .orderBy(asc(EventTable.seq))
+        .all()
+        .pipe(Effect.orDie)
+
+      yield* events.remove(sessionID)
+      yield* db.delete(PartTable).where(eq(PartTable.session_id, sessionID)).run().pipe(Effect.orDie)
+      yield* db.delete(MessageTable).where(eq(MessageTable.session_id, sessionID)).run().pipe(Effect.orDie)
+      yield* db.delete(SessionInputTable).where(eq(SessionInputTable.session_id, sessionID)).run().pipe(Effect.orDie)
+      yield* events.replayAll(
+        recorded.map((event) => ({
+          id: event.id,
+          aggregateID: event.aggregate_id,
+          seq: event.seq,
+          type: event.type,
+          data: event.data,
+        })),
+      )
+
+      expect(yield* admitted(id)).toMatchObject({ promotedSeq: before.promotedSeq })
+      expect(yield* db.select().from(MessageTable).where(eq(MessageTable.id, info.id)).get().pipe(Effect.orDie)).toBeDefined()
+      expect(yield* db.select().from(PartTable).where(eq(PartTable.message_id, info.id)).all().pipe(Effect.orDie)).toHaveLength(1)
+      expect(yield* store.message(id)).toBeUndefined()
+      expect(yield* eventCount(EventV2.versionedType(SessionEvent.Prompted.type, 1))).toBe(0)
     }),
   )
 

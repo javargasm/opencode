@@ -24,6 +24,18 @@ export interface Interface {
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
   ) => Effect.Effect<SessionV1.WithParts>
+  readonly requestWake: (sessionID: SessionID) => Effect.Effect<number>
+  readonly scheduleWake: (
+    sessionID: SessionID,
+    onInterrupt: Effect.Effect<SessionV1.WithParts>,
+    work: Effect.Effect<SessionV1.WithParts>,
+  ) => Effect.Effect<void>
+  readonly awaitWake: (sessionID: SessionID) => Effect.Effect<void>
+  readonly resumeWake: (
+    sessionID: SessionID,
+    onInterrupt: Effect.Effect<SessionV1.WithParts>,
+    work: Effect.Effect<SessionV1.WithParts>,
+  ) => Effect.Effect<SessionV1.WithParts | undefined>
   readonly startShell: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -161,9 +173,10 @@ const layer = Layer.effect(
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
       let result: SessionV1.WithParts | undefined
+      let targetRevision = revision
       while (true) {
         const current = yield* leases.get(sessionID)
-        if (current && current.wakeCompleted >= revision) return result ?? (yield* onInterrupt)
+        if (current && current.wakeCompleted >= targetRevision) return result ?? (yield* onInterrupt)
         const outcome = yield* Effect.scoped(
           Effect.gen(function* () {
             const claim = yield* leases.claimScoped(sessionID)
@@ -183,6 +196,7 @@ const layer = Layer.effect(
         result = outcome.value
         const completed = yield* leases.get(sessionID)
         if (!completed || completed.wakeCompleted >= completed.wakeRequested) return result
+        targetRevision = completed.wakeRequested
       }
     })
 
@@ -195,14 +209,56 @@ const layer = Layer.effect(
       return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(drain(sessionID, revision, onInterrupt, work))
     })
 
+    const requestWake: Interface["requestWake"] = Effect.fn("SessionRunState.requestWake")((sessionID) =>
+      leases.requestWake(sessionID),
+    )
+
+    const wakeAt = Effect.fn("SessionRunState.wakeAt")(function* (
+      sessionID: SessionID,
+      revision: number,
+      onInterrupt: Effect.Effect<SessionV1.WithParts>,
+      work: Effect.Effect<SessionV1.WithParts>,
+    ) {
+      return yield* (yield* runner(sessionID, onInterrupt)).wake(drain(sessionID, revision, onInterrupt, work))
+    })
+
     const wake = Effect.fn("SessionRunState.wake")(function* (
       sessionID: SessionID,
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
-      const revision = yield* leases.requestWake(sessionID)
-      return yield* (yield* runner(sessionID, onInterrupt)).wake(drain(sessionID, revision, onInterrupt, work))
+      return yield* wakeAt(sessionID, yield* leases.requestWake(sessionID), onInterrupt, work)
     })
+
+    const scheduleWake: Interface["scheduleWake"] = Effect.fn("SessionRunState.scheduleWake")(
+      function* (sessionID, onInterrupt, work) {
+        const current = yield* leases.get(sessionID)
+        if (!current || current.wakeCompleted >= current.wakeRequested) return
+        const data = yield* InstanceState.get(state)
+        yield* wakeAt(sessionID, current.wakeRequested, onInterrupt, work).pipe(
+          Effect.catchCause((cause) => Effect.logWarning("failed to drain queued session wake", { sessionID, cause })),
+          Effect.forkIn(data.scope, { startImmediately: true }),
+        )
+      },
+    )
+
+    const awaitWake: Interface["awaitWake"] = Effect.fn("SessionRunState.awaitWake")(function* (sessionID) {
+      const revision = (yield* leases.get(sessionID))?.wakeRequested
+      if (revision === undefined) return
+      while (true) {
+        const current = yield* leases.get(sessionID)
+        if (!current || current.wakeCompleted >= revision) return
+        yield* Effect.sleep("25 millis")
+      }
+    })
+
+    const resumeWake: Interface["resumeWake"] = Effect.fn("SessionRunState.resumeWake")(
+      function* (sessionID, onInterrupt, work) {
+        const current = yield* leases.get(sessionID)
+        if (!current || current.wakeCompleted >= current.wakeRequested) return
+        return yield* wakeAt(sessionID, current.wakeRequested, onInterrupt, work)
+      },
+    )
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
       sessionID: SessionID,
@@ -221,7 +277,18 @@ const layer = Layer.effect(
       )
     })
 
-    return Service.of({ assertNotBusy, cancel, interrupt, ensureRunning, wake, startShell })
+    return Service.of({
+      assertNotBusy,
+      cancel,
+      interrupt,
+      ensureRunning,
+      wake,
+      requestWake,
+      scheduleWake,
+      awaitWake,
+      resumeWake,
+      startShell,
+    })
   }),
 )
 

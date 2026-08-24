@@ -112,7 +112,6 @@ interface CodexAuthPluginOptions {
   issuer?: string
   codexApiEndpoint?: string
   experimentalWebSockets?: boolean
-  log?: (message: string, fields: Record<string, string | number | boolean>) => void
 }
 
 async function exchangeCodeForTokens(code: string, redirectUri: string, pkce: PkceCodes): Promise<TokenResponse> {
@@ -328,7 +327,7 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
       async loader(getAuth) {
         const auth = await getAuth()
         const websocketFetch = options.experimentalWebSockets
-          ? OpenAIWebSocketPool.createWebSocketFetch({ httpFetch: fetch, log: options.log })
+          ? OpenAIWebSocketPool.createWebSocketFetch({ httpFetch: fetch })
           : undefined
         if (websocketFetch) {
           websocketFetches.push(websocketFetch)

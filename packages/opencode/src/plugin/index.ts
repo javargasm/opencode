@@ -64,16 +64,12 @@ export function experimentalWebSocketsEnabled(input: { enabled: boolean; channel
 }
 
 // Built-in plugins that are directly imported (not installed from npm)
-function internalPlugins(
-  flags: RuntimeFlags.Info,
-  log: (message: string, fields: Record<string, string | number | boolean>) => void,
-): PluginInstance[] {
+function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
   return [
     // Temporary rollout: pre-release builds use WebSockets by default; releases require explicit opt-in.
     (input) =>
       CodexAuthPlugin(input, {
         experimentalWebSockets: experimentalWebSocketsEnabled({ enabled: flags.experimentalWebSockets }),
-        log,
       }),
     CopilotAuthPlugin,
     ModalPlugin,
@@ -171,11 +167,7 @@ const layer = Layer.effect(
           $: typeof Bun === "undefined" ? undefined : Bun.$,
         }
 
-        const log = (message: string, fields: Record<string, string | number | boolean>) => {
-          bridge.fork(Effect.logInfo(message, fields))
-        }
-
-        for (const plugin of flags.disableDefaultPlugins ? [] : internalPlugins(flags, log)) {
+        for (const plugin of flags.disableDefaultPlugins ? [] : internalPlugins(flags)) {
           const init = yield* Effect.tryPromise({
             try: () => plugin(input),
             catch: errorMessage,

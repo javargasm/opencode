@@ -4,6 +4,8 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionMessage } from "@opencode-ai/core/session/message"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema, Scope } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -16,6 +18,7 @@ import { Session } from "@/session/session"
 import type { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
+import { SessionRunLease } from "@/session/run-lease"
 import { SessionStatus } from "@/session/status"
 import { MessageV2 } from "@/session/message-v2"
 
@@ -40,6 +43,7 @@ import { Runner } from "@/effect/runner"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { eq } from "drizzle-orm"
 import { projectBackgroundTasks } from "@/cli/cmd/run/background-tasks"
+import { createHash } from "node:crypto"
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -70,6 +74,7 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       CrossSpawnSpawner.node,
       Session.node,
       SessionProjector.node,
+      SessionRunLease.node,
       SessionRunState.node,
       SessionStatus.node,
       Truncate.node,
@@ -161,7 +166,10 @@ function stubOps(opts?: {
         opts?.onPrompt?.(input)
         return reply(input, opts?.text ?? "done", opts?.error, opts?.toolError)
       }),
+    materializeLegacy: (input) => Effect.sync(() => legacyMaterialization(input)),
     wake: () => Effect.void,
+    scheduleWake: () => Effect.void,
+    awaitWake: () => Effect.void,
   }
 }
 
@@ -229,6 +237,44 @@ function reply(
           ]
         : []),
     ],
+  }
+}
+
+function legacyMaterialization(input: SessionPrompt.PromptInput): SessionV1.WithParts {
+  const messageID = input.messageID
+  const agent = input.agent
+  const model = input.model
+  if (!messageID || !agent || !model) throw new Error("legacy prompt is missing materialization fields")
+  const parts = input.parts.flatMap((part, index): SessionV1.Part[] => {
+    if (!part.id) throw new Error("legacy prompt part is missing a deterministic ID")
+    if (part.type === "text" || part.type === "file") {
+      return [{ ...part, id: PartID.make(part.id), messageID, sessionID: input.sessionID }]
+    }
+    if (part.type === "agent") {
+      return [
+        { ...part, id: PartID.make(part.id), messageID, sessionID: input.sessionID },
+        {
+          id: PartID.ascending(`prt_${createHash("sha256").update(`generated:${messageID}:${index}`).digest("hex")}`),
+          messageID,
+          sessionID: input.sessionID,
+          type: "text",
+          synthetic: true,
+          text: ` Use the above message and context to generate a prompt and call the task tool with subagent: ${part.name}`,
+        },
+      ]
+    }
+    throw new Error(`Unsupported legacy prompt part: ${part.type}`)
+  })
+  return {
+    info: {
+      id: messageID,
+      role: "user",
+      sessionID: input.sessionID,
+      time: { created: Date.now() },
+      agent,
+      model: { providerID: model.providerID, modelID: model.modelID, variant: input.variant },
+    },
+    parts,
   }
 }
 
@@ -1220,6 +1266,7 @@ describe("tool.task", () => {
       const cancelled = defer<SessionID>()
       const abort = new AbortController()
       const promptOps: TaskPromptOps = {
+        ...stubOps(),
         cancel: (sessionID) =>
           Effect.sync(() => {
             cancelled.resolve(sessionID)
@@ -1232,6 +1279,8 @@ describe("tool.task", () => {
             return cancelled.promise
           }).pipe(Effect.as(reply(input, "cancelled"))),
         wake: () => Effect.void,
+        scheduleWake: () => Effect.void,
+        awaitWake: () => Effect.void,
       }
 
       const fiber = yield* def
@@ -1574,9 +1623,7 @@ describe("tool.task", () => {
       const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
       let runs = 0
       const promptOps: TaskPromptOps = {
-        cancel: () => Effect.void,
-        interrupt: () => Effect.void,
-        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        ...stubOps(),
         prompt: (input) => {
           if (input.sessionID === chat.id) {
             return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
@@ -1588,7 +1635,6 @@ describe("tool.task", () => {
             return reply(input, "background done")
           })
         },
-        wake: () => Effect.void,
       }
 
       const fiber = yield* def
@@ -1708,17 +1754,39 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("re-enters durable terminal handling when a local running job is already inactive", () =>
+  background.instance("accepts a remotely owned durable follow-up without a local job", () =>
     Effect.gen(function* () {
+      const { db } = yield* Database.Service
       const executions = yield* BackgroundTaskExecution.Service
       const jobs = yield* BackgroundJob.Service
-      const runState = yield* SessionRunState.Service
+      const leases = yield* SessionRunLease.Service
+      const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "remote child" })
+      const remote = yield* BackgroundTaskExecution.make({ ownerID: "remote-runtime" })
+      yield* remote.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation: "remote-generation",
+        description: child.title,
+        parentMessageID: assistant.id,
+        wakeRequired: true,
+      })
       const tool = yield* TaskTool
       const def = yield* tool.init()
+      let materializations = 0
+      let schedules = 0
       const promptOps: TaskPromptOps = {
         ...stubOps(),
-        prompt: (input) => (input.sessionID === chat.id ? Effect.succeed(reply(input, "notified")) : Effect.never),
+        materializeLegacy: (input) =>
+          Effect.sync(() => {
+            materializations++
+            return legacyMaterialization(input)
+          }),
+        scheduleWake: () =>
+          Effect.sync(() => {
+            schedules++
+          }),
       }
       const params = {
         description: "inspect bug",
@@ -1727,29 +1795,22 @@ describe("tool.task", () => {
         background: true,
       } as const
 
-      const started = yield* def.execute(params, {
-        ...taskContext(chat.id, assistant.id, promptOps),
-        callID: "call-1",
-      })
-      const generation = started.metadata.backgroundTaskGeneration
-      if (!generation) throw new Error("background task generation was not recorded")
-      const settled = yield* executions.settle({
-        sessionID: started.metadata.sessionId,
-        generation,
-        state: "completed",
-        output: "settled remotely",
-      })
-      if (!settled) throw new Error("durable execution did not settle")
-      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
-
-      const relaunched = yield* def.execute(
-        { ...params, task_id: started.metadata.sessionId },
-        { ...taskContext(chat.id, assistant.id, promptOps), callID: "call-2" },
+      const result = yield* def.execute(
+        { ...params, task_id: child.id },
+        { ...taskContext(chat.id, assistant.id, promptOps), callID: "followup" },
       )
 
-      expect(relaunched.metadata.backgroundTaskGeneration).toBe(`${assistant.id}:call-2`)
-      expect(relaunched.output).toContain(`state="running"`)
-      yield* runState.cancel(relaunched.metadata.sessionId)
+      expect(result.output).toContain("Background task updated")
+      expect(materializations).toBe(1)
+      expect(schedules).toBe(1)
+      expect(yield* jobs.get(child.id)).toBeUndefined()
+      const execution = yield* executions.get(child.id)
+      expect(execution?.generation).toBe("remote-generation")
+      if (!execution?.followupMessageID) throw new Error("follow-up input was not claimed")
+      const admitted = yield* SessionInput.find(db, SessionMessage.ID.make(execution.followupMessageID))
+      expect(admitted?.delivery).toBe("legacy")
+      expect(typeof admitted?.promotedSeq).toBe("number")
+      expect(yield* leases.get(child.id)).toMatchObject({ wakeRequested: 1, wakeCompleted: 0 })
     }),
   )
 
@@ -3421,6 +3482,7 @@ describe("tool.task", () => {
     "background extension keeps the child model and variant across both dispatches",
     () =>
       Effect.gen(function* () {
+        const sessions = yield* Session.Service
         const { chat, assistant } = yield* seed()
         const tool = yield* TaskTool
         const def = yield* tool.init()
@@ -3430,6 +3492,11 @@ describe("tool.task", () => {
         let childPrompts = 0
         const promptOps: TaskPromptOps = {
           ...stubOps(),
+          materializeLegacy: (input) =>
+            Effect.sync(() => {
+              secondSeen.resolve(input)
+              return legacyMaterialization(input)
+            }),
           prompt: (input) => {
             if (input.sessionID === chat.id) return Effect.succeed(reply(input, "notified"))
             childPrompts++
@@ -3477,28 +3544,55 @@ describe("tool.task", () => {
   background.instance("background task completion waits for running updates", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
+      const executions = yield* BackgroundTaskExecution.Service
+      const leases = yield* SessionRunLease.Service
+      const { db } = yield* Database.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const first = defer<void>()
-      const second = defer<void>()
-      const updated = defer<SessionPrompt.PromptInput>()
+      const wakeRegistered = defer<void>()
+      const wakeCompleted = defer<void>()
+      const awaitingWake = defer<void>()
+      const materialized = defer<SessionPrompt.PromptInput>()
       const injected = defer<SessionPrompt.PromptInput>()
       let prompts = 0
+      let materializations = 0
+      let scheduledWakes = 0
       const promptOps: TaskPromptOps = {
         ...stubOps(),
+        materializeLegacy: (input) =>
+          Effect.sync(() => {
+            materializations++
+            materialized.resolve(input)
+            return legacyMaterialization(input)
+          }),
         prompt: (input) => {
           if (input.sessionID === chat.id) {
             injected.resolve(input)
             return Effect.succeed(reply(input, "done"))
           }
           prompts++
-          if (prompts === 1) return Effect.promise(() => first.promise).pipe(Effect.as(reply(input, "first done")))
-          updated.resolve(input)
-          return Effect.promise(() => second.promise).pipe(Effect.as(reply(input, "second done")))
+          return Effect.promise(async () => {
+            await first.promise
+            await wakeRegistered.promise
+            await new Promise((resolve) => setTimeout(resolve, 0))
+            return reply(input, "second done")
+          })
         },
+        scheduleWake: () =>
+          Effect.sync(() => {
+            scheduledWakes++
+            wakeRegistered.resolve()
+          }),
+        awaitWake: () =>
+          Effect.promise(() => {
+            awaitingWake.resolve()
+            return wakeCompleted.promise
+          }),
       }
-      const context = taskContext(chat.id, assistant.id, promptOps)
+      const initialContext = { ...taskContext(chat.id, assistant.id, promptOps), callID: "initial" }
+      const followupContext = { ...taskContext(chat.id, assistant.id, promptOps), callID: "followup" }
 
       const started = yield* def.execute(
         {
@@ -3507,7 +3601,7 @@ describe("tool.task", () => {
           subagent_type: "general",
           background: true,
         },
-        context,
+        initialContext,
       )
       const result = yield* def.execute(
         {
@@ -3516,8 +3610,38 @@ describe("tool.task", () => {
           subagent_type: "general",
           task_id: started.metadata.sessionId,
         },
-        context,
+        followupContext,
       )
+
+      const visible = yield* Effect.promise(() => materialized.promise).pipe(Effect.timeout("1 second"))
+      expect(visible.noReply).toBe(true)
+      expect(visible.parts).toEqual([
+        expect.objectContaining({
+          id: expect.stringMatching(/^prt_/),
+          type: "text",
+          text: "also inspect cancellation",
+        }),
+      ])
+      expect(materializations).toBe(1)
+      const execution = yield* executions.get(started.metadata.sessionId)
+      if (!execution?.followupMessageID) throw new Error("follow-up input was not claimed")
+      expect(yield* SessionInput.find(db, SessionMessage.ID.make(execution.followupMessageID))).toMatchObject({
+        delivery: "legacy",
+      })
+
+      const retried = yield* def.execute(
+        {
+          description: "add investigation scope",
+          prompt: "also inspect cancellation",
+          subagent_type: "general",
+          task_id: started.metadata.sessionId,
+        },
+        followupContext,
+      )
+      expect(retried.metadata.sessionId).toBe(started.metadata.sessionId)
+      expect(materializations).toBe(1)
+      expect(yield* leases.get(started.metadata.sessionId)).toMatchObject({ wakeRequested: 1, wakeCompleted: 0 })
+      expect(scheduledWakes).toBe(2)
 
       const rejected = yield* def
         .execute(
@@ -3527,7 +3651,7 @@ describe("tool.task", () => {
             subagent_type: "general",
             task_id: started.metadata.sessionId,
           },
-          context,
+          followupContext,
         )
         .pipe(Effect.exit)
 
@@ -3537,14 +3661,11 @@ describe("tool.task", () => {
       expect(result.metadata.backgroundTaskGeneration).toBe(started.metadata.backgroundTaskGeneration)
       expect(result.output).toContain("Background task updated")
       expect(Exit.isFailure(rejected)).toBe(true)
-      if (Exit.isFailure(rejected)) expect(Cause.pretty(rejected.cause)).toContain("will notify you automatically")
+      if (Exit.isFailure(rejected)) expect(Cause.pretty(rejected.cause)).toContain("conflicts with its original prompt")
       first.resolve()
+      yield* Effect.promise(() => awaitingWake.promise).pipe(Effect.timeout("1 second"))
       expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
-      expect((yield* Effect.promise(() => updated.promise)).parts).toEqual([
-        { type: "text", text: "also inspect cancellation" },
-      ])
-
-      second.resolve()
+      wakeCompleted.resolve()
       const terminal = yield* waitForTerminalExecution(started.metadata.sessionId)
       expect(terminal.state).toBe("completed")
       expect(terminal.output).toBe("second done")
@@ -3552,6 +3673,479 @@ describe("tool.task", () => {
       expect(notification.variant).toBe("xhigh")
       expect(notification.parts[0]?.type).toBe("text")
       if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("second done")
+    }),
+  )
+
+  background.instance("reuses a reserved follow-up wake after the bridge crashes", () =>
+    Effect.gen(function* () {
+      const leases = yield* SessionRunLease.Service
+      const executions = yield* BackgroundTaskExecution.Service
+      const { db } = yield* Database.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let materializations = 0
+      let schedules = 0
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        materializeLegacy: (input) =>
+          Effect.sync(() => {
+            materializations++
+            return legacyMaterialization(input)
+          }),
+        prompt: () => Effect.never,
+        scheduleWake: () =>
+          Effect.suspend(() => {
+            schedules++
+            return schedules === 1 ? Effect.die("simulated bridge crash") : Effect.void
+          }),
+      }
+      const initialContext = { ...taskContext(chat.id, assistant.id, promptOps), callID: "initial" }
+      const followupContext = { ...taskContext(chat.id, assistant.id, promptOps), callID: "followup" }
+      const started = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "first dispatch",
+          subagent_type: "general",
+          background: true,
+        },
+        initialContext,
+      )
+      const input = {
+        description: "add scope",
+        prompt: "follow-up",
+        subagent_type: "general",
+        task_id: started.metadata.sessionId,
+      }
+
+      const crashed = yield* def.execute(input, followupContext).pipe(Effect.exit)
+      expect(Exit.isFailure(crashed)).toBe(true)
+      const execution = yield* executions.get(started.metadata.sessionId)
+      if (!execution?.followupMessageID) throw new Error("follow-up claim was not persisted")
+      expect(yield* SessionInput.find(db, SessionMessage.ID.make(execution.followupMessageID))).toHaveProperty(
+        "promotedSeq",
+      )
+      expect(yield* leases.get(started.metadata.sessionId)).toMatchObject({ wakeRequested: 1, wakeCompleted: 0 })
+
+      yield* def.execute(input, followupContext)
+
+      expect(materializations).toBe(1)
+      expect(schedules).toBe(2)
+      expect(yield* leases.get(started.metadata.sessionId)).toMatchObject({ wakeRequested: 1, wakeCompleted: 0 })
+    }),
+  )
+
+  background.instance("replaces legacy follow-up parts without deleting assistant descendants", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const executions = yield* BackgroundTaskExecution.Service
+      const jobs = yield* BackgroundJob.Service
+      const leases = yield* SessionRunLease.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const materialization = defer<SessionPrompt.PromptInput>()
+      const release = defer<void>()
+      let materializations = 0
+      let resolveCalls = 0
+      let schedules = 0
+      const agentInstruction =
+        " Use the above message and context to generate a prompt and call the task tool with subagent: general"
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        resolvePromptParts: (template) =>
+          Effect.sync(() => {
+            if (template === "follow-up") resolveCalls++
+            return [
+              { type: "text" as const, text: template },
+              {
+                type: "file" as const,
+                url: "file:///tmp/scope.bin",
+                filename: "scope.bin",
+                mime: "application/octet-stream",
+              },
+              { type: "agent" as const, name: "general" },
+            ]
+          }),
+        materializeLegacy: (input) =>
+          Effect.gen(function* () {
+            materializations++
+            materialization.resolve(input)
+            yield* Effect.promise(() => release.promise)
+            return legacyMaterialization(input)
+          }),
+        prompt: (input) => (input.sessionID === chat.id ? Effect.succeed(reply(input, "notified")) : Effect.never),
+        scheduleWake: () =>
+          Effect.sync(() => {
+            schedules++
+          }),
+      }
+      const initialContext = { ...taskContext(chat.id, assistant.id, promptOps), callID: "initial" }
+      const followupContext = { ...taskContext(chat.id, assistant.id, promptOps), callID: "followup" }
+      const started = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "first dispatch",
+          subagent_type: "general",
+          background: true,
+        },
+        initialContext,
+      )
+      const input = {
+        description: "add scope",
+        prompt: "follow-up",
+        subagent_type: "general",
+        task_id: started.metadata.sessionId,
+      }
+      const followup = yield* def.execute(input, followupContext).pipe(Effect.forkChild)
+      const materialized = yield* Effect.promise(() => materialization.promise).pipe(Effect.timeout("1 second"))
+      const old = legacyMaterialization(materialized)
+      yield* sessions.updateMessage(old.info)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: old.info.id,
+        sessionID: old.info.sessionID,
+        type: "text",
+        synthetic: true,
+        text: "stale partial expansion",
+      })
+      const descendant = reply({ ...materialized, parts: [] }, "existing descendant")
+      yield* sessions.updateMessage(descendant.info)
+      yield* Effect.forEach(descendant.parts, sessions.updatePart, { discard: true })
+
+      release.resolve()
+      const result = yield* Fiber.join(followup)
+      expect(result.output).toContain("Background task updated")
+      const projected = yield* sessions.getMessage({ sessionID: old.info.sessionID, messageID: old.info.id })
+      expect(projected.parts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "text", text: "follow-up" }),
+          expect.objectContaining({ type: "file", filename: "scope.bin" }),
+          expect.objectContaining({ type: "agent", name: "general" }),
+          expect.objectContaining({ type: "text", synthetic: true, text: agentInstruction }),
+        ]),
+      )
+      expect(projected.parts.some((part) => part.type === "text" && part.text === "stale partial expansion")).toBe(false)
+      expect(
+        projected.parts.filter((part) => part.type === "text" && part.synthetic && part.text === agentInstruction),
+      ).toHaveLength(1)
+      expect(
+        (yield* sessions.getMessage({ sessionID: old.info.sessionID, messageID: descendant.info.id })).info,
+      ).toMatchObject({ parentID: old.info.id })
+
+      yield* def.execute(input, followupContext)
+      const replayed = yield* sessions.getMessage({ sessionID: old.info.sessionID, messageID: old.info.id })
+      expect(materializations).toBe(1)
+      expect(resolveCalls).toBe(1)
+      expect(schedules).toBe(2)
+      expect(
+        replayed.parts.filter((part) => part.type === "text" && part.synthetic && part.text === agentInstruction),
+      ).toHaveLength(1)
+      const execution = yield* executions.get(started.metadata.sessionId)
+      if (!execution?.followupMessageID) throw new Error("follow-up claim was not persisted")
+      expect(yield* SessionInput.find(db, SessionMessage.ID.make(execution.followupMessageID))).toMatchObject({
+        promotedSeq: expect.any(Number),
+      })
+      expect(yield* leases.get(started.metadata.sessionId)).toMatchObject({ wakeRequested: 1, wakeCompleted: 0 })
+      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
+    }),
+  )
+
+  background.instance("schedules a materialized follow-up after an active V1 drain", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const executions = yield* BackgroundTaskExecution.Service
+      const leases = yield* SessionRunLease.Service
+      const runState = yield* SessionRunState.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const materializationEntered = defer<void>()
+      const releaseMaterialization = defer<void>()
+      const successorSawMaterialized = defer<boolean>()
+      let drains = 0
+      const drainResult = (sessionID: SessionID) =>
+        reply(
+          {
+            sessionID,
+            agent: "general",
+            model: ref,
+            parts: [{ type: "text", text: "drain" }],
+          },
+          "drained",
+        )
+      const drain = (sessionID: SessionID) =>
+        Effect.gen(function* () {
+          drains++
+          const execution = yield* executions.get(sessionID)
+          const materialized = execution?.followupMessageID
+            ? yield* sessions.getMessage({ sessionID, messageID: execution.followupMessageID }).pipe(
+                Effect.as(true),
+                Effect.catchCause(() => Effect.succeed(false)),
+              )
+            : false
+          if (drains === 2) successorSawMaterialized.resolve(materialized)
+          return drainResult(sessionID)
+        })
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        materializeLegacy: (input) =>
+          Effect.gen(function* () {
+            materializationEntered.resolve()
+            yield* Effect.promise(() => releaseMaterialization.promise)
+            return legacyMaterialization(input)
+          }),
+        prompt: () => Effect.never,
+        scheduleWake: (sessionID) =>
+          runState.scheduleWake(sessionID, Effect.succeed(drainResult(sessionID)), drain(sessionID)),
+        awaitWake: (sessionID) => runState.awaitWake(sessionID),
+      }
+      const initialContext = { ...taskContext(chat.id, assistant.id, promptOps), callID: "initial" }
+      const followupContext = { ...taskContext(chat.id, assistant.id, promptOps), callID: "followup" }
+      const started = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "first dispatch",
+          subagent_type: "general",
+          background: true,
+        },
+        initialContext,
+      )
+      expect(yield* leases.requestWake(started.metadata.sessionId)).toBe(1)
+      const blocker = yield* leases.claimExclusive(started.metadata.sessionId)
+      if (!blocker) return yield* Effect.die("failed to block the active V1 drain")
+      yield* runState.scheduleWake(
+        started.metadata.sessionId,
+        Effect.succeed(drainResult(started.metadata.sessionId)),
+        drain(started.metadata.sessionId),
+      )
+      const followup = yield* def
+        .execute(
+          {
+            description: "add scope",
+            prompt: "follow-up",
+            subagent_type: "general",
+            task_id: started.metadata.sessionId,
+          },
+          followupContext,
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Effect.promise(() => materializationEntered.promise).pipe(Effect.timeout("1 second"))
+      expect(yield* leases.get(started.metadata.sessionId)).toMatchObject({ wakeRequested: 1, wakeCompleted: 0 })
+      expect(yield* leases.release(started.metadata.sessionId, blocker.token)).toBe(true)
+      const deadline = Date.now() + 1_000
+      while ((yield* leases.get(started.metadata.sessionId))?.wakeCompleted !== 1) {
+        if (Date.now() >= deadline) return yield* Effect.fail(new Error("active V1 drain did not finish"))
+        yield* Effect.sleep("5 millis")
+      }
+      expect(yield* leases.get(started.metadata.sessionId)).toMatchObject({ wakeRequested: 1, wakeCompleted: 1 })
+      releaseMaterialization.resolve()
+      yield* Fiber.join(followup)
+      expect(yield* Effect.promise(() => successorSawMaterialized.promise).pipe(Effect.timeout("1 second"))).toBe(true)
+      expect(drains).toBe(2)
+      expect(yield* leases.get(started.metadata.sessionId)).toMatchObject({ wakeRequested: 2 })
+      const execution = yield* executions.get(started.metadata.sessionId)
+      if (!execution?.followupMessageID) return yield* Effect.die("follow-up input was not claimed")
+      expect(yield* SessionInput.find(db, SessionMessage.ID.make(execution.followupMessageID))).toMatchObject({
+        promotedSeq: expect.any(Number),
+      })
+    }),
+  )
+
+  background.instance("holds a terminal result behind a reserved follow-up wake", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const leases = yield* SessionRunLease.Service
+      const executions = yield* BackgroundTaskExecution.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const first = defer<void>()
+      const materializationEntered = defer<void>()
+      const materializationReleased = defer<void>()
+      const scheduled = defer<void>()
+      const awaitingWake = defer<void>()
+      const wakeCompleted = defer<void>()
+      const terminal = defer<SessionPrompt.PromptInput>()
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        materializeLegacy: (input) =>
+          Effect.gen(function* () {
+            materializationEntered.resolve()
+            yield* Effect.promise(() => materializationReleased.promise)
+            return legacyMaterialization(input)
+          }),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) {
+            terminal.resolve(input)
+            return Effect.succeed(reply(input, "notified"))
+          }
+          return Effect.promise(() => first.promise).pipe(Effect.as(reply(input, "initial done")))
+        },
+        scheduleWake: () =>
+          Effect.sync(() => {
+            scheduled.resolve()
+          }),
+        awaitWake: () =>
+          Effect.promise(() => {
+            awaitingWake.resolve()
+            return wakeCompleted.promise
+          }),
+      }
+      const initialContext = { ...taskContext(chat.id, assistant.id, promptOps), callID: "initial" }
+      const followupContext = { ...taskContext(chat.id, assistant.id, promptOps), callID: "followup" }
+      const started = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "first dispatch",
+          subagent_type: "general",
+          background: true,
+        },
+        initialContext,
+      )
+      expect(yield* leases.requestWake(started.metadata.sessionId)).toBe(1)
+      const followup = yield* def
+        .execute(
+          {
+            description: "add scope",
+            prompt: "follow-up",
+            subagent_type: "general",
+            task_id: started.metadata.sessionId,
+          },
+          followupContext,
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Effect.promise(() => materializationEntered.promise).pipe(Effect.timeout("1 second"))
+      expect(yield* leases.get(started.metadata.sessionId)).toMatchObject({ wakeRequested: 1, wakeCompleted: 0 })
+      materializationReleased.resolve()
+      const deadline = Date.now() + 1_000
+      while ((yield* leases.get(started.metadata.sessionId))?.wakeRequested !== 2) {
+        if (Date.now() >= deadline) return yield* Effect.fail(new Error("follow-up wake was not requested"))
+        yield* Effect.sleep("5 millis")
+      }
+      yield* Effect.promise(() => scheduled.promise).pipe(Effect.timeout("1 second"))
+      yield* Fiber.join(followup)
+      expect(yield* leases.get(started.metadata.sessionId)).toMatchObject({ wakeRequested: 2, wakeCompleted: 0 })
+      first.resolve()
+      yield* Effect.sleep("50 millis")
+      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
+      expect(yield* executions.get(started.metadata.sessionId)).toMatchObject({ state: "running" })
+      yield* Effect.promise(() => awaitingWake.promise).pipe(Effect.timeout("1 second"))
+      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
+      expect(yield* executions.get(started.metadata.sessionId)).toMatchObject({ state: "running" })
+      wakeCompleted.resolve()
+      expect((yield* waitForTerminalExecution(started.metadata.sessionId)).state).toBe("completed")
+      expect((yield* Effect.promise(() => terminal.promise)).parts[0]?.type).toBe("text")
+    }),
+  )
+
+  background.instance("background follow-ups without a call ID do not reuse an earlier identity", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        materializeLegacy: (input) => Effect.sync(() => legacyMaterialization(input)),
+        prompt: () => Effect.never,
+      }
+      const context = taskContext(chat.id, assistant.id, promptOps)
+      const started = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "first dispatch",
+          subagent_type: "general",
+          background: true,
+        },
+        context,
+      )
+
+      yield* def.execute(
+        {
+          description: "add scope",
+          prompt: "first follow-up",
+          subagent_type: "general",
+          task_id: started.metadata.sessionId,
+        },
+        context,
+      )
+      const second = yield* def
+        .execute(
+          {
+            description: "add scope",
+            prompt: "different follow-up",
+            subagent_type: "general",
+            task_id: started.metadata.sessionId,
+          },
+          context,
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(second)).toBe(true)
+      if (Exit.isFailure(second)) expect(Cause.pretty(second.cause)).toContain("already received its follow-up")
+    }),
+  )
+
+  background.instance("does not wake a background task cancelled during its follow-up bridge", () =>
+    Effect.gen(function* () {
+      const executions = yield* BackgroundTaskExecution.Service
+      const leases = yield* SessionRunLease.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const entered = defer<void>()
+      const release = defer<void>()
+      let wakes = 0
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        materializeLegacy: (input) =>
+          Effect.gen(function* () {
+            entered.resolve()
+            yield* Effect.promise(() => release.promise)
+            return legacyMaterialization(input)
+          }),
+        prompt: () => Effect.never,
+        scheduleWake: () =>
+          Effect.sync(() => {
+            wakes++
+          }),
+      }
+      const initialContext = { ...taskContext(chat.id, assistant.id, promptOps), callID: "initial" }
+      const followupContext = { ...taskContext(chat.id, assistant.id, promptOps), callID: "followup" }
+      const started = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "first dispatch",
+          subagent_type: "general",
+          background: true,
+        },
+        initialContext,
+      )
+      const followup = yield* def
+        .execute(
+          {
+            description: "add scope",
+            prompt: "follow-up",
+            subagent_type: "general",
+            task_id: started.metadata.sessionId,
+          },
+          followupContext,
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Effect.promise(() => entered.promise).pipe(Effect.timeout("1 second"))
+      yield* executions.requestCancel(started.metadata.sessionId)
+      release.resolve()
+      const exit = yield* Fiber.await(followup)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("no longer accepting follow-ups")
+      expect(wakes).toBe(0)
+      expect(yield* leases.get(started.metadata.sessionId)).toBeUndefined()
     }),
   )
 

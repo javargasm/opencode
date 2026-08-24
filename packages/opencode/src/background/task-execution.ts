@@ -5,6 +5,7 @@ import { BackgroundTaskExecutionTable, SessionTable } from "@opencode-ai/core/se
 import { and, eq, getTableColumns, gt, isNotNull, isNull, lte, or, sql } from "drizzle-orm"
 import { Context, Effect, Layer } from "effect"
 import { MessageID, PartID, SessionID } from "@/session/schema"
+import { SessionRunLease } from "@/session/run-lease"
 
 export type State = "running" | "completed" | "error" | "cancelled"
 
@@ -19,6 +20,8 @@ export type Info = {
   parentVariant?: string
   leaseExpiresAt: number
   followupClaimedAt?: number
+  followupMessageID?: MessageID
+  followupHash?: string
   cancelRequestedAt?: number
   output?: string
   error?: string
@@ -47,7 +50,7 @@ export type ClaimResult = {
   info: Info
 }
 
-export type FollowupClaim = "claimed" | "already_claimed" | "inactive"
+export type FollowupClaim = "claimed" | "replayed" | "conflict" | "already_claimed" | "inactive"
 
 export type LeaseClaim = {
   token: string
@@ -72,7 +75,13 @@ export interface Interface {
     error?: string
   }) => Effect.Effect<Info | undefined>
   readonly requestCancel: (sessionID: SessionID) => Effect.Effect<Info[]>
-  readonly claimFollowup: (input: { sessionID: SessionID; generation: string }) => Effect.Effect<FollowupClaim>
+  readonly claimFollowup: (input: {
+    sessionID: SessionID
+    parentSessionID: SessionID
+    generation: string
+    messageID: MessageID
+    hash: string
+  }) => Effect.Effect<FollowupClaim>
   readonly get: (sessionID: SessionID) => Effect.Effect<Info | undefined>
   readonly list: (input: { projectID: ProjectV2.ID; directory: string }) => Effect.Effect<Info[]>
   readonly listForParent: (parentSessionID: SessionID) => Effect.Effect<Info[]>
@@ -260,6 +269,8 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
             ...values,
             cancel_requested_at: null,
             followup_claimed_at: null,
+            followup_message_id: null,
+            followup_hash: null,
             output: null,
             error: null,
             delivery_owner_id: null,
@@ -437,26 +448,44 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
     const requestCancel: Interface["requestCancel"] = Effect.fn("BackgroundTaskExecution.requestCancel")(
       function* (sessionID) {
         yield* reconcileExpired()
-        const rows = yield* listAll()
-        const descendants = tree(rows, sessionID)
         const time = now()
-        yield* Effect.forEach(
-          descendants.filter((row) => row.state === "running"),
-          (row) =>
-            db
-              .update(BackgroundTaskExecutionTable)
-              .set({ cancel_requested_at: time, time_updated: time })
-              .where(
-                and(
-                  eq(BackgroundTaskExecutionTable.session_id, row.sessionID),
-                  eq(BackgroundTaskExecutionTable.generation, row.generation),
-                  eq(BackgroundTaskExecutionTable.state, "running"),
-                ),
-              )
-              .run()
-              .pipe(Effect.orDie),
-          { concurrency: "unbounded", discard: true },
-        )
+        yield* db
+          .transaction(
+            (tx) =>
+              Effect.gen(function* () {
+                const descendants = tree(
+                  (yield* tx.select().from(BackgroundTaskExecutionTable).all().pipe(Effect.orDie))
+                    .map(fromRow)
+                    .filter(isInfo),
+                  sessionID,
+                )
+                yield* Effect.forEach(
+                  descendants.filter((row) => row.state === "running"),
+                  (row) =>
+                    tx
+                      .update(BackgroundTaskExecutionTable)
+                      .set({ cancel_requested_at: time, time_updated: time })
+                      .where(
+                        and(
+                          eq(BackgroundTaskExecutionTable.session_id, row.sessionID),
+                          eq(BackgroundTaskExecutionTable.generation, row.generation),
+                          eq(BackgroundTaskExecutionTable.state, "running"),
+                        ),
+                      )
+                      .returning({ sessionID: BackgroundTaskExecutionTable.session_id })
+                      .get()
+                      .pipe(
+                        Effect.orDie,
+                        Effect.flatMap((cancelled) =>
+                          cancelled ? SessionRunLease.requestCancel(tx, row.sessionID, time) : Effect.void,
+                        ),
+                      ),
+                  { discard: true },
+                )
+              }),
+            { behavior: "immediate" },
+          )
+          .pipe(Effect.orDie)
         return tree(yield* listAll(), sessionID)
       },
     )
@@ -467,10 +496,16 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
         const time = now()
         const claimed = yield* db
           .update(BackgroundTaskExecutionTable)
-          .set({ followup_claimed_at: time, time_updated: time })
+          .set({
+            followup_claimed_at: time,
+            followup_message_id: input.messageID,
+            followup_hash: input.hash,
+            time_updated: time,
+          })
           .where(
             and(
               eq(BackgroundTaskExecutionTable.session_id, input.sessionID),
+              eq(BackgroundTaskExecutionTable.parent_session_id, input.parentSessionID),
               eq(BackgroundTaskExecutionTable.generation, input.generation),
               eq(BackgroundTaskExecutionTable.state, "running"),
               gt(BackgroundTaskExecutionTable.lease_expires_at, time),
@@ -484,13 +519,15 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
         if (claimed) return "claimed"
         const current = yield* get(input.sessionID)
         if (
+          current?.parentSessionID === input.parentSessionID &&
           current?.generation === input.generation &&
           current.state === "running" &&
           current.leaseExpiresAt > time &&
-          current.cancelRequestedAt === undefined &&
-          current.followupClaimedAt !== undefined
+          current.cancelRequestedAt === undefined
         ) {
-          return "already_claimed"
+          if (current.followupMessageID === input.messageID)
+            return current.followupHash === input.hash ? "replayed" : "conflict"
+          if (current.followupClaimedAt !== undefined) return "already_claimed"
         }
         return "inactive"
       },
@@ -763,6 +800,8 @@ function fromRow(row: typeof BackgroundTaskExecutionTable.$inferSelect | undefin
     parentVariant: row.parent_variant ?? undefined,
     leaseExpiresAt: row.lease_expires_at,
     followupClaimedAt: row.followup_claimed_at ?? undefined,
+    followupMessageID: row.followup_message_id ? MessageID.make(row.followup_message_id) : undefined,
+    followupHash: row.followup_hash ?? undefined,
     cancelRequestedAt: row.cancel_requested_at ?? undefined,
     output: row.output ?? undefined,
     error: row.error ?? undefined,

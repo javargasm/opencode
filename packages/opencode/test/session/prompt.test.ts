@@ -631,6 +631,44 @@ it.instance("legacy prompt emits message events without session.next events", ()
   }),
 )
 
+it.instance("materializeLegacy leaves session state untouched until the durable bridge commits", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      agent: "plan",
+      model: { providerID: ProviderV2.ID.make("old"), id: ModelV2.ID.make("old-model") },
+    })
+    const first = yield* user(chat.id, "keep this pending revert")
+    const second = yield* user(chat.id, "do not remove before the bridge commits")
+    yield* sessions.setRevert({
+      sessionID: chat.id,
+      revert: { messageID: first.id },
+      summary: { additions: 0, deletions: 0, files: 0 },
+    })
+
+    const materialized = yield* prompt.materializeLegacy({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "durable follow-up" }],
+    })
+
+    expect(materialized.info.role).toBe("user")
+    expect(yield* sessions.get(chat.id)).toMatchObject({
+      agent: "plan",
+      model: { providerID: "old", id: "old-model" },
+      revert: { messageID: first.id },
+    })
+    expect((yield* sessions.messages({ sessionID: chat.id })).map((message) => message.info.id)).toEqual([
+      first.id,
+      second.id,
+    ])
+  }),
+)
+
 it.instance("loop surfaces content-filter finishes as session errors", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -1545,6 +1583,93 @@ noLLMServer.instance("assertNotBusy succeeds when idle", () =>
     const chat = yield* sessions.create({})
     const exit = yield* run.assertNotBusy(chat.id).pipe(Effect.exit)
     expect(Exit.isSuccess(exit)).toBe(true)
+  }),
+)
+
+noLLMServer.instance("scheduleWake runs a pre-reserved revision", () =>
+  Effect.gen(function* () {
+    const run = yield* SessionRunState.Service
+    const leases = yield* SessionRunLease.make()
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({})
+    const admitted = yield* user(chat.id, "hi")
+    const fallback = yield* MessageV2.get({ sessionID: chat.id, messageID: admitted.id })
+    const release = yield* Deferred.make<void>()
+    const active = yield* run
+      .wake(chat.id, Effect.succeed(fallback), Deferred.await(release).pipe(Effect.as(fallback)))
+      .pipe(Effect.forkChild)
+
+    yield* pollWithTimeout(
+      leases.get(chat.id).pipe(Effect.map((current) => (current?.wakeRequested === 1 ? (true as const) : undefined))),
+      "active wake did not register",
+    )
+    expect(yield* leases.requestWake(chat.id)).toBe(2)
+    yield* run.scheduleWake(chat.id, Effect.succeed(fallback), Effect.succeed(fallback))
+    expect(yield* leases.get(chat.id)).toMatchObject({ wakeRequested: 2, wakeCompleted: 0 })
+
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.await(active)
+    yield* pollWithTimeout(
+      leases.get(chat.id).pipe(Effect.map((current) => (current?.wakeCompleted === 2 ? (true as const) : undefined))),
+      "queued wake did not complete",
+    )
+  }),
+)
+
+noLLMServer.instance("active drain consumes a reserved wake without local scheduling", () =>
+  Effect.gen(function* () {
+    const run = yield* SessionRunState.Service
+    const leases = yield* SessionRunLease.make()
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({})
+    const admitted = yield* user(chat.id, "hi")
+    const fallback = yield* MessageV2.get({ sessionID: chat.id, messageID: admitted.id })
+    const release = yield* Deferred.make<void>()
+    let runs = 0
+    const active = yield* run
+      .wake(
+        chat.id,
+        Effect.succeed(fallback),
+        Effect.suspend(() =>
+          Effect.gen(function* () {
+            runs++
+            if (runs === 1) yield* Deferred.await(release)
+            return fallback
+          }),
+        ),
+      )
+      .pipe(Effect.forkChild)
+
+    yield* pollWithTimeout(
+      leases
+        .get(chat.id)
+        .pipe(
+          Effect.map((current) =>
+            current?.wakeRequested === 1 && current.ownerID !== undefined ? (true as const) : undefined,
+          ),
+        ),
+      "active wake did not claim",
+    )
+    expect(yield* run.requestWake(chat.id)).toBe(2)
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.await(active)
+    expect(yield* leases.get(chat.id)).toMatchObject({ wakeRequested: 2, wakeCompleted: 2 })
+    expect(runs).toBe(2)
+  }),
+)
+
+noLLMServer.instance("resumeWake drains a reserved revision without requesting another", () =>
+  Effect.gen(function* () {
+    const run = yield* SessionRunState.Service
+    const leases = yield* SessionRunLease.make()
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({})
+    const admitted = yield* user(chat.id, "hi")
+    const fallback = yield* MessageV2.get({ sessionID: chat.id, messageID: admitted.id })
+
+    expect(yield* leases.requestWake(chat.id)).toBe(1)
+    expect(yield* run.resumeWake(chat.id, Effect.succeed(fallback), Effect.succeed(fallback))).toEqual(fallback)
+    expect(yield* leases.get(chat.id)).toMatchObject({ wakeRequested: 1, wakeCompleted: 1 })
   }),
 )
 

@@ -2,9 +2,14 @@ import * as Tool from "./tool"
 import DESCRIPTION from "./task.txt"
 import { ToolJsonSchema } from "./json-schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { Prompt } from "@opencode-ai/core/session/prompt"
 import { BackgroundJob } from "@/background/job"
-import { BackgroundTaskExecution } from "@/background/task-execution"
+import { BackgroundTaskExecution, type FollowupClaim } from "@/background/task-execution"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { Session } from "@/session/session"
+import { SessionRunLease } from "@/session/run-lease"
 import { SessionID, MessageID, PartID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
@@ -17,13 +22,17 @@ import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
+import { createHash } from "node:crypto"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   interrupt(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
+  materializeLegacy(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
   wake(sessionID: SessionID): Effect.Effect<void>
+  scheduleWake(sessionID: SessionID): Effect.Effect<void>
+  awaitWake(sessionID: SessionID): Effect.Effect<void>
 }
 
 const id = "task"
@@ -311,6 +320,23 @@ export const startBackgroundTerminalPump = Effect.fn("TaskTool.startBackgroundTe
 })
 
 type TaskModel = ReturnType<typeof Provider.parseModel> & { variant?: string }
+type FollowupRejected = Exclude<FollowupClaim, "claimed" | "replayed">
+
+class FollowupAdmissionRejected extends Error {
+  constructor(readonly claim: FollowupRejected) {
+    super(`Follow-up admission rejected: ${claim}`)
+  }
+}
+
+function followupError(claim: FollowupRejected) {
+  if (claim === "conflict") return new Error("This follow-up conflicts with its original prompt.")
+  if (claim === "already_claimed") {
+    return new Error(
+      "This background task is still running and already received its follow-up. It will notify you automatically when it finishes.",
+    )
+  }
+  return new Error("This background task is no longer accepting follow-ups.")
+}
 
 function normalizeVariant(variant: string | undefined) {
   return variant === "default" ? undefined : variant
@@ -323,6 +349,57 @@ function sameModel(a: TaskModel, b: TaskModel | undefined) {
     a.modelID === b.modelID &&
     normalizeVariant(a.variant) === normalizeVariant(b.variant)
   )
+}
+
+function followupMessageID(input: { sessionID: SessionID; generation: string; requestID: string }) {
+  return MessageID.make(`msg_${createHash("sha256").update(JSON.stringify(input)).digest("hex")}`)
+}
+
+function followupPartID(messageID: MessageID, index: number) {
+  return PartID.ascending(`prt_${createHash("sha256").update(`${messageID}:${index}`).digest("hex")}`)
+}
+
+function followupHash(prompt: Prompt) {
+  return createHash("sha256").update(JSON.stringify(prompt)).digest("hex")
+}
+
+function followupPrompt(parts: SessionPrompt.PromptInput["parts"]) {
+  const text = parts.find((part) => part.type === "text")
+  if (!text || text.type !== "text") throw new Error("Follow-up prompt is missing text")
+  const files = parts.flatMap((part) => {
+    if (part.type !== "file") return []
+    return [
+      {
+        uri: part.url,
+        mime: part.mime,
+        ...(part.filename === undefined ? {} : { name: part.filename }),
+      },
+    ]
+  })
+  const agents = parts.flatMap((part) => (part.type === "agent" ? [{ name: part.name }] : []))
+  return Prompt.make({
+    text: text.text,
+    ...(files.length === 0 ? {} : { files }),
+    ...(agents.length === 0 ? {} : { agents }),
+  })
+}
+
+function followupParts(prompt: Prompt, messageID: MessageID) {
+  return [
+    { id: followupPartID(messageID, 0), type: "text" as const, text: prompt.text },
+    ...(prompt.files ?? []).map((file, index) => ({
+      id: followupPartID(messageID, index + 1),
+      type: "file" as const,
+      url: file.uri,
+      mime: file.mime,
+      ...(file.name === undefined ? {} : { filename: file.name }),
+    })),
+    ...(prompt.agents ?? []).map((agent, index) => ({
+      id: followupPartID(messageID, (prompt.files?.length ?? 0) + index + 1),
+      type: "agent" as const,
+      name: agent.name,
+    })),
+  ] satisfies SessionPrompt.PromptInput["parts"]
 }
 
 function formatModel(model: TaskModel) {
@@ -341,6 +418,8 @@ export const TaskTool = Tool.define(
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const events = yield* EventV2Bridge.Service
+    const { db } = database
     const dispatches = KeyedMutex.makeUnsafe<SessionID>()
 
     const run = Effect.fn("TaskTool.execute")(function* (
@@ -540,25 +619,7 @@ export const TaskTool = Tool.define(
         if (failed?.type === "tool" && failed.state.status === "error") {
           return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${failed.state.error}`))
         }
-        const initial = result.parts.findLast((item) => item.type === "text")?.text ?? ""
-        while ((yield* executions.listPendingHandoffs(nextSession.id)).length > 0) {
-          yield* Effect.sleep("250 millis")
-        }
-        const latest = Option.getOrUndefined(
-          yield* sessions
-            .findMessage(
-              nextSession.id,
-              (message) =>
-                message.info.role === "assistant" &&
-                message.parts.some((part) => part.type === "text" && !part.ignored),
-            )
-            .pipe(Effect.orDie),
-        )
-        const latestText = latest?.parts.findLast(
-          (item): item is Extract<(typeof latest.parts)[number], { type: "text" }> =>
-            item.type === "text" && !item.ignored,
-        )
-        return latestText?.text ?? initial
+        return result.parts.findLast((item) => item.type === "text")?.text ?? ""
       })
 
       const acknowledge = Effect.fn("TaskTool.acknowledgeBackgroundResult")(function* (
@@ -605,31 +666,35 @@ export const TaskTool = Tool.define(
         result: BackgroundJob.Info | undefined,
         generation: string,
       ) {
-        if (result?.status === "completed") {
-          yield* executions.settle({
-            sessionID: nextSession.id,
-            generation,
-            state: "completed",
-            output: result.output ?? "",
-          })
-        }
-        if (result?.status === "error") {
-          yield* executions.settle({
-            sessionID: nextSession.id,
-            generation,
-            state: "error",
-            error: result.error ?? "Task failed",
-          })
-        }
-        if (result?.status === "cancelled") {
-          yield* executions.settle({
-            sessionID: nextSession.id,
-            generation,
-            state: "cancelled",
-            error: "Task cancelled",
-          })
-        }
-        return yield* executions.get(nextSession.id)
+        return yield* dispatches.withLock(nextSession.id)(
+          Effect.gen(function* () {
+            if (result?.status === "completed") {
+              yield* executions.settle({
+                sessionID: nextSession.id,
+                generation,
+                state: "completed",
+                output: result.output ?? "",
+              })
+            }
+            if (result?.status === "error") {
+              yield* executions.settle({
+                sessionID: nextSession.id,
+                generation,
+                state: "error",
+                error: result.error ?? "Task failed",
+              })
+            }
+            if (result?.status === "cancelled") {
+              yield* executions.settle({
+                sessionID: nextSession.id,
+                generation,
+                state: "cancelled",
+                error: "Task cancelled",
+              })
+            }
+            return yield* executions.get(nextSession.id)
+          }),
+        )
       })
 
       const notify = Effect.fn("TaskTool.notifyBackgroundResult")(function* (
@@ -671,6 +736,38 @@ export const TaskTool = Tool.define(
         })
         return yield* Effect.raceFirst(
           runTask().pipe(
+            Effect.flatMap((initial) =>
+              dispatches.withLock(nextSession.id)(
+                Effect.gen(function* () {
+                  yield* ops.awaitWake(nextSession.id)
+                  while ((yield* executions.listPendingHandoffs(nextSession.id)).length > 0) {
+                    yield* Effect.sleep("250 millis")
+                  }
+                  const latest = Option.getOrUndefined(
+                    yield* sessions
+                      .findMessage(
+                        nextSession.id,
+                        (message) =>
+                          message.info.role === "assistant" &&
+                          message.parts.some((part) => part.type === "text" && !part.ignored),
+                      )
+                      .pipe(Effect.orDie),
+                  )
+                  const latestText = latest?.parts.findLast(
+                    (item): item is Extract<(typeof latest.parts)[number], { type: "text" }> =>
+                      item.type === "text" && !item.ignored,
+                  )
+                  const output = latestText?.text ?? initial
+                  yield* executions.settle({
+                    sessionID: nextSession.id,
+                    generation,
+                    state: "completed",
+                    output,
+                  })
+                  return output
+                }),
+              ),
+            ),
             Effect.onExit((exit) =>
               Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)
                 ? background
@@ -695,39 +792,107 @@ export const TaskTool = Tool.define(
               return yield* Effect.fail(new Error("Task not found"))
             }
           }
-          const current = yield* background.get(nextSession.id)
-          if (current?.status === "running") {
-            const generation =
-              typeof current?.metadata?.backgroundTaskGeneration === "string"
-                ? current.metadata.backgroundTaskGeneration
-                : undefined
-            const followup =
-              current.metadata?.background === true && generation !== undefined
-                ? yield* executions.claimFollowup({ sessionID: nextSession.id, generation })
-                : undefined
-            if (followup === "already_claimed") {
-              return yield* Effect.fail(
-                new Error(
-                  "This background task is still running and already received its follow-up. It will notify you automatically when it finishes.",
+          const execution = yield* executions.get(nextSession.id)
+          if (execution?.state === "running" && execution.wakeRequired) {
+            const generation = execution.generation
+            const followup = yield* Effect.gen(function* () {
+              const messageID = followupMessageID({
+                sessionID: nextSession.id,
+                generation,
+                requestID: ctx.callID ?? PartID.ascending(),
+              })
+              const inputID = SessionMessage.ID.make(messageID)
+              const existing = yield* SessionInput.find(db, inputID)
+              if (existing && existing.prompt.text !== params.prompt) {
+                return yield* Effect.fail(new Error("This follow-up conflicts with its original prompt."))
+              }
+              const prompt = existing?.prompt ?? followupPrompt(yield* ops.resolvePromptParts(params.prompt))
+              return { messageID, inputID, prompt, hash: followupHash(prompt) }
+            })
+            const followupClaim = {
+              sessionID: nextSession.id,
+              parentSessionID: ctx.sessionID,
+              generation,
+              messageID: followup.messageID,
+              hash: followup.hash,
+            }
+            const admitted = yield* SessionInput.admit(db, events, {
+              id: followup.inputID,
+              sessionID: nextSession.id,
+              prompt: followup.prompt,
+              delivery: "legacy",
+              commit: () =>
+                executions.claimFollowup(followupClaim).pipe(
+                  Effect.flatMap((claim) => {
+                    if (claim === "claimed" || claim === "replayed") return Effect.void
+                    return Effect.die(new FollowupAdmissionRejected(claim))
+                  }),
+                ),
+            }).pipe(
+              Effect.catchDefect((defect) =>
+                defect instanceof FollowupAdmissionRejected
+                  ? Effect.fail(followupError(defect.claim))
+                  : Effect.die(defect),
+              ),
+            )
+            if (
+              !SessionInput.equivalent(admitted, {
+                sessionID: nextSession.id,
+                prompt: followup.prompt,
+                delivery: "legacy",
+              })
+            ) {
+              return yield* Effect.fail(new Error("This follow-up conflicts with its original prompt."))
+            }
+            const admittedClaim = yield* executions.claimFollowup(followupClaim)
+            if (admittedClaim !== "claimed" && admittedClaim !== "replayed") {
+              return yield* Effect.fail(followupError(admittedClaim))
+            }
+            if (admitted.promotedSeq === undefined) {
+              const materialized = yield* ops.materializeLegacy({
+                messageID: followup.messageID,
+                sessionID: nextSession.id,
+                model: { modelID: model.modelID, providerID: model.providerID },
+                variant: model.variant,
+                agent: next.name,
+                noReply: true,
+                parts: followupParts(admitted.prompt, followup.messageID),
+              })
+              if (materialized.info.role !== "user") {
+                return yield* Effect.fail(new Error("Legacy follow-up materialization must produce a user message"))
+              }
+              yield* SessionInput.consumeLegacy(db, events, {
+                sessionID: nextSession.id,
+                id: followup.inputID,
+                info: materialized.info,
+                parts: materialized.parts,
+                commit: () =>
+                  executions.claimFollowup(followupClaim).pipe(
+                    Effect.flatMap((claim) => {
+                      if (claim !== "claimed" && claim !== "replayed")
+                        return Effect.die(new FollowupAdmissionRejected(claim))
+                      return SessionRunLease.requestWake(db, nextSession.id).pipe(Effect.asVoid)
+                    }),
+                  ),
+              }).pipe(
+                Effect.catchDefect((defect) =>
+                  defect instanceof FollowupAdmissionRejected
+                    ? Effect.fail(followupError(defect.claim))
+                    : Effect.die(defect),
                 ),
               )
             }
-            if (followup === "inactive") {
-              yield* background.cancel(nextSession.id)
-            } else {
-              if (!generation || !(yield* background.extend({ id: nextSession.id, run: ownedRun(generation) }))) {
-                return yield* Effect.fail(new Error("Unable to continue background task"))
-              }
-              const nextMetadata = {
-                ...metadata,
-                ...(generation !== undefined ? { backgroundTaskGeneration: generation } : {}),
-              }
-              yield* ctx.metadata({
-                title: params.description,
-                metadata: { ...nextMetadata, background: true, jobId: nextSession.id },
-              })
-              return { extended: true as const, generation, metadata: nextMetadata }
+            const promotedClaim = yield* executions.claimFollowup(followupClaim)
+            if (promotedClaim !== "claimed" && promotedClaim !== "replayed") {
+              return yield* Effect.fail(followupError(promotedClaim))
             }
+            yield* ops.scheduleWake(nextSession.id)
+            const nextMetadata = { ...metadata, backgroundTaskGeneration: generation }
+            yield* ctx.metadata({
+              title: params.description,
+              metadata: { ...nextMetadata, background: true, jobId: nextSession.id },
+            })
+            return { extended: true as const, generation, metadata: nextMetadata }
           }
 
           const nextMetadata = { ...metadata, backgroundTaskGeneration: requestedGeneration }

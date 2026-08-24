@@ -172,7 +172,7 @@ const layer = Layer.effect(
 
     const runTurnAttempt = Effect.fn("SessionRunner.runTurn")(function* (
       sessionID: SessionSchema.ID,
-      promotion: SessionInput.Delivery | undefined,
+      promotion: SessionInput.V2Delivery | undefined,
       step: number,
       recoverOverflow?: typeof compaction.compactAfterOverflow,
     ) {
@@ -355,7 +355,7 @@ const layer = Layer.effect(
     }, Effect.scoped)
     type RunTurn = (
       sessionID: SessionSchema.ID,
-      promotion: SessionInput.Delivery | undefined,
+      promotion: SessionInput.V2Delivery | undefined,
       step: number,
     ) => Effect.Effect<{ readonly needsContinuation: boolean; readonly step: number }, RunError>
 
@@ -395,7 +395,7 @@ const layer = Layer.effect(
       const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
       if (!input.force && !hasSteer && !hasQueue) return
       yield* failInterruptedTools(input.sessionID)
-      let promotion: SessionInput.Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
+      let promotion: SessionInput.V2Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
       let shouldRun = input.force || hasSteer || hasQueue
       while (shouldRun) {
         let needsContinuation = true

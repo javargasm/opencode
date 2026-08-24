@@ -271,6 +271,87 @@ const layer = Layer.effectDiscard(
           .pipe(Effect.orDie)
       }),
     )
+    yield* events.project(SessionV1.Event.LegacyPromptMaterialized, (event) =>
+      Effect.gen(function* () {
+        if (event.durable === undefined) return yield* Effect.die("Durable legacy prompt event is missing aggregate sequence")
+        if (
+          event.data.info.id !== event.data.inputID ||
+          event.data.info.sessionID !== event.data.sessionID ||
+          event.data.parts.some(
+            (part) => part.messageID !== event.data.inputID || part.sessionID !== event.data.sessionID,
+          )
+        ) {
+          return yield* Effect.die("Legacy prompt materialization does not match its inbox input")
+        }
+        yield* db
+          .insert(MessageTable)
+          .values({
+            id: event.data.info.id,
+            session_id: event.data.sessionID,
+            time_created: event.data.info.time.created,
+            data: messageData(event.data.info),
+          })
+          .onConflictDoUpdate({ target: MessageTable.id, set: { data: messageData(event.data.info) } })
+          .run()
+          .pipe(Effect.orDie)
+        const existing = yield* db
+          .select()
+          .from(PartTable)
+          .where(
+            and(
+              eq(PartTable.message_id, event.data.inputID),
+              eq(PartTable.session_id, event.data.sessionID),
+            ),
+          )
+          .all()
+          .pipe(Effect.orDie)
+        yield* Effect.forEach(
+          existing,
+          (part) => {
+            const previous = usage(part.data)
+            return previous ? applyUsage(db, event.data.sessionID, previous, -1) : Effect.void
+          },
+          { discard: true },
+        )
+        yield* db
+          .delete(PartTable)
+          .where(
+            and(
+              eq(PartTable.message_id, event.data.inputID),
+              eq(PartTable.session_id, event.data.sessionID),
+            ),
+          )
+          .run()
+          .pipe(Effect.orDie)
+        yield* Effect.forEach(
+          event.data.parts,
+          (part) =>
+            db
+              .insert(PartTable)
+              .values({
+                id: part.id,
+                message_id: event.data.inputID,
+                session_id: event.data.sessionID,
+                time_created: event.data.info.time.created,
+                data: partData(part),
+              })
+              .run()
+              .pipe(
+                Effect.orDie,
+                Effect.andThen(() => {
+                  const next = usage(part)
+                  return next ? applyUsage(db, event.data.sessionID, next) : Effect.void
+                }),
+              ),
+          { discard: true },
+        )
+        yield* SessionInput.projectLegacyMaterialized(db, {
+          id: SessionMessage.ID.make(event.data.inputID),
+          sessionID: event.data.sessionID,
+          promotedSeq: event.durable.seq,
+        })
+      }),
+    )
     yield* events.project(SessionV1.Event.MessageRemoved, (event) =>
       Effect.gen(function* () {
         const rows = yield* db

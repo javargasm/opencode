@@ -10,6 +10,8 @@ import { SessionMessage } from "./session-message"
 
 export const Delivery = SessionDelivery.Delivery
 export type Delivery = SessionDelivery.Delivery
+export const V2Delivery = SessionDelivery.V2Delivery
+export type V2Delivery = SessionDelivery.V2Delivery
 
 export interface Admitted extends Schema.Schema.Type<typeof Admitted> {}
 export const Admitted = Schema.Struct({

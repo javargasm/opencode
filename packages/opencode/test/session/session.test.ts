@@ -1,7 +1,13 @@
 import { describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2 } from "@opencode-ai/core/event"
+import { Database } from "@opencode-ai/core/database/database"
+import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { Prompt } from "@opencode-ai/core/session/prompt"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Deferred, Effect, Exit, Layer } from "effect"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -11,7 +17,7 @@ import { provideInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { GlobalBus } from "@/bus/global"
+import { GlobalBus, type GlobalEvent } from "@/bus/global"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceStore } from "@/project/instance-store"
@@ -25,6 +31,7 @@ const it = testEffect(
       SessionProjector.node,
       CrossSpawnSpawner.node,
       InstanceStore.node,
+      Database.node,
     ]),
     [
       [RuntimeFlags.node, RuntimeFlags.layer({ experimentalWorkspaces: false })],
@@ -128,6 +135,121 @@ describe("session.created event", () => {
       })
 
       yield* session.remove(info.id)
+    }),
+  )
+
+  it.instance("relays a materialized legacy prompt to live legacy listeners", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const events = yield* EventV2Bridge.Service
+      const session = yield* SessionNs.Service
+      const info = yield* session.create({})
+      const messageID = MessageID.ascending()
+      const inputID = SessionMessage.ID.make(messageID)
+      const partID = PartID.ascending()
+      yield* SessionInput.admit(db, events, {
+        id: inputID,
+        sessionID: info.id,
+        prompt: Prompt.make({ text: "Show this follow-up live" }),
+        delivery: "legacy",
+      })
+
+      const seen: string[] = []
+      const off = yield* events.listen((event) => {
+        seen.push(event.type)
+        return Effect.void
+      })
+      const global: GlobalEvent[] = []
+      const listener = (event: GlobalEvent) => global.push(event)
+      GlobalBus.on("event", listener)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          GlobalBus.off("event", listener)
+        }),
+      )
+
+      yield* SessionInput.consumeLegacy(db, events, {
+        id: inputID,
+        sessionID: info.id,
+        info: {
+          id: messageID,
+          role: "user",
+          sessionID: info.id,
+          time: { created: Date.now() },
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+        },
+        parts: [
+          {
+            id: partID,
+            messageID,
+            sessionID: info.id,
+            type: "text",
+            text: "Show this follow-up live",
+          },
+        ],
+      })
+      const visible: string[] = [
+        SessionV1.Event.LegacyPromptMaterialized.type,
+        SessionV1.Event.MessageUpdated.type,
+        SessionV1.Event.PartUpdated.type,
+      ]
+      expect(seen.filter((type) => visible.includes(type))).toEqual(visible)
+      expect(global.map((event) => event.payload.type).filter((type) => visible.includes(type))).toEqual(visible)
+
+      const replay = yield* session.create({})
+      yield* events.remove(replay.id)
+      const replayMessageID = MessageID.ascending()
+      const replayInputID = SessionMessage.ID.make(replayMessageID)
+      const replayPartID = PartID.ascending()
+      yield* SessionInput.admit(db, events, {
+        id: replayInputID,
+        sessionID: replay.id,
+        prompt: Prompt.make({ text: "Replay this follow-up live" }),
+        delivery: "legacy",
+      })
+      const replaySeq = (yield* EventV2.latestSequence(db, replay.id)) + 1
+      const definition = SessionV1.Event.LegacyPromptMaterialized
+      if (!definition.durable) return yield* Effect.die("legacy materialization event must be durable")
+      seen.length = 0
+      global.length = 0
+      yield* events.replay(
+        {
+          id: EventV2.ID.create(),
+          type: EventV2.versionedType(
+            definition.type,
+            definition.durable.version,
+          ),
+          aggregateID: replay.id,
+          seq: replaySeq,
+          data: {
+            sessionID: replay.id,
+            inputID: replayMessageID,
+            info: {
+              id: replayMessageID,
+              role: "user",
+              sessionID: replay.id,
+              time: { created: Date.now() },
+              agent: "build",
+              model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+            },
+            parts: [
+              {
+                id: replayPartID,
+                messageID: replayMessageID,
+                sessionID: replay.id,
+                type: "text",
+                text: "Replay this follow-up live",
+              },
+            ],
+          },
+        },
+        { publish: true },
+      )
+      expect(yield* EventV2.latestSequence(db, replay.id)).toBe(replaySeq)
+      expect(seen.filter((type) => visible.includes(type))).toEqual(visible)
+      expect(global.map((event) => event.payload.type).filter((type) => visible.includes(type))).toEqual(visible)
+      yield* off
     }),
   )
 })

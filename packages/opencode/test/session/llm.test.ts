@@ -571,66 +571,6 @@ describe("session.llm.ai-sdk adapter", () => {
   })
 })
 
-describe("session.llm.ai-sdk provider watchdog", () => {
-  test("fails a pending provider read and consumes cancellation rejection", async () => {
-    let timeout: (() => void) | undefined
-    let aborted = false
-    let cancelled = false
-    let pulls = 0
-    const readStarted = Promise.withResolvers<void>()
-    const cancelStarted = Promise.withResolvers<void>()
-    const model = new MockLanguageModelV3({
-      doStream: async (options) => {
-        options.abortSignal?.addEventListener("abort", () => (aborted = true), { once: true })
-        return {
-          stream: new ReadableStream({
-            pull() {
-              // ReadableStream pulls once eagerly; the second pull proves the watchdog reader.read() is pending.
-              if (++pulls === 2) readStarted.resolve()
-            },
-            cancel() {
-              cancelled = true
-              cancelStarted.resolve()
-              return Promise.reject(new Error("provider cancel failed"))
-            },
-          }),
-        }
-      },
-    })
-    const result = streamText({
-      onError() {},
-      model: wrapLanguageModel({
-        model,
-        middleware: LLMAISDK.providerFrameWatchdog({
-          schedule(run, ms) {
-            expect(ms).toBe(60_000)
-            timeout = run
-            return () => undefined
-          },
-        }),
-      }),
-      prompt: "hello",
-    })
-    const failure = (async () => {
-      try {
-        for await (const event of result.fullStream) {
-          if (event.type === "error") return event.error
-        }
-      } catch (error) {
-        return error
-      }
-    })()
-
-    await readStarted.promise
-    timeout?.()
-
-    expect(await failure).toBeInstanceOf(ProviderError.ResponseStreamError)
-    await cancelStarted.promise
-    expect(aborted).toBe(true)
-    expect(cancelled).toBe(true)
-  })
-})
-
 type Capture = {
   url: URL
   headers: Headers

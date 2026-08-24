@@ -2,7 +2,7 @@ export * as SessionInput from "./input"
 
 import { and, asc, eq, isNull, lte } from "drizzle-orm"
 import { DateTime, Effect, Schema } from "effect"
-import { Admitted, Delivery } from "@opencode-ai/schema/session-input"
+import { Admitted, Delivery, V2Delivery } from "@opencode-ai/schema/session-input"
 import type { Database } from "../database/database"
 import type { EventV2 } from "../event"
 import { SessionEvent } from "./event"
@@ -10,10 +10,12 @@ import { SessionMessage } from "./message"
 import { Prompt } from "./prompt"
 import { SessionSchema } from "./schema"
 import { SessionInputTable, SessionMessageTable } from "./sql"
+import { SessionV1 } from "../v1/session"
 
 type DatabaseService = Database.Interface["db"]
+type DatabaseClient = DatabaseService | Parameters<Parameters<DatabaseService["transaction"]>[0]>[0]
 
-export { Admitted, Delivery }
+export { Admitted, Delivery, V2Delivery }
 
 const decodePrompt = Schema.decodeUnknownSync(Prompt)
 const encodePrompt = Schema.encodeSync(Prompt)
@@ -29,7 +31,7 @@ const fromRow = (row: typeof SessionInputTable.$inferSelect): Admitted =>
     ...(row.promoted_seq === null ? {} : { promotedSeq: row.promoted_seq }),
   })
 
-export const find = Effect.fn("SessionInput.find")(function* (db: DatabaseService, id: SessionMessage.ID) {
+export const find = Effect.fn("SessionInput.find")(function* (db: DatabaseClient, id: SessionMessage.ID) {
   const row = yield* db.select().from(SessionInputTable).where(eq(SessionInputTable.id, id)).get().pipe(Effect.orDie)
   return row === undefined ? undefined : fromRow(row)
 })
@@ -46,19 +48,24 @@ export const admit = Effect.fn("SessionInput.admit")(function* (
     readonly sessionID: SessionSchema.ID
     readonly prompt: Prompt
     readonly delivery: Delivery
+    readonly commit?: (seq: number) => Effect.Effect<void>
   },
 ) {
   const existing = yield* find(db, input.id)
   if (existing !== undefined) return existing
   const timestamp = yield* DateTime.now
   return yield* events
-    .publish(SessionEvent.PromptAdmitted, {
-      messageID: input.id,
-      sessionID: input.sessionID,
-      timestamp,
-      prompt: input.prompt,
-      delivery: input.delivery,
-    })
+    .publish(
+      SessionEvent.PromptAdmitted,
+      {
+        messageID: input.id,
+        sessionID: input.sessionID,
+        timestamp,
+        prompt: input.prompt,
+        delivery: input.delivery,
+      },
+      { commit: input.commit },
+    )
     .pipe(
       Effect.flatMap((event) =>
         event.durable === undefined
@@ -263,6 +270,109 @@ export const promoteSteers = Effect.fn("SessionInput.promoteSteers")(function* (
     .all()
     .pipe(Effect.orDie)
   return yield* publish(db, events, sessionID, rows)
+})
+
+export const projectLegacyMaterialized = Effect.fn("SessionInput.projectLegacyMaterialized")(function* (
+  db: DatabaseService,
+  input: { readonly sessionID: SessionSchema.ID; readonly id: SessionMessage.ID; readonly promotedSeq: number },
+) {
+  const updated = yield* db
+    .update(SessionInputTable)
+    .set({ promoted_seq: input.promotedSeq })
+    .where(
+      and(
+        eq(SessionInputTable.id, input.id),
+        eq(SessionInputTable.session_id, input.sessionID),
+        eq(SessionInputTable.delivery, "legacy"),
+        isNull(SessionInputTable.promoted_seq),
+      ),
+    )
+    .returning()
+    .get()
+    .pipe(Effect.orDie)
+  if (updated) return true
+  const existing = yield* find(db, input.id)
+  if (
+    existing?.sessionID === input.sessionID &&
+    existing.delivery === "legacy" &&
+    existing.promotedSeq === input.promotedSeq
+  ) {
+    return false
+  }
+  return yield* Effect.die(new LifecycleConflict({ id: input.id }))
+})
+
+export const consumeLegacy = Effect.fn("SessionInput.consumeLegacy")(function* (
+  db: DatabaseService,
+  events: EventV2.Interface,
+  input: {
+    readonly sessionID: SessionSchema.ID
+    readonly id: SessionMessage.ID
+    readonly info: SessionV1.User
+    readonly parts: ReadonlyArray<SessionV1.Part>
+    readonly commit?: (seq: number) => Effect.Effect<void>
+  },
+) {
+  const existing = yield* find(db, input.id)
+  if (existing?.sessionID !== input.sessionID || existing.delivery !== "legacy")
+    return yield* Effect.die(new LifecycleConflict({ id: input.id }))
+  if (existing.promotedSeq !== undefined) return false
+  if (
+    input.info.id !== SessionV1.MessageID.make(input.id) ||
+    input.info.sessionID !== input.sessionID ||
+    input.parts.some((part) => part.messageID !== input.info.id || part.sessionID !== input.sessionID)
+  ) {
+    return yield* Effect.die(new LifecycleConflict({ id: input.id }))
+  }
+  return yield* events
+    .publish(
+      SessionV1.Event.LegacyPromptMaterialized,
+      {
+        sessionID: input.sessionID,
+        inputID: input.info.id,
+        info: input.info,
+        parts: [...input.parts],
+      },
+      { commit: input.commit },
+    )
+    .pipe(
+      Effect.as(true),
+      Effect.catchDefect((defect) =>
+        defect instanceof LifecycleConflict
+          ? find(db, input.id).pipe(
+              Effect.flatMap((stored) =>
+                stored?.sessionID === input.sessionID &&
+                stored.delivery === "legacy" &&
+                stored.promotedSeq !== undefined
+                  ? Effect.succeed(false)
+                  : Effect.die(defect),
+              ),
+            )
+          : Effect.die(defect),
+      ),
+    )
+})
+
+export const promoteOne = Effect.fn("SessionInput.promoteOne")(function* (
+  db: DatabaseService,
+  events: EventV2.Interface,
+  input: { readonly sessionID: SessionSchema.ID; readonly id: SessionMessage.ID },
+) {
+  const row = yield* db
+    .select()
+    .from(SessionInputTable)
+    .where(
+      and(
+        eq(SessionInputTable.id, input.id),
+        eq(SessionInputTable.session_id, input.sessionID),
+        isNull(SessionInputTable.promoted_seq),
+      ),
+    )
+    .get()
+    .pipe(Effect.orDie)
+  if (row === undefined || (row.delivery !== "steer" && row.delivery !== "queue")) return false
+  yield* publish(db, events, input.sessionID, [row])
+  return true
 })
 
 export const promoteNextQueued = Effect.fn("SessionInput.promoteNextQueued")(function* (

@@ -191,6 +191,8 @@ export const BackgroundTaskExecutionTable = sqliteTable(
     parent_variant: text(),
     lease_expires_at: integer().notNull(),
     followup_claimed_at: integer(),
+    followup_message_id: text().$type<MessageID>(),
+    followup_hash: text(),
     cancel_requested_at: integer(),
     output: text(),
     error: text(),

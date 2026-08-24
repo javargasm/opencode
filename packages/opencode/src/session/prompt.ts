@@ -59,6 +59,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { createHash } from "node:crypto"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -105,6 +106,7 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly materializeLegacy: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -152,8 +154,12 @@ const layer = Layer.effect(
         interrupt: (sessionID: SessionID) => state.interrupt(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        materializeLegacy: (input: PromptInput) => materializeLegacy(input).pipe(Effect.catch(Effect.die)),
         wake: (sessionID: SessionID) =>
           state.wake(sessionID, lastAssistant(sessionID), runLoop(sessionID)).pipe(Effect.asVoid),
+        scheduleWake: (sessionID: SessionID) =>
+          state.scheduleWake(sessionID, lastAssistant(sessionID), runLoop(sessionID)),
+        awaitWake: (sessionID: SessionID) => state.awaitWake(sessionID),
       } satisfies TaskPromptOps
     })
 
@@ -652,7 +658,10 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (
+      input: PromptInput,
+      persist = true,
+    ) {
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -689,31 +698,38 @@ const layer = Layer.effect(
         format: input.format,
       }
 
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      if (
-        current.agent !== info.agent ||
-        current.model?.providerID !== info.model.providerID ||
-        current.model?.id !== info.model.modelID ||
-        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
-      ) {
-        yield* sessions.setAgentModel({
-          sessionID: input.sessionID,
-          agent: info.agent,
-          model: {
-            id: info.model.modelID,
-            providerID: info.model.providerID,
-            variant: info.model.variant ?? "default",
-          },
-          time: info.time.created,
-        })
+      if (persist) {
+        const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+        if (
+          current.agent !== info.agent ||
+          current.model?.providerID !== info.model.providerID ||
+          current.model?.id !== info.model.modelID ||
+          (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
+        ) {
+          yield* sessions.setAgentModel({
+            sessionID: input.sessionID,
+            agent: info.agent,
+            model: {
+              id: info.model.modelID,
+              providerID: info.model.providerID,
+              variant: info.model.variant ?? "default",
+            },
+            time: info.time.created,
+          })
+        }
       }
 
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
 
       type Draft<T> = T extends SessionV1.Part ? Omit<T, "id"> & { id?: string } : never
-      const assign = (part: Draft<SessionV1.Part>): SessionV1.Part => ({
+      const assign = (part: Draft<SessionV1.Part>, index: number): SessionV1.Part => ({
         ...part,
-        id: part.id ? PartID.make(part.id) : PartID.ascending(),
+        id:
+          part.id
+            ? PartID.make(part.id)
+            : input.messageID
+              ? PartID.ascending(`prt_${createHash("sha256").update(`generated:${input.messageID}:${index}`).digest("hex")}`)
+              : PartID.ascending(),
       })
 
       const resolvePart: (part: PromptInput["parts"][number]) => Effect.Effect<Draft<SessionV1.Part>[]> = Effect.fn(
@@ -1063,11 +1079,17 @@ const layer = Layer.effect(
         })
       }
 
-      yield* sessions.updateMessage(info)
-      for (const part of parts) yield* sessions.updatePart(part)
+      if (persist) {
+        yield* sessions.updateMessage(info)
+        for (const part of parts) yield* sessions.updatePart(part)
+      }
 
       return { info, parts }
     }, Effect.scoped)
+
+    const materializeLegacy: Interface["materializeLegacy"] = Effect.fn("SessionPrompt.materializeLegacy")((input) =>
+      createUserMessage(input, false),
+    )
 
     const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
       "SessionPrompt.prompt",
@@ -1364,6 +1386,8 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
+      const resumed = yield* state.resumeWake(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      if (resumed) return resumed
       return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
     })
 
@@ -1527,6 +1551,7 @@ const layer = Layer.effect(
     return Service.of({
       cancel,
       prompt,
+      materializeLegacy,
       loop,
       shell,
       command,

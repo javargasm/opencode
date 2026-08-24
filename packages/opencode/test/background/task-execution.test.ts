@@ -4,10 +4,12 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
-import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionRunLeaseTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { eq } from "drizzle-orm"
 import { Context, Effect, Fiber, Latch, Layer, Logger } from "effect"
 import { BackgroundTaskExecution } from "@/background/task-execution"
 import { MessageID, SessionID } from "@/session/schema"
+import { SessionRunLease } from "@/session/run-lease"
 import path from "path"
 import { tmpdir } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -69,18 +71,86 @@ describe("BackgroundTaskExecution", () => {
     }),
   )
 
+  it.live("cancelling a durable execution completes a reserved session wake", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const ids = yield* seed()
+      const owner = yield* BackgroundTaskExecution.make({ ownerID: "runtime-a" })
+      const remote = yield* BackgroundTaskExecution.make({ ownerID: "runtime-b" })
+      yield* owner.claim({ ...claim(ids, "generation-1"), wakeRequired: true })
+
+      expect(yield* SessionRunLease.requestWake(db, ids.child)).toBe(1)
+      yield* remote.requestCancel(ids.child)
+
+      const lease = yield* db
+        .select()
+        .from(SessionRunLeaseTable)
+        .where(eq(SessionRunLeaseTable.session_id, ids.child))
+        .get()
+        .pipe(Effect.orDie)
+      expect(lease).toMatchObject({ wake_requested_seq: 1, wake_completed_seq: 1 })
+      expect(yield* owner.heartbeat({ sessionID: ids.child, generation: "generation-1" })).toBe("cancelled")
+    }),
+  )
+
   it.live("allows one durable follow-up per active background generation", () =>
     Effect.gen(function* () {
       const ids = yield* seed()
       const owner = yield* BackgroundTaskExecution.make({ ownerID: "runtime-a" })
       const remote = yield* BackgroundTaskExecution.make({ ownerID: "runtime-b" })
+      const inputID = MessageID.ascending()
       yield* owner.claim({ ...claim(ids, "generation-1"), parentVariant: "xhigh" })
 
-      expect(yield* owner.claimFollowup({ sessionID: ids.child, generation: "generation-1" })).toBe("claimed")
-      expect(yield* remote.claimFollowup({ sessionID: ids.child, generation: "generation-1" })).toBe("already_claimed")
+      expect(
+        yield* remote.claimFollowup({
+          sessionID: ids.child,
+          parentSessionID: SessionID.make("ses_other_parent"),
+          generation: "generation-1",
+          messageID: inputID,
+          hash: "first",
+        }),
+      ).toBe("inactive")
+      expect(
+        yield* owner.claimFollowup({
+          sessionID: ids.child,
+          parentSessionID: ids.parent,
+          generation: "generation-1",
+          messageID: inputID,
+          hash: "first",
+        }),
+      ).toBe("claimed")
+      expect(
+        yield* remote.claimFollowup({
+          sessionID: ids.child,
+          parentSessionID: ids.parent,
+          generation: "generation-1",
+          messageID: inputID,
+          hash: "first",
+        }),
+      ).toBe("replayed")
+      expect(
+        yield* remote.claimFollowup({
+          sessionID: ids.child,
+          parentSessionID: ids.parent,
+          generation: "generation-1",
+          messageID: inputID,
+          hash: "changed",
+        }),
+      ).toBe("conflict")
+      expect(
+        yield* remote.claimFollowup({
+          sessionID: ids.child,
+          parentSessionID: ids.parent,
+          generation: "generation-1",
+          messageID: MessageID.ascending(),
+          hash: "second",
+        }),
+      ).toBe("already_claimed")
       expect(yield* owner.get(ids.child)).toMatchObject({
         parentVariant: "xhigh",
         followupClaimedAt: expect.any(Number),
+        followupMessageID: inputID,
+        followupHash: "first",
       })
 
       yield* owner.settle({
@@ -89,7 +159,16 @@ describe("BackgroundTaskExecution", () => {
         state: "completed",
         output: "done",
       })
-      expect(yield* owner.claimFollowup({ sessionID: ids.child, generation: "generation-1" })).toBe("inactive")
+      expect(
+        yield* owner.claimFollowup({
+          sessionID: ids.child,
+          parentSessionID: ids.parent,
+          generation: "generation-1",
+          messageID: inputID,
+          hash: "first",
+        }),
+      ).toBe("inactive")
+      expect(yield* owner.get(ids.child)).toMatchObject({ followupMessageID: inputID, followupHash: "first" })
       const delivery = yield* owner.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
       if (!delivery) throw new Error("terminal delivery was not claimed")
       yield* owner.completeDelivery({
@@ -98,8 +177,46 @@ describe("BackgroundTaskExecution", () => {
         token: delivery.token,
       })
       expect(yield* owner.claim(claim(ids, "generation-2"))).toMatchObject({ status: "claimed" })
-      expect(yield* owner.claimFollowup({ sessionID: ids.child, generation: "generation-2" })).toBe("claimed")
+      expect(
+        yield* owner.claimFollowup({
+          sessionID: ids.child,
+          parentSessionID: ids.parent,
+          generation: "generation-2",
+          messageID: MessageID.ascending(),
+          hash: "next",
+        }),
+      ).toBe("claimed")
     }),
+  )
+
+  it.live("retains a durable follow-up when its active generation errors or is cancelled", () =>
+    Effect.forEach(["error", "cancelled"] as const, (state) =>
+      Effect.gen(function* () {
+        const ids = yield* seed()
+        const owner = yield* BackgroundTaskExecution.make({ ownerID: `runtime-${state}` })
+        const inputID = MessageID.ascending()
+        yield* owner.claim(claim(ids, `generation-${state}`))
+        yield* owner.claimFollowup({
+          sessionID: ids.child,
+          parentSessionID: ids.parent,
+          generation: `generation-${state}`,
+          messageID: inputID,
+          hash: state,
+        })
+        yield* owner.settle({
+          sessionID: ids.child,
+          generation: `generation-${state}`,
+          state,
+          ...(state === "error" ? { error: "failed" } : {}),
+        })
+
+        expect(yield* owner.get(ids.child)).toMatchObject({
+          state,
+          followupMessageID: inputID,
+          followupHash: state,
+        })
+      }),
+    ).pipe(Effect.asVoid),
   )
 
   it.live("reconciles an expired lease when the former owner tries to settle", () =>

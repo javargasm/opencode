@@ -601,6 +601,16 @@ const events = {
       info: Info,
     },
   }),
+  LegacyPromptMaterialized: define({
+    type: "session.legacy_prompt.materialized",
+    ...options,
+    schema: {
+      sessionID: SessionID,
+      inputID: MessageID,
+      info: User,
+      parts: Schema.Array(Part),
+    },
+  }),
   MessageRemoved: define({
     type: "message.removed",
     ...options,
@@ -666,6 +676,7 @@ export const Event = {
     events.Updated,
     events.Deleted,
     events.MessageUpdated,
+    events.LegacyPromptMaterialized,
     events.MessageRemoved,
     events.PartUpdated,
     events.PartRemoved,

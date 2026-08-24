@@ -136,6 +136,8 @@ export default {
           \`parent_variant\` text,
           \`lease_expires_at\` integer NOT NULL,
           \`followup_claimed_at\` integer,
+          \`followup_message_id\` text,
+          \`followup_hash\` text,
           \`cancel_requested_at\` integer,
           \`output\` text,
           \`error\` text,

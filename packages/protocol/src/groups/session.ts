@@ -224,7 +224,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
         payload: Schema.Struct({
           id: SessionMessage.ID.pipe(Schema.optional),
           prompt: PromptInput.Prompt,
-          delivery: SessionInput.Delivery.pipe(Schema.optional),
+          delivery: SessionInput.V2Delivery.pipe(Schema.optional),
           resume: Schema.Boolean.pipe(Schema.optional),
         }),
         success: Schema.Struct({ data: SessionInput.Admitted }),

@@ -24,6 +24,53 @@ export type Claim = {
   targetRevision: number
 }
 
+type DatabaseService = Database.Interface["db"]
+type DatabaseClient = DatabaseService | Parameters<Parameters<DatabaseService["transaction"]>[0]>[0]
+
+export const requestWake = Effect.fn("SessionRunLease.requestWake")(function* (
+  db: DatabaseClient,
+  sessionID: SessionID,
+  time = Date.now(),
+) {
+  const row = yield* db
+    .insert(SessionRunLeaseTable)
+    .values({
+      session_id: sessionID,
+      wake_requested_seq: 1,
+      wake_completed_seq: 0,
+      time_created: time,
+      time_updated: time,
+    })
+    .onConflictDoUpdate({
+      target: SessionRunLeaseTable.session_id,
+      set: {
+        wake_requested_seq: sql`${SessionRunLeaseTable.wake_requested_seq} + 1`,
+        time_updated: time,
+      },
+    })
+    .returning({ revision: SessionRunLeaseTable.wake_requested_seq })
+    .get()
+    .pipe(Effect.orDie)
+  return row.revision
+})
+
+export const requestCancel = Effect.fn("SessionRunLease.requestCancel")(function* (
+  db: DatabaseClient,
+  sessionID: SessionID,
+  time = Date.now(),
+) {
+  yield* db
+    .update(SessionRunLeaseTable)
+    .set({
+      cancel_requested_at: time,
+      wake_completed_seq: sql`${SessionRunLeaseTable.wake_requested_seq}`,
+      time_updated: time,
+    })
+    .where(eq(SessionRunLeaseTable.session_id, sessionID))
+    .run()
+    .pipe(Effect.orDie)
+})
+
 export interface Interface {
   readonly leaseMillis: number
   readonly requestWake: (sessionID: SessionID) => Effect.Effect<number>
@@ -85,29 +132,7 @@ export function make(options?: {
       return fromRow(yield* getRow(sessionID))
     })
 
-    const requestWake: Interface["requestWake"] = Effect.fn("SessionRunLease.requestWake")(function* (sessionID) {
-      const time = now()
-      const row = yield* db
-        .insert(SessionRunLeaseTable)
-        .values({
-          session_id: sessionID,
-          wake_requested_seq: 1,
-          wake_completed_seq: 0,
-          time_created: time,
-          time_updated: time,
-        })
-        .onConflictDoUpdate({
-          target: SessionRunLeaseTable.session_id,
-          set: {
-            wake_requested_seq: sql`${SessionRunLeaseTable.wake_requested_seq} + 1`,
-            time_updated: time,
-          },
-        })
-        .returning({ revision: SessionRunLeaseTable.wake_requested_seq })
-        .get()
-        .pipe(Effect.orDie)
-      return row.revision
-    })
+    const request: Interface["requestWake"] = (sessionID) => requestWake(db, sessionID, now())
 
     const acquire = Effect.fn("SessionRunLease.acquire")(function* (sessionID: SessionID, pendingOnly: boolean) {
       yield* ensureRow(sessionID)
@@ -259,19 +284,7 @@ export function make(options?: {
       (sessionID) => scoped(claimExclusive, sessionID),
     )
 
-    const requestCancel: Interface["requestCancel"] = Effect.fn("SessionRunLease.requestCancel")(function* (sessionID) {
-      const time = now()
-      yield* db
-        .update(SessionRunLeaseTable)
-        .set({
-          cancel_requested_at: time,
-          wake_completed_seq: sql`${SessionRunLeaseTable.wake_requested_seq}`,
-          time_updated: time,
-        })
-        .where(eq(SessionRunLeaseTable.session_id, sessionID))
-        .run()
-        .pipe(Effect.orDie)
-    })
+    const cancel: Interface["requestCancel"] = (sessionID) => requestCancel(db, sessionID, now())
 
     const isBusy: Interface["isBusy"] = Effect.fn("SessionRunLease.isBusy")(function* (sessionID) {
       const time = now()
@@ -315,7 +328,7 @@ export function make(options?: {
 
     return Service.of({
       leaseMillis,
-      requestWake,
+      requestWake: request,
       claim,
       claimExclusive,
       claimScoped,
@@ -323,7 +336,7 @@ export function make(options?: {
       heartbeat,
       complete,
       release,
-      requestCancel,
+      requestCancel: cancel,
       get,
       list,
       isBusy,

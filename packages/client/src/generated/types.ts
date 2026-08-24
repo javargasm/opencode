@@ -480,7 +480,7 @@ export type SessionsPromptOutput = {
         readonly source?: { readonly start: number; readonly end: number; readonly text: string }
       }>
     }
-    readonly delivery: "steer" | "queue"
+    readonly delivery: "steer" | "queue" | "legacy"
     readonly timeCreated: number
     readonly promotedSeq?: number
   }
@@ -751,7 +751,7 @@ export type SessionsHistoryOutput = {
               readonly source?: { readonly start: number; readonly end: number; readonly text: string }
             }>
           }
-          readonly delivery: "steer" | "queue"
+          readonly delivery: "steer" | "queue" | "legacy"
         }
       }
     | {
@@ -778,7 +778,7 @@ export type SessionsHistoryOutput = {
               readonly source?: { readonly start: number; readonly end: number; readonly text: string }
             }>
           }
-          readonly delivery: "steer" | "queue"
+          readonly delivery: "steer" | "queue" | "legacy"
         }
       }
     | {
@@ -1209,7 +1209,7 @@ export type SessionsEventsOutput =
             readonly source?: { readonly start: number; readonly end: number; readonly text: string }
           }>
         }
-        readonly delivery: "steer" | "queue"
+        readonly delivery: "steer" | "queue" | "legacy"
       }
     }
   | {
@@ -1236,7 +1236,7 @@ export type SessionsEventsOutput =
             readonly source?: { readonly start: number; readonly end: number; readonly text: string }
           }>
         }
-        readonly delivery: "steer" | "queue"
+        readonly delivery: "steer" | "queue" | "legacy"
       }
     }
   | {
