@@ -66,16 +66,43 @@ function applyOnlyUnlocked(db: Database, input: Migration[]) {
           ) {
             return current
           }
-          yield* tx.run(sql`
-            INSERT OR IGNORE INTO ${sql.identifier("migration")} (id, time_completed)
-            SELECT name, ${Date.now()}
-            FROM ${sql.identifier("__drizzle_migrations")}
-            WHERE name IS NOT NULL
-          `)
-          current = new Set(
+          const named = (yield* tx.all<{ name: string }>(
+            sql`SELECT name FROM pragma_table_info('__drizzle_migrations')`,
+          )).some((column) => column.name === "name")
+
+          if (named) {
+            yield* tx.run(sql`
+              INSERT OR IGNORE INTO ${sql.identifier("migration")} (id, time_completed)
+              SELECT name, ${Date.now()}
+              FROM ${sql.identifier("__drizzle_migrations")}
+              WHERE name IS NOT NULL
+            `)
+          }
+
+          if (!named) {
+            const entries = yield* tx.all<{ created_at: number; prefix: string | null }>(sql`
+              SELECT created_at, strftime('%Y%m%d%H%M%S', created_at / 1000, 'unixepoch') AS prefix
+              FROM ${sql.identifier("__drizzle_migrations")}
+              WHERE created_at IS NOT NULL
+            `)
+
+            for (const entry of entries) {
+              const migration = input.find((item) => item.id.startsWith(`${entry.prefix}_`))
+              if (!migration) {
+                return yield* Effect.die(
+                  new Error(`Legacy migration timestamp ${entry.created_at} does not match any known migration`),
+                )
+              }
+              yield* tx.run(sql`
+                INSERT OR IGNORE INTO ${sql.identifier("migration")} (id, time_completed)
+                VALUES (${migration.id}, ${Date.now()})
+              `)
+            }
+          }
+
+          return new Set(
             (yield* tx.all<{ id: string }>(sql`SELECT id FROM ${sql.identifier("migration")}`)).map((row) => row.id),
           )
-          return current
         }),
       { behavior: "immediate" },
     )
