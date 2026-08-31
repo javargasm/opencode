@@ -1,7 +1,7 @@
-import type { RGBA } from "@opentui/core"
+import type { ColorInput, RGBA } from "@opentui/core"
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 import { sessionActivityLabel, type SessionActivity } from "../util/session"
-import { createColors, createFrames } from "../ui/spinner"
+import { createColors, createFrameCount } from "../ui/spinner"
 
 export function ActiveDescendantLabel(props: {
   activity: SessionActivity
@@ -25,13 +25,21 @@ export function ActiveDescendantLabel(props: {
 }
 
 export function AnimatedActivityLabel(props: { label: string; color: RGBA; mutedColor: RGBA; animated: boolean }) {
+  return (
+    <text fg={props.mutedColor}>
+      <AnimatedText label={props.label} color={props.color} animated={props.animated} />
+    </text>
+  )
+}
+
+export function AnimatedText(props: { label: string; color: ColorInput; animated: boolean }) {
   const characters = createMemo(() => Array.from(props.label))
   const options = createMemo(() => ({
     color: props.color,
     inactiveFactor: 0.6,
     minAlpha: 0.3,
   }))
-  const frames = createMemo(() => createFrames({ ...options(), width: characters().length }))
+  const totalFrames = createMemo(() => createFrameCount({ width: characters().length }))
   const colors = createMemo(() => createColors(options()))
   const [frame, setFrame] = createSignal(0)
 
@@ -41,19 +49,18 @@ export function AnimatedActivityLabel(props: { label: string; color: RGBA; muted
       return
     }
 
-    const timer = setInterval(() => setFrame((value) => (value + 1) % frames().length), 40)
+    const timer = setInterval(() => setFrame((value) => (value + 1) % totalFrames()), 40)
+    timer.unref?.()
     onCleanup(() => clearInterval(timer))
   })
 
   return (
-    <text fg={props.mutedColor}>
-      <Show when={props.animated} fallback={props.label}>
-        <For each={characters()}>
-          {(character, index) => (
-            <span style={{ fg: colors()(frame(), index(), frames().length, characters().length) }}>{character}</span>
-          )}
-        </For>
-      </Show>
-    </text>
+    <Show when={props.animated} fallback={props.label}>
+      <For each={characters()}>
+        {(character, index) => (
+          <span style={{ fg: colors()(frame(), index(), totalFrames(), characters().length) }}>{character}</span>
+        )}
+      </For>
+    </Show>
   )
 }

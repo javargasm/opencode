@@ -19,6 +19,7 @@ import type { Event, GlobalEvent, OpencodeClient } from "@opencode-ai/sdk/v2"
 import { Context, Deferred, Effect, Exit, Layer, Scope, Semaphore, Stream } from "effect"
 import { makeRuntime } from "@/effect/run-service"
 import {
+  activeCommandStatus,
   blockerStatus,
   bootstrapSessionData,
   createSessionData,
@@ -316,11 +317,13 @@ function pickView(data: SessionData, subagent: SubagentData, order: Map<string, 
 
 function composeFooter(input: {
   patch?: FooterPatch
+  activeStatus: string
   subagent?: FooterSubagentState
   current: FooterView
   previous: FooterView
 }) {
   let footer: FooterOutput | undefined
+  const patch = input.activeStatus ? { ...input.patch, status: input.activeStatus } : input.patch
 
   if (input.subagent) {
     footer = {
@@ -340,17 +343,17 @@ function composeFooter(input: {
     footer = {
       ...footer,
       patch: {
-        ...input.patch,
-        status: blockerStatus(input.current),
+        ...patch,
+        status: input.activeStatus || blockerStatus(input.current),
       },
     }
     return footer
   }
 
-  if (input.patch) {
+  if (patch) {
     footer = {
       ...footer,
-      patch: input.patch,
+      patch,
     }
     return footer
   }
@@ -553,8 +556,13 @@ function createLayer(input: StreamInput, resize: ResizeSignal) {
 
         const syncFooter = (commits: StreamCommit[], patch?: FooterPatch, nextSubagent?: FooterSubagentState) => {
           const current = pickView(state.data, state.subagent, state.blockers)
+          const owner =
+            current.type === "prompt" || current.request.sessionID === input.sessionID
+              ? state.data
+              : state.subagent.details.get(current.request.sessionID)?.data
           const footer = composeFooter({
             patch,
+            activeStatus: owner ? activeCommandStatus(owner) : "",
             subagent: nextSubagent,
             current,
             previous: state.footerView,
@@ -869,7 +877,7 @@ function createLayer(input: StreamInput, resize: ResizeSignal) {
           }
 
           if (replay) {
-            const activeCommitIDs = new Set([...state.data.part.keys(), ...state.data.tools])
+            const activeCommitIDs = new Set([...state.data.part.keys(), ...state.data.tools.keys()])
             for (const commit of replay.commits) {
               input.trace?.write("ui.commit", commit)
               input.footer.append(commit)
@@ -988,8 +996,9 @@ function createLayer(input: StreamInput, resize: ResizeSignal) {
 
         const flush = (type: "turn.abort" | "turn.cancel") => {
           const commits: StreamCommit[] = []
+          const active = state.data.tools.size > 0
           flushInterrupted(state.data, commits)
-          syncFooter(commits)
+          syncFooter(commits, active ? { status: "" } : undefined)
           input.trace?.write(type, {
             sessionID: input.sessionID,
           })

@@ -11,6 +11,8 @@
 import { useTerminalDimensions } from "@opentui/solid"
 import { For, Match, Show, Switch, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 import { registerOpencodeSpinner } from "@opencode-ai/tui/component/register-spinner"
+import { AnimatedText } from "@opencode-ai/tui/component/animated-activity-label"
+import { SPINNER_FRAMES } from "@opencode-ai/tui/component/spinner"
 import { createColors, createFrames } from "@opencode-ai/tui/ui/spinner"
 import {
   RUN_SUBAGENT_PANEL_ROWS,
@@ -87,6 +89,7 @@ type RunFooterViewProps = {
   subagent?: () => FooterSubagentState
   queuedPrompts?: () => FooterQueuedPrompt[]
   theme: () => RunTheme
+  animationsEnabled: boolean
   diffStyle?: RunDiffStyle
   tuiConfig: RunTuiConfig
   backgroundSubagents: boolean
@@ -142,16 +145,10 @@ export function RunFooterView(props: RunFooterViewProps) {
   const skilling = createMemo(() => active().type === "prompt" && route().type === "skill")
   const modeling = createMemo(() => active().type === "prompt" && route().type === "model")
   const varianting = createMemo(() => active().type === "prompt" && route().type === "variant")
+  const blocker = createMemo(() => active().type === "permission" || active().type === "question")
   const panel = createMemo(
     () =>
-      active().type === "permission" ||
-      active().type === "question" ||
-      selectingQueued() ||
-      selectingSubagent() ||
-      commanding() ||
-      skilling() ||
-      modeling() ||
-      varianting(),
+      blocker() || selectingQueued() || selectingSubagent() || commanding() || skilling() || modeling() || varianting(),
   )
   const selected = createMemo(() => {
     const current = route()
@@ -274,10 +271,13 @@ export function RunFooterView(props: RunFooterViewProps) {
     const view = active()
     return view.type === "permission" ? view : undefined
   })
+  const permissionOwner = createMemo(() => tabs().find((item) => item.sessionID === permission()?.request.sessionID))
   const question = createMemo<Extract<FooterView, { type: "question" }> | undefined>(() => {
     const view = active()
     return view.type === "question" ? view : undefined
   })
+  const questionOwner = createMemo(() => tabs().find((item) => item.sessionID === question()?.request.sessionID))
+  const questionActive = createMemo(() => (questionOwner()?.status ?? "running") === "running")
   const promptView = createMemo(() => {
     if (active().type !== "prompt") {
       return active().type
@@ -383,6 +383,9 @@ export function RunFooterView(props: RunFooterViewProps) {
   const shell = createMemo(() => prompt() && composer.shell())
   const menu = createMemo(() => prompt() && composer.visible())
   const stateStatus = createMemo(() => props.state().status.trim())
+  const runningCommand = createMemo(() =>
+    busy() && !exiting() && stateStatus().startsWith("$ ") ? stateStatus() : undefined,
+  )
   const modeLabel = createMemo(() => {
     if (exiting()) {
       return "EXIT"
@@ -666,6 +669,30 @@ export function RunFooterView(props: RunFooterViewProps) {
                     gap={0}
                   >
                     <box width="100%" flexGrow={1} flexShrink={1} flexDirection="column">
+                      <Show when={active().type === "question" && runningCommand()}>
+                        {(command) => (
+                          <box
+                            height={1}
+                            paddingLeft={2}
+                            flexDirection="row"
+                            gap={questionActive() ? 1 : 0}
+                            flexShrink={0}
+                          >
+                            <Show when={questionActive()}>
+                              <Show when={props.animationsEnabled} fallback={<text fg={theme().highlight}>⋯</text>}>
+                                <spinner frames={SPINNER_FRAMES} interval={80} color={theme().highlight} />
+                              </Show>
+                            </Show>
+                            <text fg={theme().text} wrapMode="none" truncate flexShrink={1}>
+                              <AnimatedText
+                                label={command()}
+                                color={theme().highlight}
+                                animated={props.animationsEnabled && questionActive()}
+                              />
+                            </text>
+                          </box>
+                        )}
+                      </Show>
                       <Switch>
                         <Match when={active().type === "prompt" && route().type === "composer"}>
                           <RunPromptBody
@@ -782,6 +809,9 @@ export function RunFooterView(props: RunFooterViewProps) {
                             request={permission()!.request}
                             theme={theme()}
                             block={block()}
+                            activeCommand={runningCommand()}
+                            active={(permissionOwner()?.status ?? "running") === "running"}
+                            animationsEnabled={props.animationsEnabled}
                             diffStyle={props.diffStyle}
                             onReply={props.onPermissionReply}
                           />
@@ -839,20 +869,49 @@ export function RunFooterView(props: RunFooterViewProps) {
                   paddingRight={1}
                   backgroundColor="transparent"
                 >
-                  <Show when={busy() && !exiting()}>
+                  <Show when={busy() && !exiting() && !runningCommand()}>
                     <box flexShrink={0}>
                       <spinner color={spin().color} frames={spin().frames} interval={40} />
                     </box>
                   </Show>
 
-                  <text fg={statusColor()} wrapMode="none" truncate flexGrow={1} flexShrink={1}>
-                    <Show when={busy() && !exiting()} fallback={statusText()}>
-                      <Show when={interruptLabel()}>
-                        {(label) => <span style={{ fg: armed() ? statusColor() : theme().muted }}>{label()} </span>}
-                      </Show>
-                      {statusText()}
-                    </Show>
-                  </text>
+                  <Show
+                    when={runningCommand()}
+                    fallback={
+                      <text fg={statusColor()} wrapMode="none" truncate flexGrow={1} flexShrink={1}>
+                        <Show when={busy() && !exiting()} fallback={statusText()}>
+                          <Show when={interruptLabel()}>
+                            {(label) => <span style={{ fg: armed() ? statusColor() : theme().muted }}>{label()} </span>}
+                          </Show>
+                          {statusText()}
+                        </Show>
+                      </text>
+                    }
+                  >
+                    {(command) => (
+                      <>
+                        <Show when={interruptLabel()}>
+                          {(label) => (
+                            <text fg={armed() ? statusColor() : theme().muted} wrapMode="none" flexShrink={0}>
+                              {label()}
+                            </text>
+                          )}
+                        </Show>
+                        <box flexShrink={0}>
+                          <Show when={props.animationsEnabled} fallback={<text fg={theme().highlight}>⋯</text>}>
+                            <spinner frames={SPINNER_FRAMES} interval={80} color={theme().highlight} />
+                          </Show>
+                        </box>
+                        <text fg={statusColor()} wrapMode="none" truncate flexGrow={1} flexShrink={1}>
+                          <AnimatedText
+                            label={command()}
+                            color={theme().highlight}
+                            animated={props.animationsEnabled}
+                          />
+                        </text>
+                      </>
+                    )}
+                  </Show>
                 </box>
 
                 <Show when={activityMeta().length > 0}>
@@ -934,6 +993,7 @@ export function RunFooterView(props: RunFooterViewProps) {
             total={() => tabs().length}
             detail={detail}
             width={width}
+            animationsEnabled={props.animationsEnabled}
             diffStyle={props.diffStyle}
             onCycle={cycleTab}
             onClose={closeTab}

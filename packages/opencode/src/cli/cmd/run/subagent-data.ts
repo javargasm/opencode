@@ -3,6 +3,7 @@ import * as Locale from "@/util/locale"
 import {
   bootstrapSessionData,
   createSessionData,
+  flushInterrupted,
   formatError,
   reduceSessionData,
   type SessionData,
@@ -345,7 +346,13 @@ function syncTaskTab(data: SubagentData, part: ToolPart, children?: Set<string>)
   }
 
   const next = taskTab(part, sessionID)
-  if (sameSubagentTab(data.tabs.get(sessionID), next)) {
+  const current = data.tabs.get(sessionID)
+  if (current && current.status !== "running" && next.status === "running" && current.partID === next.partID) {
+    ensureDetail(data, sessionID)
+    return false
+  }
+
+  if (sameSubagentTab(current, next)) {
     ensureDetail(data, sessionID)
     return false
   }
@@ -431,6 +438,40 @@ function appendCommits(detail: DetailState, commits: StreamCommit[]) {
   return changed
 }
 
+function settleCommand(detail: DetailState, event: Event) {
+  if (event.type !== "message.part.updated" || event.properties.part.type !== "tool") {
+    return false
+  }
+
+  const part = event.properties.part
+  if (part.tool !== "bash" || (part.state.status !== "completed" && part.state.status !== "error")) {
+    return false
+  }
+
+  const index = detail.frames.findIndex(
+    (item) => item.commit.partID === part.id && item.commit.phase === "start" && item.commit.tool === "bash",
+  )
+  if (index === -1) {
+    return false
+  }
+
+  const current = detail.frames[index]!
+  const next = {
+    ...current.commit,
+    part: compactToolPart(part),
+    toolState: part.state.status === "error" ? ("error" as const) : ("completed" as const),
+  }
+  if (sameCommit(current.commit, next)) {
+    return false
+  }
+
+  detail.frames[index] = {
+    ...current,
+    commit: next,
+  }
+  return true
+}
+
 function ensureBlockerTab(
   data: SubagentData,
   sessionID: string,
@@ -482,6 +523,11 @@ function cancelSubagentTab(data: SubagentData, sessionID: string) {
     return false
   }
 
+  const detail = ensureDetail(data, sessionID)
+  const commits: StreamCommit[] = []
+  flushInterrupted(detail.data, commits)
+  appendCommits(detail, commits)
+
   const next = {
     ...current,
     status: "cancelled" as const,
@@ -530,7 +576,7 @@ function compactDetail(detail: DetailState) {
   })
   const activePartIDs = new Set(detail.data.part.keys())
   const framePartIDs = new Set(detail.frames.flatMap((item) => (item.commit.partID ? [item.commit.partID] : [])))
-  const partIDs = new Set([...activePartIDs, ...framePartIDs, ...detail.data.tools])
+  const partIDs = new Set([...activePartIDs, ...framePartIDs, ...detail.data.tools.keys()])
   const messageIDs = new Set([
     ...[...activePartIDs]
       .map((partID) => detail.data.msg.get(partID))
@@ -542,7 +588,7 @@ function compactDetail(detail: DetailState) {
   next.permissions = detail.data.permissions
   next.questions = detail.data.questions
   next.ids = compactIDs(detail)
-  next.tools = new Set([...detail.data.tools].filter((item) => partIDs.has(item)))
+  next.tools = new Map([...detail.data.tools].filter(([partID]) => partIDs.has(partID)))
   next.call = compactCallMap(detail)
   next.role = copyMap(detail.data.role, messageIDs)
   next.msg = copyMap(detail.data.msg, activePartIDs)
@@ -569,9 +615,10 @@ function applyChildEvent(input: {
     limits: input.limits,
   })
   const changed = appendCommits(input.detail, out.commits)
+  const settled = settleCommand(input.detail, input.event)
   compactDetail(input.detail)
 
-  return changed || queueChanged(input.detail.data, before)
+  return changed || settled || queueChanged(input.detail.data, before)
 }
 
 function bootstrapChildEvent(input: {
@@ -588,7 +635,9 @@ function bootstrapChildEvent(input: {
     limits: input.limits,
   })
 
-  return appendCommits(input.detail, out.commits)
+  const changed = appendCommits(input.detail, out.commits)
+  const settled = settleCommand(input.detail, input.event)
+  return changed || settled
 }
 
 function bootstrapChildMessages(input: {

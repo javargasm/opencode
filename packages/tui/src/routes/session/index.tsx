@@ -24,6 +24,7 @@ import { useEvent } from "../../context/event"
 import { SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { Spinner } from "../../component/spinner"
+import { AnimatedText } from "../../component/animated-activity-label"
 import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
 import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
 import { Prompt, type PromptRef } from "../../component/prompt"
@@ -2048,6 +2049,7 @@ function BlockTool(props: {
 
 function Shell(props: ToolProps) {
   const { theme } = useTheme()
+  const kv = useKV()
   const pathFormatter = usePathFormatter()
   const ctx = use()
   const isRunning = createMemo(() => props.part.state.status === "running")
@@ -2085,7 +2087,13 @@ function Shell(props: ToolProps) {
         >
           <box gap={1}>
             <Show when={isRunning()} fallback={<text fg={theme.text}>$ {stringValue(props.input.command)}</text>}>
-              <Spinner color={theme.text}>{stringValue(props.input.command)}</Spinner>
+              <Spinner color={theme.text}>
+                <AnimatedText
+                  label={`$ ${stringValue(props.input.command)}`}
+                  color={theme.text}
+                  animated={kv.get("animations_enabled", true)}
+                />
+              </Spinner>
             </Show>
             <Show when={output()}>
               <text fg={theme.text}>{limited()}</text>
@@ -2097,8 +2105,18 @@ function Shell(props: ToolProps) {
         </BlockTool>
       </Match>
       <Match when={true}>
-        <InlineTool icon="$" pending="Writing command..." complete={stringValue(props.input.command)} part={props.part}>
-          {stringValue(props.input.command)}
+        <InlineTool
+          icon="$"
+          pending="Writing command..."
+          complete={stringValue(props.input.command)}
+          part={props.part}
+          spinner={isRunning() && Boolean(stringValue(props.input.command))}
+        >
+          <AnimatedText
+            label={`${isRunning() ? "$ " : ""}${stringValue(props.input.command) ?? ""}`}
+            color={theme.text}
+            animated={isRunning() && kv.get("animations_enabled", true)}
+          />
         </InlineTool>
       </Match>
     </Switch>

@@ -264,6 +264,11 @@ export interface KnightRiderOptions {
   minAlpha?: number
 }
 
+export function createFrameCount(options: Pick<KnightRiderOptions, "width" | "holdStart" | "holdEnd"> = {}) {
+  const width = options.width ?? 8
+  return width + (options.holdEnd ?? 9) + (width - 1) + (options.holdStart ?? 30)
+}
+
 /**
  * Creates frame strings for a Knight Rider style scanner animation
  * @param options Configuration options for the Knight Rider effect
@@ -303,7 +308,7 @@ export function createFrames(options: KnightRiderOptions = {}): string[] {
   }
 
   // Bidirectional cycle: Forward (width) + Hold End + Backward (width-1) + Hold Start
-  const totalFrames = width + holdEnd + (width - 1) + holdStart
+  const totalFrames = createFrameCount({ width, holdStart, holdEnd })
 
   // Generate dynamic frames where inactive pixels are dots and active ones are blocks
   const frames = Array.from({ length: totalFrames }, (_, frameIndex) => {

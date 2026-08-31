@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test"
 import { OpencodeClient, type GlobalEvent } from "@opencode-ai/sdk/v2"
+import { testRender } from "@opentui/solid"
+import { createComponent } from "solid-js"
+import { SPINNER_FRAMES } from "@opencode-ai/tui/component/spinner"
+import { RunPermissionBody } from "@/cli/cmd/run/footer.permission"
+import { RunFooterSubagentBody } from "@/cli/cmd/run/footer.subagent"
 import { createSessionTransport } from "@/cli/cmd/run/stream.transport"
 import { SUBAGENT_BOOTSTRAP_LIMIT } from "@/cli/cmd/run/subagent-data"
+import { RUN_THEME_FALLBACK } from "@/cli/cmd/run/theme"
 import type { FooterApi, FooterEvent, LocalReplayRow, RunFilePart, StreamCommit } from "@/cli/cmd/run/types"
 
 type EventStream = Awaited<ReturnType<OpencodeClient["event"]["subscribe"]>>["stream"]
@@ -738,7 +744,7 @@ describe("run stream transport", () => {
       expect(patch).toEqual(
         expect.objectContaining({
           phase: "running",
-          status: "running bash",
+          status: "$ pwd",
         }),
       )
     } finally {
@@ -1556,6 +1562,237 @@ describe("run stream transport", () => {
           }),
         },
       })
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("projects a child command into its blocker with the Thinking icon", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const transport = await createSessionTransport({
+      sdk: sdk({ stream: src.stream }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      src.push(
+        toolUpdated(
+          runningTool({
+            sessionID: "session-1",
+            messageID: "msg-root",
+            id: "task-child",
+            callID: "call-child",
+            tool: "task",
+            body: { description: "Inspect repository", subagent_type: "explore" },
+            metadata: { sessionId: "child-1" },
+          }),
+        ),
+      )
+      await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        return item?.type === "stream.subagent" && item.state.tabs.some((tab) => tab.sessionID === "child-1")
+          ? true
+          : undefined
+      })
+
+      src.push(
+        toolUpdated(
+          runningTool({
+            sessionID: "child-1",
+            messageID: "msg-child",
+            id: "bash-child",
+            callID: "call-bash-child",
+            tool: "bash",
+            body: { command: "sleep 25m" },
+          }),
+        ),
+      )
+      src.push({
+        id: "evt-child-read-permission",
+        type: "permission.asked",
+        properties: {
+          id: "perm-child-read",
+          sessionID: "child-1",
+          permission: "read",
+          patterns: ["/tmp/input"],
+          metadata: { input: { filePath: "/tmp/input" } },
+          always: [],
+        },
+      })
+
+      const shown = await waitFor(() => {
+        const view = ui.events.findLast(
+          (event) =>
+            event.type === "stream.view" &&
+            event.view.type === "permission" &&
+            event.view.request.id === "perm-child-read",
+        )
+        const patch = ui.events.findLast(
+          (event) => event.type === "stream.patch" && event.patch.status === "$ sleep 25m",
+        )
+        const subagent = ui.events.findLast((event) => event.type === "stream.subagent")
+        const tab =
+          subagent?.type === "stream.subagent"
+            ? subagent.state.tabs.find((item) => item.sessionID === "child-1")
+            : undefined
+        return view?.type === "stream.view" && view.view.type === "permission" && patch?.type === "stream.patch" && tab
+          ? { request: view.view.request, status: patch.patch.status, active: tab.status === "running" }
+          : undefined
+      })
+
+      expect(shown.active).toBe(true)
+      const app = await testRender(
+        () =>
+          createComponent(RunPermissionBody, {
+            request: shown.request,
+            theme: RUN_THEME_FALLBACK.footer,
+            block: RUN_THEME_FALLBACK.block,
+            activeCommand: shown.status,
+            active: shown.active,
+            animationsEnabled: true,
+            onReply: () => {},
+          }),
+        { width: 100, height: 14 },
+      )
+
+      try {
+        await app.renderOnce()
+        const frame = app.captureCharFrame()
+        expect(SPINNER_FRAMES.some((icon) => frame.includes(`${icon} $ sleep 25m`))).toBe(true)
+      } finally {
+        app.renderer.destroy()
+      }
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("keeps a cancelled child neutral after a late running Task update", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const task = runningTool({
+      sessionID: "session-1",
+      messageID: "msg-root",
+      id: "task-child",
+      callID: "call-child",
+      tool: "task",
+      body: { description: "Inspect repository", subagent_type: "explore" },
+      metadata: { sessionId: "child-1" },
+    })
+    const command = runningTool({
+      sessionID: "child-1",
+      messageID: "msg-child",
+      id: "bash-child",
+      callID: "call-bash-child",
+      tool: "bash",
+      body: { command: "sleep 25m" },
+    })
+    const transport = await createSessionTransport({
+      sdk: sdk({ stream: src.stream }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      src.push(toolUpdated(task))
+      await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        return item?.type === "stream.subagent" && item.state.tabs.some((tab) => tab.sessionID === "child-1")
+          ? true
+          : undefined
+      })
+      transport.selectSubagent("child-1")
+
+      src.push(toolUpdated(command))
+      await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        const detail = item?.type === "stream.subagent" ? item.state.details["child-1"] : undefined
+        return detail?.commits.some((commit) => commit.partID === "bash-child") ? true : undefined
+      })
+
+      const aborted = assistantMessage({ sessionID: "child-1", id: "msg-child", parts: [] })
+      if (aborted.info.role !== "assistant") throw new Error("expected assistant message")
+      src.push({
+        id: "evt-child-aborted",
+        type: "message.updated",
+        properties: {
+          sessionID: "child-1",
+          info: {
+            ...aborted.info,
+            time: { ...aborted.info.time, completed: 2 },
+            error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+            finish: "error",
+          },
+        },
+      })
+      src.push({ ...toolUpdated(command), id: "evt-bash-child-late" })
+      src.push({ ...toolUpdated(task), id: "evt-task-child-late" })
+      src.push({
+        id: "evt-cancelled-child-permission",
+        type: "permission.asked",
+        properties: {
+          id: "perm-cancelled-child",
+          sessionID: "child-1",
+          permission: "read",
+          patterns: ["/tmp/input"],
+          metadata: { input: { filePath: "/tmp/input" } },
+          always: [],
+        },
+      })
+
+      const shown = await waitFor(() => {
+        const view = ui.events.findLast(
+          (event) =>
+            event.type === "stream.view" &&
+            event.view.type === "permission" &&
+            event.view.request.id === "perm-cancelled-child",
+        )
+        const subagent = ui.events.findLast((event) => event.type === "stream.subagent")
+        const tab =
+          subagent?.type === "stream.subagent"
+            ? subagent.state.tabs.find((item) => item.sessionID === "child-1")
+            : undefined
+        const detail = subagent?.type === "stream.subagent" ? subagent.state.details["child-1"] : undefined
+        return view && tab && detail ? { tab, detail } : undefined
+      })
+
+      expect(shown.tab.status).toBe("cancelled")
+      expect(ui.events.findLast((event) => event.type === "stream.patch")?.patch.status).not.toBe("$ sleep 25m")
+
+      const app = await testRender(
+        () =>
+          createComponent(RunFooterSubagentBody, {
+            active: () => true,
+            theme: () => RUN_THEME_FALLBACK,
+            tab: () => shown.tab,
+            index: () => 0,
+            total: () => 1,
+            detail: () => shown.detail,
+            width: () => 100,
+            animationsEnabled: true,
+            onCycle: () => {},
+            onClose: () => {},
+          }),
+        { width: 100, height: 14 },
+      )
+
+      try {
+        await app.renderOnce()
+        await app.renderOnce()
+        const frame = app.captureCharFrame()
+        expect(frame).toContain("$ sleep 25m")
+        expect(SPINNER_FRAMES.some((icon) => frame.includes(`${icon} $ sleep 25m`))).toBe(false)
+      } finally {
+        app.renderer.destroy()
+      }
     } finally {
       src.close()
       await transport.close()
@@ -3012,6 +3249,107 @@ describe("run stream transport", () => {
           interrupted: true,
         },
       ])
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("does not revive an aborted command on later events", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const command = runningTool({
+      sessionID: "session-1",
+      messageID: "msg-1",
+      id: "bash-1",
+      callID: "call-bash-1",
+      tool: "bash",
+      body: { command: "sleep 25m" },
+    })
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        promptAsync: async () => {
+          queueMicrotask(() => {
+            src.push(busy())
+            src.push(assistant("msg-1"))
+            src.push(toolUpdated(command))
+          })
+          return ok(undefined)
+        },
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+    const ctrl = new AbortController()
+
+    try {
+      const task = transport.runPromptTurn({
+        agent: undefined,
+        model: undefined,
+        variant: undefined,
+        prompt: { text: "hello", parts: [] },
+        files: [],
+        includeFiles: false,
+        signal: ctrl.signal,
+      })
+
+      await waitFor(() =>
+        ui.events.some((event) => event.type === "stream.patch" && event.patch.status === "$ sleep 25m")
+          ? true
+          : undefined,
+      )
+      ctrl.abort()
+      await task
+
+      src.push(assistant("msg-after-abort"))
+      src.push({
+        id: "evt-after-abort",
+        type: "session.error",
+        properties: {
+          sessionID: "session-1",
+          error: { name: "UnknownError", data: { message: "after abort" } },
+        },
+      })
+      await waitFor(
+        () => ui.commits.some((commit) => commit.kind === "error" && commit.text === "after abort") || undefined,
+      )
+
+      const active = ui.events.findIndex(
+        (event) => event.type === "stream.patch" && event.patch.status === "$ sleep 25m",
+      )
+      const later = ui.events.slice(active + 1).filter((event) => event.type === "stream.patch")
+      expect(later).toContainEqual({ type: "stream.patch", patch: expect.objectContaining({ status: "" }) })
+      expect(later.every((event) => !event.patch.status?.startsWith("$ "))).toBe(true)
+
+      src.push(
+        toolUpdated(
+          completedTool({
+            sessionID: command.sessionID,
+            messageID: command.messageID,
+            id: command.id,
+            callID: command.callID,
+            tool: command.tool,
+            body: command.state.input,
+            output: "late output",
+          }),
+        ),
+      )
+      src.push({
+        id: "evt-after-late-terminal",
+        type: "session.error",
+        properties: {
+          sessionID: "session-1",
+          error: { name: "UnknownError", data: { message: "after terminal" } },
+        },
+      })
+      await waitFor(
+        () => ui.commits.some((commit) => commit.kind === "error" && commit.text === "after terminal") || undefined,
+      )
+
+      expect(ui.commits.filter((commit) => commit.partID === "bash-1").map((commit) => commit.phase)).toEqual(["start"])
     } finally {
       src.close()
       await transport.close()

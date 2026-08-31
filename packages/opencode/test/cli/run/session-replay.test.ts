@@ -414,7 +414,7 @@ describe("run session replay", () => {
     expect(out.patch).toEqual(
       expect.objectContaining({
         phase: "running",
-        status: "running bash",
+        status: "$ pwd",
       }),
     )
   })

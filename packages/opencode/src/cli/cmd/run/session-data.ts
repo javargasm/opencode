@@ -53,7 +53,7 @@ type SessionCommit = StreamCommit
 // of the stream so we can produce correct incremental output:
 //
 // - ids:    parts and error keys we've already committed (dedup guard)
-// - tools:  tool parts we've emitted a "start" for but not yet completed
+// - tools:  active tool part IDs and their visible status, in start order
 // - call:   tool call inputs, keyed by msg:call, for enriching permission views
 // - role:   message ID → "assistant" | "user", learned from message.updated
 // - msg:    part ID → message ID
@@ -73,7 +73,7 @@ export type SessionData = {
   includeUserText: boolean
   announced: boolean
   ids: Set<string>
-  tools: Set<string>
+  tools: Map<string, string>
   call: Map<string, Dict>
   shell: Map<string, ShellCall>
   permissions: PermissionRequest[]
@@ -111,7 +111,7 @@ export function createSessionData(
     includeUserText: input.includeUserText ?? false,
     announced: false,
     ids: new Set(),
-    tools: new Set(),
+    tools: new Map(),
     call: new Map(),
     shell: new Map(),
     permissions: [],
@@ -252,7 +252,30 @@ function queueFooter(data: SessionData): FooterOutput {
 
   return {
     view,
-    patch: { status: blockerStatus(view) },
+    patch: { status: sessionStatus(data, view) },
+  }
+}
+
+function sessionStatus(data: SessionData, view = pickSessionView(data)) {
+  if (view.type === "prompt") {
+    return activeToolStatus(data)
+  }
+
+  return activeCommandStatus(data) || blockerStatus(view)
+}
+
+function refreshFooterStatus(data: SessionData, footer: FooterOutput | undefined) {
+  if (!footer) {
+    return undefined
+  }
+
+  const view = footer.view ?? pickSessionView(data)
+  return {
+    ...footer,
+    patch: {
+      ...footer.patch,
+      status: sessionStatus(data, view),
+    },
   }
 }
 
@@ -366,9 +389,7 @@ function syncPermission(data: SessionData, part: ToolPart): FooterOutput | undef
     return undefined
   }
 
-  return {
-    view: pickSessionView(data),
-  }
+  return queueFooter(data)
 }
 
 // Question tool replies can complete without a matching question.replied event.
@@ -395,6 +416,13 @@ function syncQuestion(data: SessionData, part: ToolPart): FooterOutput | undefin
 }
 
 function toolStatus(part: ToolPart): string {
+  if (part.tool === "bash") {
+    const command = bashCommand(part)
+    if (command) {
+      return commandStatus(command)
+    }
+  }
+
   if (part.tool !== "task") {
     return `running ${part.tool}`
   }
@@ -416,6 +444,19 @@ function toolStatus(part: ToolPart): string {
   }
 
   return "running task"
+}
+
+function commandStatus(command: string): string {
+  return `$ ${command.replace(/\r?\n/g, " ↵ ")}`
+}
+
+function activeToolStatus(data: SessionData) {
+  const statuses = [...data.tools.values()]
+  return statuses.findLast((status) => status.startsWith("$ ")) ?? statuses.at(-1) ?? ""
+}
+
+export function activeCommandStatus(data: SessionData) {
+  return [...data.tools.values()].findLast((status) => status.startsWith("$ ")) ?? ""
 }
 
 // Returns true if we can flush this part's text to scrollback.
@@ -758,6 +799,12 @@ export function flushInterrupted(data: SessionData, commits: SessionCommit[]) {
     data.ids.add(partID)
     drop(data, partID)
   }
+
+  // Keep tombstones so delayed tool updates cannot restore cancelled presentation state.
+  for (const partID of data.tools.keys()) {
+    data.ids.add(partID)
+  }
+  data.tools.clear()
 }
 
 // The main reducer. Takes one SDK event and returns scrollback commits and
@@ -787,12 +834,13 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
 
     const partID = shellPartID(event.properties.callID)
     if (data.ids.has(partID) || data.tools.has(partID)) {
-      return out(data, commits, patch({ status: "running shell" }))
+      return out(data, commits, patch({ status: activeToolStatus(data) }))
     }
 
-    data.tools.add(partID)
+    const status = commandStatus(shell.command ?? event.properties.command)
+    data.tools.set(partID, status)
     commits.push(startShell(event.properties.callID, shell.command ?? event.properties.command))
-    return out(data, commits, patch({ status: "running shell" }))
+    return out(data, commits, patch({ status }))
   }
 
   if (event.type === "session.next.shell.ended") {
@@ -819,7 +867,7 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
 
     data.ids.add(partID)
     commits.push(doneShell(event.properties.callID, command, event.properties.output))
-    return out(data, commits)
+    return out(data, commits, patch({ status: sessionStatus(data) }))
   }
 
   if (event.type === "message.updated") {
@@ -935,11 +983,12 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
         }
 
         if (!data.tools.has(part.id)) {
-          data.tools.add(part.id)
           commits.push(startTool(part))
         }
 
-        return out(data, commits, view ?? patch({ status: toolStatus(part) }))
+        const status = toolStatus(part)
+        data.tools.set(part.id, status)
+        return out(data, commits, refreshFooterStatus(data, view) ?? patch({ status: activeToolStatus(data) }))
       }
 
       if (part.state.status === "completed") {
@@ -976,7 +1025,12 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
           commits.push(doneTool(part))
         }
 
-        return out(data, commits, view)
+        return out(
+          data,
+          commits,
+          refreshFooterStatus(data, view) ??
+            (part.tool === "bash" ? patch({ status: sessionStatus(data) }) : undefined),
+        )
       }
 
       if (part.state.status === "error") {
@@ -994,7 +1048,12 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
         const text =
           typeof part.state.error === "string" && part.state.error.trim() ? part.state.error : "unknown error"
         commits.push(failTool(part, text))
-        return out(data, commits, view)
+        return out(
+          data,
+          commits,
+          refreshFooterStatus(data, view) ??
+            (part.tool === "bash" ? patch({ status: sessionStatus(data) }) : undefined),
+        )
       }
     }
 

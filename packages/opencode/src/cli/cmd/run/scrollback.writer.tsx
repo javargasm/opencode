@@ -1,8 +1,10 @@
 import { createScrollbackWriter } from "@opentui/solid"
 import { TextRenderable, type ColorInput, type ScrollbackRenderContext, type ScrollbackWriter } from "@opentui/core"
-import { Match, Switch, createMemo } from "solid-js"
+import { AnimatedText } from "@opencode-ai/tui/component/animated-activity-label"
+import { SPINNER_FRAMES } from "@opencode-ai/tui/component/spinner"
+import { Match, Show, Switch, createMemo } from "solid-js"
 import { entryBody, entryFlags } from "./entry.body"
-import { entryColor, entryLook, entrySyntax } from "./scrollback.shared"
+import { entryColor, entryFailed, entryLook, entrySyntax } from "./scrollback.shared"
 import { toolFiletype, toolStructuredFinal } from "./tool"
 import { RUN_THEME_FALLBACK, transparent, type RunTheme } from "./theme"
 import type { EntryLayout, RunEntryBody, ScrollbackOptions, StreamCommit } from "./types"
@@ -100,6 +102,8 @@ export function RunEntryContent(props: {
   theme?: RunTheme
   opts?: ScrollbackOptions
   width?: number
+  loading: boolean
+  animated: boolean
 }) {
   const theme = createMemo(() => props.theme ?? RUN_THEME_FALLBACK)
   const body = createMemo(() => props.body ?? entryBody(props.commit))
@@ -112,6 +116,13 @@ export function RunEntryContent(props: {
   const text = createMemo(() => {
     const next = body()
     return next.type === "text" ? next : undefined
+  })
+  const command = createMemo(() => {
+    if (props.commit.kind !== "tool" || props.commit.phase !== "start" || props.commit.tool !== "bash") {
+      return
+    }
+
+    return text()?.content
   })
   const code = createMemo(() => {
     const next = body()
@@ -149,9 +160,39 @@ export function RunEntryContent(props: {
   return (
     <Switch fallback={null}>
       <Match when={text()}>
-        <text width="100%" wrapMode="word" fg={style().fg} attributes={style().attrs}>
-          {text()!.content}
-        </text>
+        <Show
+          when={command()}
+          fallback={
+            <text width="100%" wrapMode="word" fg={style().fg} attributes={style().attrs}>
+              {text()!.content}
+            </text>
+          }
+        >
+          {(label) => (
+            <Show
+              when={props.loading}
+              fallback={
+                <text
+                  width="100%"
+                  wrapMode="word"
+                  fg={entryFailed(props.commit) ? style().fg : theme().block.text}
+                  attributes={style().attrs}
+                >
+                  <AnimatedText label={label()} color={theme().block.highlight} animated={false} />
+                </text>
+              }
+            >
+              <box width="100%" flexDirection="row" gap={1}>
+                <Show when={props.animated} fallback={<text fg={theme().block.highlight}>⋯</text>}>
+                  <spinner frames={SPINNER_FRAMES} interval={80} color={theme().block.highlight} />
+                </Show>
+                <text flexGrow={1} flexShrink={1} wrapMode="word" fg={theme().block.text} attributes={style().attrs}>
+                  <AnimatedText label={label()} color={theme().block.highlight} animated={props.animated} />
+                </text>
+              </box>
+            </Show>
+          )}
+        </Show>
       </Match>
       <Match when={code()}>
         <code
@@ -313,6 +354,8 @@ export function entryWriter(input: {
         theme={input.theme}
         opts={{ ...input.opts, suppressBackgrounds: true }}
         width={ctx.width}
+        loading={false}
+        animated={false}
       />
     ),
     entryFlags(input.commit),

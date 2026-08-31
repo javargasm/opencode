@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import { RGBA, type CapturedSpan } from "@opentui/core"
 import { testRender } from "@opentui/solid"
-import { ActiveDescendantLabel, AnimatedActivityLabel } from "../../src/component/animated-activity-label"
+import { createSignal } from "solid-js"
+import { ActiveDescendantLabel, AnimatedActivityLabel, AnimatedText } from "../../src/component/animated-activity-label"
 import { getActiveDescendantCount, getSessionActivity } from "../../src/util/session"
+import { createFrameCount } from "../../src/ui/spinner"
 
 const label = "↳ Subagent active(2)"
 const color = RGBA.fromHex("#ff6600")
@@ -10,6 +12,34 @@ const mutedColor = RGBA.fromHex("#777777")
 const sessions = [{ id: "root" }, { id: "child", parentID: "root" }, { id: "grandchild", parentID: "child" }]
 
 describe("AnimatedActivityLabel", () => {
+  test("counts frames for long command labels without materializing them", () => {
+    expect(createFrameCount({ width: 100_000 })).toBe(200_038)
+  })
+
+  test("renders reusable animated text with a neutral fallback", async () => {
+    const [animated, setAnimated] = createSignal(true)
+    const app = await testRender(
+      () => (
+        <text fg={mutedColor}>
+          <AnimatedText label={label} color={color} animated={animated()} />
+        </text>
+      ),
+      { width: label.length, height: 1 },
+    )
+
+    try {
+      await app.renderOnce()
+      expect(new Set(app.captureSpans().lines[0]?.spans.map((span) => spanColor(span)) ?? []).size).toBeGreaterThan(1)
+
+      setAnimated(false)
+      await app.renderOnce()
+      expect(app.captureCharFrame().split("\n")[0]).toBe(label)
+      expect(app.captureSpans().lines[0]?.spans.every((span) => spanColor(span) === rgba(mutedColor))).toBe(true)
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
   test("keeps the exact label visible while its color scan advances", async () => {
     const app = await testRender(
       () => <AnimatedActivityLabel label={label} color={color} mutedColor={mutedColor} animated />,
@@ -84,6 +114,14 @@ describe("ActiveDescendantLabel", () => {
 
 function spanSignature(spans: CapturedSpan[]) {
   return spans.map((span) => `${span.text}:${span.fg.r},${span.fg.g},${span.fg.b},${span.fg.a}`).join("|")
+}
+
+function spanColor(span: CapturedSpan) {
+  return rgba(span.fg)
+}
+
+function rgba(value: RGBA) {
+  return `${value.r},${value.g},${value.b},${value.a}`
 }
 
 async function renderActiveDescendantLabel(statuses: Parameters<typeof getSessionActivity>[2]) {

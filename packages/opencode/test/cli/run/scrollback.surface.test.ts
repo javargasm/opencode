@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from "bun:test"
 import type { ToolPart } from "@opencode-ai/sdk/v2"
-import { RGBA, SyntaxStyle } from "@opentui/core"
+import { RGBA, SyntaxStyle, type CapturedLine } from "@opentui/core"
 import { MockTreeSitterClient, createTestRenderer, type TestRenderer } from "@opentui/core/testing"
+import { SPINNER_FRAMES } from "@opencode-ai/tui/component/spinner"
 import { RunScrollbackStream } from "@/cli/cmd/run/scrollback.surface"
 import { RUN_THEME_FALLBACK, type RunTheme } from "@/cli/cmd/run/theme"
 import type { StreamCommit } from "@/cli/cmd/run/types"
@@ -10,6 +11,7 @@ type ClaimedCommit = {
   snapshot: {
     height: number
     getRealCharBytes(addLineBreaks?: boolean): Uint8Array
+    getSpanLines(): CapturedLine[]
     destroy(): void
   }
   trailingNewline: boolean
@@ -255,6 +257,42 @@ function toolCommit(input: {
     ...(input.state ? { part: toolPart(input.tool, input.state, id, messageID) } : {}),
   }
 }
+
+test("keeps the immutable main command neutral while the live footer owns its animation", async () => {
+  const out = await setup()
+
+  try {
+    await out.scrollback.append(
+      toolCommit({
+        tool: "bash",
+        phase: "start",
+        toolState: "running",
+        state: {
+          status: "running",
+          input: { command: "sleep 25m" },
+          time: { start: 1 },
+        },
+      }),
+    )
+
+    const commits = claim(out.renderer)
+    try {
+      const spans = commits.flatMap((commit) => commit.snapshot.getSpanLines()).flatMap((line) => line.spans)
+      const neutral = RUN_THEME_FALLBACK.block.text as RGBA
+      const text = spans.map((span) => span.text).join("")
+      expect(text).toContain("$ sleep 25m")
+      expect(SPINNER_FRAMES.some((icon) => text.includes(`${icon} $ sleep 25m`))).toBe(false)
+      expect(text).not.toContain("⋯ $ sleep 25m")
+      expect(
+        spans.filter((span) => span.text.trim()).every((span) => span.fg.toInts().join() === neutral.toInts().join()),
+      ).toBe(true)
+    } finally {
+      destroy(commits)
+    }
+  } finally {
+    out.scrollback.destroy()
+  }
+})
 
 test("finalizes markdown tables for streamed and coalesced input", async () => {
   const text =

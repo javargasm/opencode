@@ -82,6 +82,7 @@ type RunFooterOptions = {
   first: boolean
   history?: RunPrompt[]
   theme: RunTheme
+  animationsEnabled: boolean
   keymap: Keymap<Renderable, KeyEvent>
   tuiConfig: RunTuiConfig
   backgroundSubagents: boolean
@@ -318,6 +319,7 @@ export class RunFooter implements FooterApi {
               variants: footer.variants,
               currentVariant: footer.currentVariant,
               theme: footer.theme,
+              animationsEnabled: options.animationsEnabled,
               diffStyle: options.diffStyle,
               tuiConfig: options.tuiConfig,
               backgroundSubagents: options.backgroundSubagents,

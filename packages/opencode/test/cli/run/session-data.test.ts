@@ -268,6 +268,7 @@ describe("run session data", () => {
     )
 
     expect(out.footer).toEqual({
+      patch: { status: "$ git status --short" },
       view: {
         type: "permission",
         request: expect.objectContaining({
@@ -350,6 +351,7 @@ describe("run session data", () => {
         },
       }),
     ])
+    expect(started.footer?.patch).toEqual({ status: "$ pwd" })
 
     data = started.data
     const ended = reduce(data, {
@@ -376,6 +378,163 @@ describe("run session data", () => {
         },
       }),
     ])
+    expect(ended.footer?.patch).toEqual({ status: "" })
+  })
+
+  test("exposes a running bash command to the live footer and clears it without output", () => {
+    const running = reduce(
+      createSessionData(),
+      tool({
+        id: "tool-1",
+        messageID: "msg-1",
+        tool: "bash",
+        state: {
+          status: "running",
+          input: { command: "sleep 25m" },
+          time: { start: 1 },
+        },
+      }),
+    )
+    expect(running.footer?.patch).toEqual({ status: "$ sleep 25m" })
+
+    const completed = reduce(
+      running.data,
+      tool({
+        id: "tool-1",
+        messageID: "msg-1",
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: "sleep 25m" },
+          output: "",
+          title: "",
+          metadata: {},
+          time: { start: 1, end: 2 },
+        },
+      }),
+    )
+    expect(completed.footer?.patch).toEqual({ status: "" })
+  })
+
+  test("restores the remaining bash command when parallel commands finish out of order", () => {
+    let data = reduce(
+      createSessionData(),
+      tool({
+        id: "tool-slow",
+        messageID: "msg-1",
+        callID: "call-slow",
+        tool: "bash",
+        state: {
+          status: "running",
+          input: { command: "sleep 25m" },
+          time: { start: 1 },
+        },
+      }),
+    ).data
+    data = reduce(
+      data,
+      tool({
+        id: "tool-fast",
+        messageID: "msg-1",
+        callID: "call-fast",
+        tool: "bash",
+        state: {
+          status: "running",
+          input: { command: "printf done" },
+          time: { start: 2 },
+        },
+      }),
+    ).data
+    data = reduce(
+      data,
+      tool({
+        id: "tool-question",
+        messageID: "msg-1",
+        callID: "call-question",
+        tool: "question",
+        state: {
+          status: "running",
+          input: { questions: [] },
+          time: { start: 3 },
+        },
+      }),
+    ).data
+
+    const blocked = reduce(data, {
+      type: "question.asked",
+      properties: {
+        id: "question-1",
+        sessionID: "session-1",
+        tool: { messageID: "msg-1", callID: "call-question" },
+        questions: [
+          {
+            question: "Continue?",
+            header: "Continue",
+            options: [{ label: "Yes", description: "Keep running" }],
+            multiple: false,
+          },
+        ],
+      },
+    })
+    expect(blocked.footer?.patch).toEqual({ status: "$ printf done" })
+    data = blocked.data
+
+    const fast = reduce(
+      data,
+      tool({
+        id: "tool-fast",
+        messageID: "msg-1",
+        callID: "call-fast",
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: "printf done" },
+          output: "done",
+          title: "",
+          metadata: {},
+          time: { start: 2, end: 3 },
+        },
+      }),
+    )
+    expect(fast.footer?.patch).toEqual({ status: "$ sleep 25m" })
+
+    const slow = reduce(
+      fast.data,
+      tool({
+        id: "tool-slow",
+        messageID: "msg-1",
+        callID: "call-slow",
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: "sleep 25m" },
+          output: "",
+          title: "",
+          metadata: {},
+          time: { start: 1, end: 4 },
+        },
+      }),
+    )
+    expect(slow.footer?.patch).toEqual({ status: "awaiting answer" })
+
+    const answered = reduce(
+      slow.data,
+      tool({
+        id: "tool-question",
+        messageID: "msg-1",
+        callID: "call-question",
+        tool: "question",
+        state: {
+          status: "completed",
+          input: { questions: [] },
+          output: "answered",
+          title: "",
+          metadata: {},
+          time: { start: 3, end: 5 },
+        },
+      }),
+    )
+    expect(answered.footer?.patch).toEqual({ status: "" })
   })
 
   test("suppresses legacy bash part updates once shell events claim the call", () => {

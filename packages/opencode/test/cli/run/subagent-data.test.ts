@@ -281,6 +281,41 @@ describe("run subagent data", () => {
     ])
   })
 
+  test("allows a new Task part to resume a terminal child session", () => {
+    const data = createSubagentData()
+
+    bootstrapSubagentData({
+      data,
+      messages: [taskMessage("child-1")],
+      children: [{ id: "child-1" }],
+      permissions: [],
+      questions: [],
+    })
+    reduce(data, {
+      type: "message.part.updated",
+      properties: {
+        part: {
+          id: "part-child-1-resumed",
+          sessionID: "parent-1",
+          messageID: "msg-child-1-resumed",
+          type: "tool",
+          callID: "call-child-1-resumed",
+          tool: "task",
+          state: {
+            status: "running",
+            input: { description: "Continue reducer scan", subagent_type: "explore" },
+            metadata: { sessionId: "child-1" },
+            time: { start: 3 },
+          },
+        },
+      },
+    })
+
+    expect(snapshotSubagentData(data).tabs).toEqual([
+      expect.objectContaining({ sessionID: "child-1", partID: "part-child-1-resumed", status: "running" }),
+    ])
+  })
+
   test("captures child activity and blocker metadata in the footer detail state", () => {
     const data = createSubagentData()
 
@@ -415,6 +450,67 @@ describe("run subagent data", () => {
       }),
     ])
     expect(snapshot.questions).toEqual([])
+  })
+
+  test("settles a child command start when bash completes without output", () => {
+    const data = createSubagentData()
+    bootstrapSubagentData({
+      data,
+      messages: [taskMessage("child-1", "running")],
+      children: [{ id: "child-1" }],
+      permissions: [],
+      questions: [],
+    })
+
+    reduce(data, {
+      type: "message.part.updated",
+      properties: {
+        part: {
+          id: "tool-1",
+          messageID: "msg-assistant-1",
+          sessionID: "child-1",
+          type: "tool",
+          callID: "call-1",
+          tool: "bash",
+          state: {
+            status: "running",
+            input: { command: "sleep 25m" },
+            time: { start: 1 },
+          },
+        },
+      },
+    })
+    expect(snapshotSubagentData(data).details["child-1"]?.commits.at(-1)?.toolState).toBe("running")
+
+    const completed = {
+      type: "message.part.updated",
+      properties: {
+        part: {
+          id: "tool-1",
+          messageID: "msg-assistant-1",
+          sessionID: "child-1",
+          type: "tool",
+          callID: "call-1",
+          tool: "bash",
+          state: {
+            status: "completed",
+            input: { command: "sleep 25m" },
+            output: "",
+            title: "",
+            metadata: {},
+            time: { start: 1, end: 2 },
+          },
+        },
+      },
+    }
+    expect(reduce(data, completed)).toBe(true)
+    expect(reduce(data, completed)).toBe(false)
+
+    const command = snapshotSubagentData(data).details["child-1"]?.commits.find(
+      (commit) => commit.partID === "tool-1" && commit.phase === "start",
+    )
+    expect(command?.toolState).toBe("completed")
+    expect(command?.part?.state.status).toBe("completed")
   })
 
   test("replays bootstrapped child session messages into inspector commits", () => {

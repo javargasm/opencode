@@ -211,6 +211,10 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
       model: input.model,
       variant: input.variant,
     })
+    const animationsEnabled = await Bun.file(path.join(Global.Path.state, "kv.json"))
+      .json()
+      .then((value) => (value as Record<string, unknown>).animations_enabled !== false)
+      .catch(() => true)
     const footerTask = import("./footer")
     const wrote = queueSplash(
       renderer,
@@ -241,6 +245,7 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
       first: input.first,
       history: input.history,
       theme,
+      animationsEnabled,
       wrote,
       keymap,
       tuiConfig: input.tuiConfig,

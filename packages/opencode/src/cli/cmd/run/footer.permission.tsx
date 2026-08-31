@@ -15,6 +15,8 @@ import type { TextareaRenderable } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { For, Match, Show, Switch, createEffect, createMemo, createSignal } from "solid-js"
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
+import { AnimatedText } from "@opencode-ai/tui/component/animated-activity-label"
+import { SPINNER_FRAMES } from "@opencode-ai/tui/component/spinner"
 import {
   createPermissionBodyState,
   permissionAlwaysLines,
@@ -133,12 +135,20 @@ export function RunPermissionBody(props: {
   request: PermissionRequest
   theme: RunFooterTheme
   block: RunBlockTheme
+  activeCommand?: string
+  active: boolean
+  animationsEnabled: boolean
   diffStyle?: RunDiffStyle
   onReply: (input: PermissionReply) => void | Promise<void>
 }) {
   const dims = useTerminalDimensions()
   const [state, setState] = createSignal(createPermissionBodyState(props.request.id))
   const info = createMemo(() => permissionInfo(props.request))
+  const ownCommand = createMemo(() =>
+    props.request.permission === "bash" ? info().lines.find((line) => line.startsWith("$ ")) : undefined,
+  )
+  const command = createMemo(() => (props.request.permission === "bash" ? ownCommand() : props.activeCommand))
+  const lines = createMemo(() => info().lines.filter((line) => line !== command()))
   const ft = createMemo(() => toolFiletype(info().file))
   const narrow = createMemo(() => footerWidthPolicy(dims().width).dialog.narrow)
   const opts = createMemo(() => permissionOptions(state().stage))
@@ -288,6 +298,24 @@ export function RunPermissionBody(props: {
             </box>
           </Match>
         </Switch>
+        <Show when={command()}>
+          {(label) => (
+            <box flexDirection="row" gap={props.active ? 1 : 0} paddingLeft={2}>
+              <Show when={props.active}>
+                <Show when={props.animationsEnabled} fallback={<text fg={props.theme.highlight}>⋯</text>}>
+                  <spinner frames={SPINNER_FRAMES} interval={80} color={props.theme.highlight} />
+                </Show>
+              </Show>
+              <text fg={props.theme.text} wrapMode="word">
+                <AnimatedText
+                  label={label()}
+                  color={props.theme.highlight}
+                  animated={props.active && props.animationsEnabled}
+                />
+              </text>
+            </box>
+          )}
+        </Show>
       </box>
 
       <Show
@@ -360,7 +388,7 @@ export function RunPermissionBody(props: {
                     when={info().diff}
                     fallback={
                       <box width="100%" flexDirection="column" gap={1} paddingLeft={1}>
-                        <For each={info().lines}>
+                        <For each={lines()}>
                           {(line) => (
                             <text fg={props.theme.text} wrapMode="word">
                               {line}

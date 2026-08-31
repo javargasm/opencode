@@ -52,6 +52,7 @@ export function RunFooterSubagentBody(props: {
   total: () => number
   detail: () => FooterSubagentDetail | undefined
   width: () => number
+  animationsEnabled: boolean
   diffStyle?: RunDiffStyle
   onCycle: (dir: -1 | 1) => void
   onClose: () => void
@@ -86,7 +87,14 @@ export function RunFooterSubagentBody(props: {
   const rows = indexArray(commits, (commit, index) => (
     <box flexDirection="column" gap={0} flexShrink={0}>
       {index > 0 && separatorRows(commits()[index - 1], commit()) > 0 ? <box height={1} flexShrink={0} /> : null}
-      <RunEntryContent commit={commit()} theme={theme()} opts={opts()} width={props.width()} />
+      <RunEntryContent
+        commit={commit()}
+        theme={theme()}
+        opts={opts()}
+        width={props.width()}
+        loading={tab()?.status === "running" && commit().toolState === "running"}
+        animated={props.animationsEnabled && tab()?.status === "running" && commit().toolState === "running"}
+      />
     </box>
   ))
   let scroll: ScrollBoxRenderable | undefined

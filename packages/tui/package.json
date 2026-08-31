@@ -45,6 +45,7 @@
     "./ui/spinner": "./src/ui/spinner.ts",
     "./ui/toast": "./src/ui/toast.tsx",
     "./component/spinner": "./src/component/spinner.tsx",
+    "./component/animated-activity-label": "./src/component/animated-activity-label.tsx",
     "./component/register-spinner": "./src/component/register-spinner.ts"
   },
   "dependencies": {

@@ -1,11 +1,12 @@
 /** @jsxImportSource @opentui/solid */
 import { expect, test } from "bun:test"
-import { BoxRenderable, RGBA, type RootRenderable } from "@opentui/core"
+import { BoxRenderable, RGBA, type CapturedSpan, type RootRenderable } from "@opentui/core"
 import { testRender, useRenderer } from "@opentui/solid"
 import { createSignal } from "solid-js"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
-import type { QuestionRequest } from "@opencode-ai/sdk/v2"
+import type { PermissionRequest, QuestionRequest } from "@opencode-ai/sdk/v2"
 import { OpencodeKeymapProvider, registerOpencodeKeymap } from "@opencode-ai/tui/keymap"
+import { SPINNER_FRAMES } from "@opencode-ai/tui/component/spinner"
 import {
   RUN_COMMAND_PANEL_ROWS,
   RUN_SUBAGENT_PANEL_ROWS,
@@ -17,6 +18,7 @@ import {
   RunVariantSelectBody,
 } from "@/cli/cmd/run/footer.command"
 import { RunFooterView } from "@/cli/cmd/run/footer.view"
+import { RunFooterSubagentBody } from "@/cli/cmd/run/footer.subagent"
 import { RunEntryContent } from "@/cli/cmd/run/scrollback.writer"
 import { RUN_THEME_FALLBACK, type RunTheme } from "@/cli/cmd/run/theme"
 import type {
@@ -164,11 +166,13 @@ async function renderFooter(
     width?: number
     height?: number
     state?: Partial<FooterState>
+    view?: FooterView
+    animationsEnabled?: boolean
     onCycle?: () => void
     onSubmit?: (prompt: RunPrompt) => boolean
   } = {},
 ) {
-  const [view] = createSignal<FooterView>({ type: "prompt" })
+  const [view] = createSignal<FooterView>(input.view ?? { type: "prompt" })
   const [subagents] = createSignal<FooterSubagentState>(
     input.subagents ?? { tabs: [], details: {}, permissions: [], questions: [] },
   )
@@ -194,6 +198,7 @@ async function renderFooter(
           variants={() => []}
           currentVariant={() => input.currentVariant}
           state={state}
+          animationsEnabled={input.animationsEnabled ?? true}
           view={view}
           subagent={subagents}
           theme={input.theme ?? (() => RUN_THEME_FALLBACK)}
@@ -281,6 +286,27 @@ function footerStatusline(root: BoxRenderable | RootRenderable) {
   throw new Error("Footer statusline not found")
 }
 
+function textColors(spans: CapturedSpan[], target: string) {
+  const text = spans.map((span) => span.text).join("")
+  const start = text.indexOf(target)
+  if (start === -1) return []
+
+  const chunks = spans.map((span) => Array.from(span.text))
+  return chunks.flatMap((characters, spanIndex) => {
+    const offset = chunks.slice(0, spanIndex).reduce((total, chunk) => total + chunk.length, 0)
+    return characters.flatMap((_, index) => {
+      const position = offset + index
+      return position >= start && position < start + target.length
+        ? [`${spans[spanIndex]!.fg.r},${spans[spanIndex]!.fg.g},${spans[spanIndex]!.fg.b},${spans[spanIndex]!.fg.a}`]
+        : []
+    })
+  })
+}
+
+function hasThinkingCommand(frame: string, command: string) {
+  return SPINNER_FRAMES.some((icon) => frame.includes(`${icon} ${command}`))
+}
+
 function panelMenu(root: BoxRenderable | RootRenderable) {
   const panel = child(child(root, 0), 0)
   const content = child(panel, 0)
@@ -326,7 +352,7 @@ test("run entry content updates when live commit text changes", async () => {
   const app = await testRender(
     () => (
       <box width={80} height={4}>
-        <RunEntryContent commit={commit()} theme={RUN_THEME_FALLBACK} width={80} />
+        <RunEntryContent commit={commit()} theme={RUN_THEME_FALLBACK} width={80} animated={false} loading={false} />
       </box>
     ),
     {
@@ -351,6 +377,408 @@ test("run entry content updates when live commit text changes", async () => {
     await app.renderOnce()
 
     expect(app.captureCharFrame()).toContain("I need to inspect the codebase")
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("run entry command text animates while active and returns to neutral when settled", async () => {
+  const command = "$ python3 -m unittest slow_test -v"
+  const [commit, setCommit] = createSignal<StreamCommit>({
+    kind: "tool",
+    text: "running shell",
+    phase: "start",
+    source: "tool",
+    partID: "shell:call-1",
+    tool: "bash",
+    toolState: "running",
+    shell: {
+      callID: "call-1",
+      command: command.slice(2),
+    },
+  })
+  const app = await testRender(
+    () => (
+      <box width={80} height={2}>
+        <RunEntryContent
+          commit={commit()}
+          theme={RUN_THEME_FALLBACK}
+          width={80}
+          animated={commit().toolState === "running"}
+          loading={commit().toolState === "running"}
+        />
+      </box>
+    ),
+    { width: 80, height: 2 },
+  )
+
+  try {
+    await app.renderOnce()
+    const active = app.captureSpans().lines.flatMap((line) => textColors(line.spans, command))
+    expect(app.captureCharFrame()).toContain(command)
+    expect(hasThinkingCommand(app.captureCharFrame(), command)).toBe(true)
+    expect(new Set(active).size).toBeGreaterThan(1)
+
+    setCommit({ ...commit(), toolState: "completed" })
+    await app.renderOnce()
+    const neutral = RUN_THEME_FALLBACK.block.text as RGBA
+    const settled = app.captureSpans().lines.flatMap((line) => textColors(line.spans, command))
+    expect(hasThinkingCommand(app.captureCharFrame(), command)).toBe(false)
+    expect(app.captureCharFrame()).not.toContain(`⋯ ${command}`)
+    expect(new Set(settled)).toEqual(new Set([`${neutral.r},${neutral.g},${neutral.b},${neutral.a}`]))
+
+    setCommit({ ...commit(), toolState: "error" })
+    await app.renderOnce()
+    const error = RUN_THEME_FALLBACK.entry.error.body as RGBA
+    const failed = app.captureSpans().lines.flatMap((line) => textColors(line.spans, command))
+    expect(hasThinkingCommand(app.captureCharFrame(), command)).toBe(false)
+    expect(app.captureCharFrame()).not.toContain(`⋯ ${command}`)
+    expect(new Set(failed)).toEqual(new Set([`${error.r},${error.g},${error.b},${error.a}`]))
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("direct footer shows the active command as animated text", async () => {
+  const command = "$ python3 -m unittest slow_test -v"
+  const app = await renderFooter({
+    state: {
+      phase: "running",
+      status: command,
+    },
+  })
+
+  try {
+    await app.renderOnce()
+    const colors = app.captureSpans().lines.flatMap((line) => textColors(line.spans, command))
+    expect(app.captureCharFrame()).toContain(command)
+    expect(hasThinkingCommand(app.captureCharFrame(), command)).toBe(true)
+    expect(new Set(colors).size).toBeGreaterThan(1)
+  } finally {
+    app.cleanup()
+  }
+})
+
+test("direct footer honors disabled animations for an active command", async () => {
+  const command = "$ python3 -m unittest slow_test -v"
+  const app = await renderFooter({
+    animationsEnabled: false,
+    state: {
+      phase: "running",
+      status: command,
+    },
+  })
+
+  try {
+    await app.renderOnce()
+    const colors = app.captureSpans().lines.flatMap((line) => textColors(line.spans, command))
+    expect(app.captureCharFrame()).toContain(command)
+    expect(app.captureCharFrame()).toContain(`⋯ ${command}`)
+    expect(hasThinkingCommand(app.captureCharFrame(), command)).toBe(false)
+    expect(new Set(colors).size).toBe(1)
+  } finally {
+    app.cleanup()
+  }
+})
+
+test("direct footer omits loading for a terminal command", async () => {
+  const command = "$ python3 -m unittest slow_test -v"
+  const app = await renderFooter({
+    state: {
+      phase: "idle",
+      status: command,
+    },
+  })
+
+  try {
+    await app.renderOnce()
+    expect(app.captureCharFrame()).toContain(command)
+    expect(hasThinkingCommand(app.captureCharFrame(), command)).toBe(false)
+    expect(app.captureCharFrame()).not.toContain(`⋯ ${command}`)
+  } finally {
+    app.cleanup()
+  }
+})
+
+test("direct footer keeps an active command animated while a blocker panel is open", async () => {
+  const command = "$ sleep 25m"
+  const permission = {
+    id: "permission-1",
+    sessionID: "session-1",
+    permission: "bash",
+    patterns: ["sleep 25m"],
+    metadata: { input: { command: "sleep 25m" } },
+    always: [],
+  } satisfies PermissionRequest
+  const readPermission = {
+    id: "permission-2",
+    sessionID: "session-1",
+    permission: "read",
+    patterns: ["/tmp/input.txt"],
+    metadata: { input: { filePath: "/tmp/input.txt" } },
+    always: [],
+  } satisfies PermissionRequest
+  const question = {
+    id: "question-1",
+    sessionID: "session-1",
+    questions: [
+      {
+        question: "Continue?",
+        header: "Continue",
+        options: [{ label: "Yes", description: "Keep running" }],
+        multiple: false,
+      },
+    ],
+  } satisfies QuestionRequest
+
+  for (const view of [
+    { type: "question", request: question },
+    { type: "permission", request: permission },
+    { type: "permission", request: readPermission },
+  ] satisfies FooterView[]) {
+    const app = await renderFooter({
+      height: 20,
+      view,
+      state: {
+        phase: "running",
+        status: command,
+      },
+    })
+
+    try {
+      await app.renderOnce()
+      const expectCommand = () => {
+        const colors = app.captureSpans().lines.flatMap((line) => textColors(line.spans, command))
+        expect(app.captureCharFrame()).toContain(command)
+        expect(app.captureCharFrame().split(command)).toHaveLength(2)
+        expect(hasThinkingCommand(app.captureCharFrame(), command)).toBe(true)
+        expect(new Set(colors).size).toBeGreaterThan(1)
+      }
+      expectCommand()
+
+      if (view.type === "permission" && view.request.permission === "bash") {
+        app.mockInput.pressTab()
+        app.mockInput.pressEnter()
+        await app.renderOnce()
+        expect(app.captureCharFrame()).toContain("Always allow")
+        expectCommand()
+
+        app.mockInput.pressTab()
+        app.mockInput.pressEnter()
+        await app.renderOnce()
+        app.mockInput.pressEscape()
+        await app.renderOnce()
+        expect(app.captureCharFrame()).toContain("Reject permission")
+        expectCommand()
+      }
+    } finally {
+      app.cleanup()
+    }
+  }
+})
+
+test("direct blockers use the Thinking fallback when animations are disabled", async () => {
+  const command = "$ sleep 25m"
+  const permission = {
+    id: "permission-1",
+    sessionID: "session-1",
+    permission: "bash",
+    patterns: ["sleep 25m"],
+    metadata: { input: { command: "sleep 25m" } },
+    always: [],
+  } satisfies PermissionRequest
+  const readPermission = {
+    id: "permission-2",
+    sessionID: "session-1",
+    permission: "read",
+    patterns: ["/tmp/input.txt"],
+    metadata: { input: { filePath: "/tmp/input.txt" } },
+    always: [],
+  } satisfies PermissionRequest
+  const question = {
+    id: "question-1",
+    sessionID: "session-1",
+    questions: [
+      {
+        question: "Continue?",
+        header: "Continue",
+        options: [{ label: "Yes", description: "Keep running" }],
+        multiple: false,
+      },
+    ],
+  } satisfies QuestionRequest
+
+  for (const view of [
+    { type: "question", request: question },
+    { type: "permission", request: permission },
+    { type: "permission", request: readPermission },
+  ] satisfies FooterView[]) {
+    const app = await renderFooter({
+      animationsEnabled: false,
+      height: 20,
+      view,
+      state: { phase: "running", status: command },
+    })
+
+    try {
+      await app.renderOnce()
+      expect(app.captureCharFrame()).toContain(`⋯ ${command}`)
+      expect(hasThinkingCommand(app.captureCharFrame(), command)).toBe(false)
+    } finally {
+      app.cleanup()
+    }
+  }
+})
+
+test("retained subagent permission command is neutral after its tab is cancelled", async () => {
+  const command = "$ sleep 25m"
+  const permission = {
+    id: "permission-1",
+    sessionID: "child-1",
+    permission: "bash",
+    patterns: ["sleep 25m"],
+    metadata: { input: { command: "sleep 25m" } },
+    always: [],
+  } satisfies PermissionRequest
+  const app = await renderFooter({
+    height: 20,
+    view: { type: "permission", request: permission },
+    subagents: {
+      tabs: [
+        subagent({
+          sessionID: "child-1",
+          label: "Explore",
+          description: "Inspect commands",
+          status: "cancelled",
+        }),
+      ],
+      details: {},
+      permissions: [permission],
+      questions: [],
+    },
+    state: { phase: "running", status: command },
+  })
+
+  try {
+    await app.renderOnce()
+    const neutral = RUN_THEME_FALLBACK.footer.text as RGBA
+    const colors = app.captureSpans().lines.flatMap((line) => textColors(line.spans, command))
+    expect(app.captureCharFrame().split(command)).toHaveLength(2)
+    expect(hasThinkingCommand(app.captureCharFrame(), command)).toBe(false)
+    expect(app.captureCharFrame()).not.toContain(`⋯ ${command}`)
+    expect(new Set(colors)).toEqual(new Set([`${neutral.r},${neutral.g},${neutral.b},${neutral.a}`]))
+  } finally {
+    app.cleanup()
+  }
+})
+
+test("retained subagent question command is neutral after its tab is cancelled", async () => {
+  const command = "$ sleep 25m"
+  const question = {
+    id: "question-1",
+    sessionID: "child-1",
+    questions: [
+      {
+        question: "Continue?",
+        header: "Continue",
+        options: [{ label: "Yes", description: "Keep running" }],
+        multiple: false,
+      },
+    ],
+  } satisfies QuestionRequest
+  const app = await renderFooter({
+    height: 20,
+    view: { type: "question", request: question },
+    subagents: {
+      tabs: [
+        subagent({
+          sessionID: "child-1",
+          label: "Explore",
+          description: "Inspect commands",
+          status: "cancelled",
+        }),
+      ],
+      details: {},
+      permissions: [],
+      questions: [question],
+    },
+    state: { phase: "running", status: command },
+  })
+
+  try {
+    await app.renderOnce()
+    const neutral = RUN_THEME_FALLBACK.footer.text as RGBA
+    const colors = app.captureSpans().lines.flatMap((line) => textColors(line.spans, command))
+    expect(app.captureCharFrame().split(command)).toHaveLength(2)
+    expect(hasThinkingCommand(app.captureCharFrame(), command)).toBe(false)
+    expect(app.captureCharFrame()).not.toContain(`⋯ ${command}`)
+    expect(new Set(colors)).toEqual(new Set([`${neutral.r},${neutral.g},${neutral.b},${neutral.a}`]))
+  } finally {
+    app.cleanup()
+  }
+})
+
+test("subagent inspector neutralizes an active command when its tab is cancelled", async () => {
+  const command = "$ sleep 25m"
+  const [animationsEnabled, setAnimationsEnabled] = createSignal(true)
+  const [tab, setTab] = createSignal<FooterSubagentTab>(
+    subagent({ sessionID: "child-1", label: "Explore", description: "Inspect commands" }),
+  )
+  const detail = {
+    sessionID: "child-1",
+    commits: [
+      {
+        kind: "tool",
+        text: "running shell",
+        phase: "start",
+        source: "tool",
+        partID: "tool-1",
+        tool: "bash",
+        toolState: "running",
+        shell: { callID: "call-1", command: "sleep 25m" },
+      } satisfies StreamCommit,
+    ],
+  }
+  const app = await testRender(
+    () => (
+      <box width={80} height={10}>
+        <RunFooterSubagentBody
+          active={() => false}
+          theme={() => RUN_THEME_FALLBACK}
+          tab={tab}
+          index={() => 1}
+          total={() => 1}
+          detail={() => detail}
+          width={() => 80}
+          animationsEnabled={animationsEnabled()}
+          onCycle={() => {}}
+          onClose={() => {}}
+        />
+      </box>
+    ),
+    { width: 80, height: 10 },
+  )
+
+  try {
+    await app.renderOnce()
+    await app.renderOnce()
+    const active = app.captureSpans().lines.flatMap((line) => textColors(line.spans, command))
+    expect(app.captureCharFrame()).toContain(command)
+    expect(hasThinkingCommand(app.captureCharFrame(), command)).toBe(true)
+    expect(new Set(active).size).toBeGreaterThan(1)
+
+    setAnimationsEnabled(false)
+    await app.renderOnce()
+    expect(app.captureCharFrame()).toContain(`⋯ ${command}`)
+    expect(hasThinkingCommand(app.captureCharFrame(), command)).toBe(false)
+
+    setTab({ ...tab(), status: "cancelled" })
+    await app.renderOnce()
+    const neutral = RUN_THEME_FALLBACK.block.text as RGBA
+    const cancelled = app.captureSpans().lines.flatMap((line) => textColors(line.spans, command))
+    expect(hasThinkingCommand(app.captureCharFrame(), command)).toBe(false)
+    expect(app.captureCharFrame()).not.toContain(`⋯ ${command}`)
+    expect(new Set(cancelled)).toEqual(new Set([`${neutral.r},${neutral.g},${neutral.b},${neutral.a}`]))
   } finally {
     app.renderer.destroy()
   }
@@ -986,6 +1414,7 @@ test("direct footer shows editable prompts and additional queued work while runn
             { messageID: "m-queued", partID: "p-queued", prompt: { text: "follow up", parts: [] } },
           ]}
           theme={() => RUN_THEME_FALLBACK}
+          animationsEnabled={true}
           tuiConfig={tuiConfig}
           backgroundSubagents={true}
           agent="opencode"
