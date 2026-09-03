@@ -20,6 +20,7 @@ import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
 import { Question } from "@/question"
+import { ProviderError } from "@/provider/error"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -718,6 +719,7 @@ const layer = Layer.effect(
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
         let retrySafe = true
+        let toolActivity = false
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
@@ -728,15 +730,15 @@ const layer = Layer.effect(
 
             yield* stream.pipe(
               Stream.tap((event) => {
+                if (event.type === "reasoning-start" || event.type === "text-start") retrySafe = false
                 if (
-                  event.type === "reasoning-start" ||
-                  event.type === "text-start" ||
                   event.type === "tool-input-start" ||
                   event.type === "tool-call" ||
                   event.type === "tool-result" ||
                   event.type === "tool-error"
                 ) {
                   retrySafe = false
+                  toolActivity = true
                 }
                 return handleEvent(event)
               }),
@@ -760,7 +762,7 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
-                shouldRetry: () => retrySafe,
+                shouldRetry: (error) => retrySafe || (!toolActivity && error instanceof ProviderError.ResponseStreamError),
                 set: (info) => {
                   return status.set(ctx.sessionID, {
                     type: "retry",

@@ -9,6 +9,7 @@ import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
 import { Provider } from "@/provider/provider"
+import { ProviderError } from "@/provider/error"
 
 import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
@@ -185,6 +186,38 @@ const env = LayerNode.compile(
 )
 
 const it = testEffect(env)
+
+let responseStreamRetryAttempts = 0
+const responseStreamRetryLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () => {
+      responseStreamRetryAttempts++
+      if (responseStreamRetryAttempts > 1) {
+        return Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textStart({ id: "text-2" }),
+          LLMEvent.textDelta({ id: "text-2", text: "after retry" }),
+          LLMEvent.textEnd({ id: "text-2" }),
+          LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+          LLMEvent.finish({ reason: "stop" }),
+        )
+      }
+      return Stream.concat(
+        Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.reasoningStart({ id: "reasoning-1" }),
+          LLMEvent.reasoningDelta({ id: "reasoning-1", text: "thinking" }),
+          LLMEvent.textStart({ id: "text-1" }),
+          LLMEvent.textDelta({ id: "text-1", text: "partial" }),
+        ),
+        Stream.fail(new ProviderError.ResponseStreamError("WebSocket closed before response.completed (code 1006)")),
+      )
+    },
+  }),
+)
+const responseStreamRetryEnv = LayerNode.compile(root, [...replacements, [LLM.node, responseStreamRetryLLM]])
+const itResponseStreamRetry = testEffect(responseStreamRetryEnv)
 
 const providerErrorLLM = Layer.succeed(
   LLM.Service,
@@ -648,6 +681,51 @@ it.live("session.processor effect tests retry OpenAI-compatible midstream server
         expect(handle.message.error).toBeUndefined()
       }),
     { config: (url) => providerCfg(url) },
+  ),
+)
+
+itResponseStreamRetry.live("session.processor effect tests retry OpenAI WebSocket 1006 after passive output starts", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        responseStreamRetryAttempts = 0
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry websocket 1006")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "retry websocket 1006" }],
+          tools: {},
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+
+        expect(value).toBe("continue")
+        expect(responseStreamRetryAttempts).toBe(2)
+        expect(parts.some((part) => part.type === "text" && part.text === "after retry")).toBe(true)
+        expect(handle.message.error).toBeUndefined()
+      }),
+    { config: cfg },
   ),
 )
 
