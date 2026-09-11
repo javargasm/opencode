@@ -87,6 +87,42 @@ test("moves legacy image data URLs into blobs and hydrates object URLs", async (
   expect(value.prompt[0].blob.url).toStartWith("blob:")
 })
 
+test("persists stash image references without their transient object URLs", async () => {
+  const documents = new Map<string, string>()
+  const blobs = new Map<string, Blob>()
+  const store = createDraftStore({
+    get: async (key) => documents.get(key) ?? null,
+    set: async (key, value) => void documents.set(key, value),
+    remove: async (key) => void documents.delete(key),
+    putBlob: async (blob) => {
+      blobs.set("stash-image", blob)
+      return "stash-image"
+    },
+    getBlob: async (id) => blobs.get(id) ?? null,
+  })
+  const blob = await store.putBlob(new Blob(["stash image"], { type: "image/png" }))
+
+  await store.setItem(
+    "prompt.stash",
+    JSON.stringify({
+      entries: [
+        {
+          id: "stash",
+          input: "",
+          timestamp: 1,
+          parts: [{ type: "image", id: "image", filename: "image.png", mime: "image/png", blob }],
+        },
+      ],
+    }),
+  )
+
+  const raw = JSON.parse(documents.get("prompt.stash")!)
+  expect(raw.entries[0].parts[0].blob).toEqual({ id: "stash-image" })
+
+  const restored = JSON.parse((await store.getItem("prompt.stash"))!)
+  expect(restored.entries[0].parts[0].blob).toMatchObject({ id: "stash-image", url: expect.stringMatching(/^blob:/) })
+})
+
 test("does not let delayed blob migration overwrite a newer draft", async () => {
   const documents = new Map<string, string>()
   const migration = Promise.withResolvers<void>()

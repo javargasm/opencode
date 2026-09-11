@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import { ServerConnection } from "@/context/server"
-import { legacySessionHref, legacySessionServer, requireServerKey, rootSession, sessionHref } from "./session-route"
+import {
+  legacySessionHref,
+  legacySessionServer,
+  requireServerKey,
+  rootSession,
+  sessionHref,
+  sessionHrefForRoute,
+} from "./session-route"
 
 describe("session routes", () => {
   test("uses the unique persisted server for a legacy session route", () => {
@@ -42,6 +49,14 @@ describe("session routes", () => {
     expect(legacySessionHref("/Users/example/project", "session-1")).toBe(
       "/L1VzZXJzL2V4YW1wbGUvcHJvamVjdA/session/session-1",
     )
+  })
+
+  test("preserves the route server when navigating to a newly created session", () => {
+    const server = ServerConnection.Key.make("https://remote.example:4096")
+    const serverKey = sessionHref(server, "source").split("/")[2]!
+
+    expect(sessionHrefForRoute(serverKey, "/repo", "forked")).toBe(sessionHref(server, "forked"))
+    expect(sessionHrefForRoute(undefined, "/repo", "forked")).toBe(legacySessionHref("/repo", "forked"))
   })
 
   test("resolves the root session", async () => {

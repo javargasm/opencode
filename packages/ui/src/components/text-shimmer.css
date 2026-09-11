@@ -100,6 +100,15 @@
   }
 }
 
+[data-component="text-shimmer"][data-variant="wave"] {
+  --text-shimmer-duration: 1350ms;
+  --text-shimmer-spread: 3.8ch;
+}
+
+[data-component="text-shimmer"][data-variant="wave"] [data-slot="text-shimmer-char-shimmer"][data-run="true"] {
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--text-shimmer-peak-color) 40%, transparent));
+}
+
 @media (prefers-reduced-motion: reduce) {
   [data-component="text-shimmer"] [data-slot="text-shimmer-char-base"],
   [data-component="text-shimmer"] [data-slot="text-shimmer-char-shimmer"] {

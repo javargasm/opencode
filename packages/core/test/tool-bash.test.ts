@@ -2,7 +2,7 @@ import fs from "fs/promises"
 import { realpathSync } from "node:fs"
 import path from "path"
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Duration, Effect, Layer, Schema } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Config } from "@opencode-ai/core/config"
@@ -416,6 +416,36 @@ describe("BashTool", () => {
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
     ),
   )
+
+  it.live("preserves sub-second timeout values in milliseconds", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        return withTool(tmp.path, (registry) =>
+          settleTool(registry, call({ command: "sleep 1", timeout: 500 })),
+        ).pipe(
+          Effect.andThen(() =>
+            Effect.sync(() => {
+              expect(runs[0]?.options?.timeout).toEqual(Duration.millis(500))
+            }),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  test("preserves millisecond timeout values and enforces the millisecond limit", () => {
+    expect(BashTool.normalizeTimeoutMs(undefined)).toBe(120_000)
+    for (const timeout of [1, 500, 999, 9_999, 10_000, 120_000, BashTool.MAX_TIMEOUT_MS]) {
+      expect(BashTool.normalizeTimeoutMs(timeout)).toBe(timeout)
+      expect(Schema.decodeUnknownSync(BashTool.Input)({ command: "true", timeout }).timeout).toBe(timeout)
+    }
+    expect(() =>
+      Schema.decodeUnknownSync(BashTool.Input)({ command: "true", timeout: BashTool.MAX_TIMEOUT_MS + 1 }),
+    ).toThrow()
+  })
 })
 
 test("keeps locked deferred parity TODOs visible", async () => {

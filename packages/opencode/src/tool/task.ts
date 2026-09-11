@@ -485,12 +485,21 @@ export const TaskTool = Tool.define(
         providerID: parentMessage.providerID,
         variant: parentMessage.variant,
       }
-      const agentModel: TaskModel | undefined = next.model ? { ...next.model, variant: next.variant } : undefined
+      const sameConfiguredModel =
+        next.model !== undefined &&
+        next.model.providerID === parentModel.providerID &&
+        next.model.modelID === parentModel.modelID
+      const agentModel: TaskModel | undefined = next.model
+        ? {
+            ...next.model,
+            variant: next.variant ?? (sameConfiguredModel ? parentModel.variant : undefined),
+          }
+        : undefined
       const storedModel: TaskModel | undefined = session?.model
         ? {
             modelID: session.model.id,
             providerID: session.model.providerID,
-            variant: session.model.variant ?? "default",
+            variant: session.model.variant ?? (agentModel ?? parentModel).variant ?? "default",
           }
         : undefined
       const trustedModel = agentModel ?? parentModel
@@ -582,7 +591,7 @@ export const TaskTool = Tool.define(
         model: {
           modelID: model.modelID,
           providerID: model.providerID,
-          ...(params.variant !== undefined ? { variant: model.variant } : {}),
+          ...(model.variant !== undefined ? { variant: model.variant } : {}),
         },
         backgroundTaskGeneration: undefined as string | undefined,
         ...(runInBackground ? { background: true } : {}),

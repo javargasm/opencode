@@ -24,6 +24,14 @@ import { BashArity } from "@/permission/arity"
 
 export { Parameters } from "./shell/prompt"
 
+/**
+ * Shell timeouts have always crossed this tool boundary in milliseconds. Do not
+ * infer a unit from the magnitude: short, legacy millisecond values are valid.
+ */
+export function normalizeTimeoutMs(timeout: number | undefined, defaultMs: number = 2 * 60 * 1000): number {
+  return timeout ?? defaultMs
+}
+
 const MAX_METADATA_LENGTH = 30_000
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
@@ -615,7 +623,7 @@ export const ShellTool = Tool.define(
               if (params.timeout !== undefined && params.timeout < 0) {
                 throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
               }
-              const timeout = params.timeout ?? defaultTimeoutMs
+              const timeout = normalizeTimeoutMs(params.timeout, defaultTimeoutMs)
               const ps = Shell.ps(shell)
               yield* Effect.scoped(
                 Effect.gen(function* () {

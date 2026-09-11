@@ -7,7 +7,7 @@ import os from "os"
 import path from "path"
 import { Config } from "@/config/config"
 import { Shell } from "@opencode-ai/core/shell"
-import { ShellTool } from "../../src/tool/shell"
+import { normalizeTimeoutMs, ShellTool } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
 import type { Permission } from "../../src/permission"
@@ -1055,6 +1055,19 @@ describe("tool.shell abort", () => {
         }),
       ),
     15_000,
+  )
+
+  it.effect("preserves timeout values in milliseconds", () =>
+    Effect.sync(() => {
+      expect(normalizeTimeoutMs(undefined)).toBe(120_000)
+      expect(normalizeTimeoutMs(1)).toBe(1)
+      expect(normalizeTimeoutMs(500)).toBe(500)
+      expect(normalizeTimeoutMs(999)).toBe(999)
+      expect(normalizeTimeoutMs(9_999)).toBe(9_999)
+      expect(normalizeTimeoutMs(10_000)).toBe(10_000)
+      expect(normalizeTimeoutMs(120_000)).toBe(120_000)
+      expect(normalizeTimeoutMs(1_800_000)).toBe(1_800_000)
+    }),
   )
 
   it.live(

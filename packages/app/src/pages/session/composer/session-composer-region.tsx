@@ -6,6 +6,7 @@ import { SessionQuestionDock } from "@/pages/session/composer/session-question-d
 import { SessionFollowupDock } from "@/pages/session/composer/session-followup-dock"
 import { SessionRevertDock } from "@/pages/session/composer/session-revert-dock"
 import { SessionTodoDock } from "@/pages/session/composer/session-todo-dock"
+import { SubagentFooter } from "@/pages/session/composer/subagent-footer"
 import type { SessionComposerRegionController } from "./session-composer-region-controller"
 
 export function SessionComposerRegion(props: {
@@ -143,20 +144,12 @@ export function SessionComposerRegion(props: {
                 when={controller.child()}
                 fallback={<Show when={!controller.state.blocked()}>{props.promptInput}</Show>}
               >
-                <div
-                  ref={controller.setPromptRef}
-                  class="w-full rounded-[12px] border border-border-weak-base bg-background-base p-3 text-16-regular text-text-weak"
-                >
-                  <span>{language.t("session.child.promptDisabled")} </span>
-                  <Show when={controller.parentID()}>
-                    <button
-                      type="button"
-                      class="text-text-base transition-colors hover:text-text-strong"
-                      onClick={controller.openParent}
-                    >
-                      {language.t("session.child.backToParent")}
-                    </button>
-                  </Show>
+                <div ref={controller.setPromptRef} class="w-full">
+                  <SubagentFooter
+                    sessionID={controller.sessionID?.() ?? ""}
+                    parentID={controller.parentID() ?? ""}
+                    openParent={controller.openParent}
+                  />
                 </div>
               </Show>
             </div>

@@ -13,7 +13,7 @@ import {
 } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import { Dynamic } from "solid-js/web"
-import { useNavigate } from "@solidjs/router"
+import { useNavigate, useParams } from "@solidjs/router"
 import { useMutation } from "@tanstack/solid-query"
 import { createVirtualizer, defaultRangeExtractor, elementScroll, type VirtualItem } from "@tanstack/solid-virtual"
 import { Accordion } from "@opencode-ai/ui/accordion"
@@ -61,6 +61,7 @@ import { useFileComponent } from "@opencode-ai/ui/context/file"
 import { shouldMarkBoundaryGesture, normalizeWheelDelta } from "@/pages/session/message-gesture"
 import { SessionContextUsage } from "@/components/session-context-usage"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
+import { DialogTimeline } from "@/components/dialog-timeline"
 import { useLanguage } from "@/context/language"
 import { useSessionKey } from "@/pages/session/session-layout"
 import { useSessionArchive } from "@/pages/session/session-archive"
@@ -133,7 +134,7 @@ function TimelineThinkingRow(props: { reasoningHeading?: string; showReasoningSu
   const language = useLanguage()
 
   return (
-    <div data-slot="session-turn-thinking">
+    <div data-slot="session-turn-thinking" class="flex items-center gap-2 flex-wrap">
       <TextShimmer text={language.t("ui.sessionTurn.status.thinking")} />
       <Show when={!props.showReasoningSummaries}>
         <TextReveal text={props.reasoningHeading} class="session-turn-thinking-heading" travel={25} duration={700} />
@@ -936,6 +937,96 @@ export function MessageTimeline(props: {
     )
   }
 
+  function DialogRenameSession(props: { sessionID: string }) {
+    const currentTitle = () => sessionTitle(sync().session.get(props.sessionID)?.title) ?? ""
+    const [titleInput, setTitleInput] = createSignal(currentTitle())
+
+    const handleRename = async (e?: Event) => {
+      e?.preventDefault()
+      const next = titleInput().trim()
+      if (next && next !== currentTitle()) {
+        try {
+          await titleMutation.mutateAsync({ id: props.sessionID, title: next })
+        } catch {
+          return
+        }
+      }
+      dialog.close()
+    }
+
+    if (settings.general.newLayoutDesigns())
+      return (
+        <DialogV2 fit class="w-[400px]">
+          <form onSubmit={handleRename} class="contents">
+            <DialogHeader>
+              <DialogTitleGroup title={language.t("common.rename")} description="" />
+            </DialogHeader>
+            <div class="px-4 py-3">
+              <input
+                autofocus
+                ref={(el) => {
+                  setTimeout(() => {
+                    el?.focus()
+                    el?.select()
+                  }, 0)
+                }}
+                class="w-full h-8 px-2.5 rounded-[6px] text-[13px] bg-v2-surface-input border border-v2-border-base text-v2-text-text-base outline-none focus:border-v2-border-focus"
+                value={titleInput()}
+                onInput={(e) => setTitleInput(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    e.preventDefault()
+                    dialog.close()
+                  }
+                }}
+              />
+            </div>
+            <DialogFooter>
+              <ButtonV2 variant="ghost" onClick={() => dialog.close()}>
+                {language.t("common.cancel")}
+              </ButtonV2>
+              <ButtonV2 variant="contrast" type="submit" disabled={titleMutation.isPending}>
+                {language.t("common.save")}
+              </ButtonV2>
+            </DialogFooter>
+          </form>
+        </DialogV2>
+      )
+
+    return (
+      <Dialog title={language.t("common.rename")} fit>
+        <form onSubmit={handleRename} class="flex flex-col gap-4 p-6 pt-0 w-[360px]">
+          <TextField
+            autofocus
+            ref={(el: HTMLInputElement | null) => {
+              setTimeout(() => {
+                el?.focus()
+                el?.select()
+              }, 0)
+            }}
+            type="text"
+            value={titleInput()}
+            onChange={setTitleInput}
+            onKeyDown={(e: KeyboardEvent) => {
+              if (e.key === "Escape") {
+                e.preventDefault()
+                dialog.close()
+              }
+            }}
+          />
+          <div class="flex justify-end gap-2">
+            <Button variant="ghost" size="large" onClick={() => dialog.close()}>
+              {language.t("common.cancel")}
+            </Button>
+            <Button variant="primary" size="large" type="submit" disabled={titleMutation.isPending}>
+              {language.t("common.save")}
+            </Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+
   const workingTurn = (userMessageID: string) => sessionStatus().type !== "idle" && activeMessageID() === userMessageID
 
   const turnDurationMs = (userMessageID: string) => {
@@ -1525,10 +1616,7 @@ export function MessageTimeline(props: {
                                 }}
                               >
                                 <DropdownMenu.Item
-                                  onSelect={() => {
-                                    setTitle("pendingRename", true)
-                                    setTitle("menuOpen", false)
-                                  }}
+                                  onSelect={() => dialog.show(() => <DialogRenameSession sessionID={id} />)}
                                 >
                                   <DropdownMenu.ItemLabel>{language.t("common.rename")}</DropdownMenu.ItemLabel>
                                 </DropdownMenu.Item>
@@ -1543,6 +1631,9 @@ export function MessageTimeline(props: {
                                     </DropdownMenu.ItemLabel>
                                   </DropdownMenu.Item>
                                 </Show>
+                                <DropdownMenu.Item onSelect={() => dialog.show(() => <DialogTimeline sessionID={id} />)}>
+                                  <DropdownMenu.ItemLabel>Timeline</DropdownMenu.ItemLabel>
+                                </DropdownMenu.Item>
                                 <DropdownMenu.Item onSelect={() => exportSession(id)}>
                                   <DropdownMenu.ItemLabel>{language.t("common.export")}</DropdownMenu.ItemLabel>
                                 </DropdownMenu.Item>
@@ -1601,10 +1692,7 @@ export function MessageTimeline(props: {
                               }}
                             >
                               <MenuV2.Item
-                                onSelect={() => {
-                                  setTitle("pendingRename", true)
-                                  setTitle("menuOpen", false)
-                                }}
+                                onSelect={() => dialog.show(() => <DialogRenameSession sessionID={id} />)}
                               >
                                 {language.t("common.rename")}
                               </MenuV2.Item>
@@ -1617,6 +1705,9 @@ export function MessageTimeline(props: {
                                   {language.t("session.share.action.share")}...
                                 </MenuV2.Item>
                               </Show>
+                              <MenuV2.Item onSelect={() => dialog.show(() => <DialogTimeline sessionID={id} />)}>
+                                Timeline
+                              </MenuV2.Item>
                               <MenuV2.Item onSelect={() => exportSession(id)}>
                                 {language.t("common.export")}...
                               </MenuV2.Item>

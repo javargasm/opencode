@@ -266,7 +266,8 @@ export const loadAgentsQuery = (
     queryKey: [scope, directory, "agents"],
     queryFn: () =>
       retry(async () => {
-        if ((await protocol) === "v1" && legacy) return normalizeAgentList((await legacy.app.agents()).data ?? [])
+        if ((await protocol) === "v1" && legacy)
+          return normalizeAgentList((await legacy.app.agents({ directory })).data ?? [])
         return sdk.list({ location: { directory } }).then((result) => normalizeAgentList(result.data))
       }),
   })
@@ -279,7 +280,7 @@ export const loadCommands = (
 ): Promise<CommandInfo[]> =>
   retry(async () => {
     if ((await protocol) === "v1" && legacy) {
-      return ((await legacy.command.list()).data ?? []).map((command) => {
+      return ((await legacy.command.list({ directory })).data ?? []).map((command) => {
         const [providerID, id] = command.model?.split("/") ?? []
         return {
           name: command.name,
@@ -375,9 +376,9 @@ export async function bootstrapDirectory(input: {
     const slow = [
       () => Promise.resolve(input.loadSessions(input.directory)),
       () =>
-        input.queryClient
-          .ensureQueryData(loadAgentsQuery(input.scope, input.directory, input.api.agent, input.sdk, input.protocol))
-          .then((data) => input.setStore("agent", data)),
+        input.queryClient.ensureQueryData(
+          loadAgentsQuery(input.scope, input.directory, input.api.agent, input.sdk, input.protocol),
+        ),
       () =>
         retry(async () => {
           if ((await input.protocol) !== "v1") return

@@ -26,6 +26,8 @@ import { useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { showToast } from "@/utils/toast"
+import { getActiveDescendantCount, sessionActivityLabel } from "@/utils/active-descendant"
+import { TextShimmer } from "@opencode-ai/ui/text-shimmer"
 import { PromptInputV2, type PromptInputV2Suggestion } from "@opencode-ai/session-ui/v2/prompt-input"
 import {
   createPromptInputV2Controller,
@@ -42,12 +44,29 @@ export type PromptInputV2ComposerProps = {
 export type PromptInputV2ControllerProps = Omit<PromptInputProps, "class" | "submission">
 export type PromptInputV2ComposerController = PromptInputV2Interaction & {
   readonly model: PromptInputProps["controls"]["model"]
+  readonly session?: PromptInputProps["controls"]["session"]
 }
 
 export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
+  const sync = useSync()
   const dialog = useDialog()
   const command = useCommand()
   const language = useLanguage()
+
+  const activeSubagentCount = createMemo(() => {
+    const s = sync()
+    const sessions = s.data.session ?? []
+    const statuses = s.data.session_status ?? {}
+    const sessionID = props.controller.session?.id
+    const descendantCount = getActiveDescendantCount(sessionID, sessions, statuses)
+    if (descendantCount > 0) return descendantCount
+    return sessions.filter((sess) => {
+      if (!sess.parentID) return false
+      const status = statuses[sess.id]
+      return status && status.type !== "idle"
+    }).length
+  })
+  const activeSubagentLabel = createMemo(() => sessionActivityLabel(activeSubagentCount()))
 
   return (
     <div class="flex flex-col gap-3">
@@ -72,6 +91,30 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
               dialog.show(() => <DialogSelectModelUnpaidV2 model={props.controller.model.selection} />)
             }
           />
+        }
+        subagentControl={
+          <Show when={activeSubagentLabel()}>
+            <div
+              data-component="prompt-subagent-control"
+              class="animate-in fade-in duration-300 shrink-0"
+            >
+              <div
+                class="flex items-center gap-1.5 px-2 h-7 rounded text-13-regular text-text-success font-medium select-none"
+                title={activeSubagentLabel()}
+              >
+                <span class="size-1.5 rounded-full bg-icon-success-base animate-pulse shrink-0" />
+                <TextShimmer
+                  text={activeSubagentLabel() ?? ""}
+                  variant="wave"
+                  class="truncate font-medium text-13-regular text-text-success"
+                  style={{
+                    "--text-shimmer-base-color": "var(--icon-success-base)",
+                    "--text-shimmer-peak-color": "var(--text-strong)",
+                  }}
+                />
+              </div>
+            </div>
+          </Show>
         }
       />
     </div>
@@ -409,6 +452,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     },
   })
   Object.defineProperty(controller, "model", { get: () => props.controls.model })
+  Object.defineProperty(controller, "session", { get: () => props.controls.session })
 
   command.register("prompt-input", () => [
     {

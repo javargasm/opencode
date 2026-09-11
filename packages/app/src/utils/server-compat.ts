@@ -20,8 +20,11 @@ type LegacyClient = OpencodeClient
 type LegacyFor = (directory?: string) => LegacyClient
 type CompatibleSessionApi = Omit<
   SessionApi,
-  "prompt" | "command" | "shell" | "compact" | "rename" | "archive" | "remove"
+  "prompt" | "command" | "shell" | "compact" | "rename" | "archive" | "remove" | "create"
 > & {
+  create: (
+    input?: Parameters<SessionApi["create"]>[0] & { parentID?: string; title?: string },
+  ) => ReturnType<SessionApi["create"]>
   prompt: (input: SessionPromptInput & LegacyPrompt) => Promise<SessionPromptOutput>
   command: (input: SessionCommandInput) => Promise<SessionCommandOutput>
   shell: (input: SessionShellInput & LegacyPrompt) => Promise<SessionShellOutput>
@@ -67,7 +70,7 @@ function sessionInfo(session: Session): SessionInfo {
     model: session.model && {
       id: session.model.id,
       providerID: session.model.providerID,
-      variant: session.model.variant,
+      variant: session.model.variant === "default" ? undefined : session.model.variant,
     },
     cost: session.cost ?? 0,
     tokens: session.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
@@ -85,12 +88,15 @@ function sessionInfo(session: Session): SessionInfo {
 
 export function createCompatibleApi(input: CompatibleInput): CompatibleApi {
   const v1 = createV1Api(input)
-  // V2 compaction cannot resolve a model yet, so it must use the legacy endpoint.
+  // V2 compaction, rename, remove, and fork use legacy endpoints until native V2 endpoints exist on the server.
   const v2 = {
     ...input.current,
     session: {
       ...input.current.session,
       compact: v1.session.compact,
+      rename: v1.session.rename,
+      remove: v1.session.remove,
+      fork: v1.session.fork,
     },
   }
   return lazyApi(
@@ -168,9 +174,21 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
         })
         return { data: (result.data ?? []).map(sessionInfo), cursor: {} }
       },
-      async create(value?: Parameters<ServerApi["session"]["create"]>[0]) {
+      async create(
+        value?: Parameters<ServerApi["session"]["create"]>[0] & { parentID?: string; title?: string },
+      ) {
         const result = await legacy(value?.location ?? undefined).session.create({
           directory: directory(value?.location ?? undefined),
+          parentID: value?.parentID ?? undefined,
+          title: value?.title ?? undefined,
+          agent: value?.agent ?? undefined,
+          model: value?.model
+            ? {
+                id: value.model.id,
+                providerID: value.model.providerID,
+                variant: value.model.variant === "default" ? undefined : (value.model.variant ?? undefined),
+              }
+            : undefined,
         })
         if (!result.data) throw new Error("Failed to create session")
         return sessionInfo(result.data)

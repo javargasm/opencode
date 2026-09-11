@@ -54,6 +54,7 @@ import { useTheme, type ColorScheme } from "@opencode-ai/ui/theme/context"
 import { useCommand, type CommandOption } from "@/context/command"
 import { ConstrainDragXAxis, getDraggableId } from "@/utils/solid-dnd"
 import { DebugBar } from "@/components/debug-bar"
+import { WORKSPACE_HEALTH_FOOTER_MOUNT_ID } from "@/components/workspace-health-footer"
 import { TabsInfoPopup } from "@/components/help-button"
 import { Titlebar, type TitlebarUpdate } from "@/components/titlebar"
 import { useDirectoryPicker } from "@/components/directory-picker"
@@ -2401,6 +2402,7 @@ export default function LegacyLayout(props: ParentProps) {
             </div>
           </div>
         </div>
+        <div id={WORKSPACE_HEALTH_FOOTER_MOUNT_ID} class="shrink-0" />
         {import.meta.env.DEV && import.meta.env.VITE_DISABLE_DEBUG_BAR !== "1" && state.debugTools && <DebugBar />}
       </div>
       <TabsInfoPopup />

@@ -776,6 +776,79 @@ describe("tool.task", () => {
     }),
   )
 
+  background.instance(
+    "inherits the parent message variant to background subagent session, prompt, and metadata when omitted",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const ready = defer<SessionPrompt.PromptInput>()
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            background: true,
+          },
+          taskContext(
+            chat.id,
+            assistant.id,
+            stubOps({
+              onPrompt: (input) => ready.resolve(input),
+            }),
+          ),
+        )
+
+        const prompt = yield* Effect.promise(() => ready.promise)
+        yield* waitForTerminalExecution(result.metadata.sessionId)
+        const child = yield* sessions.get(result.metadata.sessionId)
+
+        expect(result.metadata.model.variant).toBe("xhigh")
+        expect(child?.model?.variant).toBe("xhigh")
+        expect(prompt.variant).toBe("xhigh")
+      }),
+  )
+
+  background.instance(
+    "inherits parent variant when subagent agent config matches parent model without explicit variant",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const ready = defer<SessionPrompt.PromptInput>()
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            background: true,
+          },
+          taskContext(
+            chat.id,
+            assistant.id,
+            stubOps({
+              onPrompt: (input) => ready.resolve(input),
+            }),
+          ),
+        )
+
+        const prompt = yield* Effect.promise(() => ready.promise)
+        yield* waitForTerminalExecution(result.metadata.sessionId)
+        const child = yield* sessions.get(result.metadata.sessionId)
+
+        expect(result.metadata.model.variant).toBe("xhigh")
+        expect(child?.model?.variant).toBe("xhigh")
+        expect(prompt.variant).toBe("xhigh")
+      }),
+    { config: { agent: { general: { model: "test/test-model" } } } },
+  )
+
   it.instance("propagates an explicit variant when resuming a task session", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service

@@ -80,6 +80,8 @@ import { PromptDragOverlay } from "./prompt-input/drag-overlay"
 import { promptPlaceholder } from "./prompt-input/placeholder"
 import { createPromptInputTransientState } from "./prompt-input/transient-state"
 import { showToast } from "@/utils/toast"
+import { getActiveDescendantCount, sessionActivityLabel } from "@/utils/active-descendant"
+import { TextShimmer } from "@opencode-ai/ui/text-shimmer"
 import { ImagePreview } from "@opencode-ai/ui/image-preview"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
 
@@ -271,6 +273,21 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const buttons = createMemo(() => motion(buttonsSpring()))
   const shell = createMemo(() => motion(1 - buttonsSpring()))
   const control = createMemo(() => ({ height: "28px", ...buttons() }))
+
+  const activeSubagentCount = createMemo(() => {
+    const s = sync()
+    const sessions = s.data.session ?? []
+    const statuses = s.data.session_status ?? {}
+    const sessionID = props.controls.session.id
+    const descendantCount = getActiveDescendantCount(sessionID, sessions, statuses)
+    if (descendantCount > 0) return descendantCount
+    return sessions.filter((sess) => {
+      if (!sess.parentID) return false
+      const status = statuses[sess.id]
+      return status && status.type !== "idle"
+    }).length
+  })
+  const activeSubagentLabel = createMemo(() => sessionActivityLabel(activeSubagentCount()))
 
   const commentCount = createMemo(() => {
     if (store.mode === "shell") return 0
@@ -1779,6 +1796,29 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                             variant="ghost"
                           />
                         </TooltipKeybind>
+                      </div>
+                    </Show>
+                    <Show when={activeSubagentLabel()}>
+                      <div
+                        data-component="prompt-subagent-control"
+                        class="animate-in fade-in duration-300 shrink-0"
+                      >
+                        <div
+                          class="flex items-center gap-1.5 px-2 rounded text-13-regular text-text-success font-medium select-none"
+                          style={control()}
+                          title={activeSubagentLabel()}
+                        >
+                          <span class="size-1.5 rounded-full bg-icon-success-base animate-pulse shrink-0" />
+                          <TextShimmer
+                            text={activeSubagentLabel() ?? ""}
+                            variant="wave"
+                            class="truncate font-medium text-13-regular text-text-success"
+                            style={{
+                              "--text-shimmer-base-color": "var(--icon-success-base)",
+                              "--text-shimmer-peak-color": "var(--text-strong)",
+                            }}
+                          />
+                        </div>
                       </div>
                     </Show>
                   </Show>

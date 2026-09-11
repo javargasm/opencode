@@ -10,12 +10,40 @@ import type {
 import { QueryClient } from "@tanstack/solid-query"
 import { canDisposeDirectory, pickDirectoriesToEvict } from "./global-sync/eviction"
 import { estimateRootSessionTotal, loadRootSessions } from "./global-sync/session-load"
-import { loadActiveSessionsQuery, loadMcpQuery, loadMcpResourcesQuery, seedActiveSessionStatuses } from "./server-sync"
+import {
+  invalidateAgentQueries,
+  loadActiveSessionsQuery,
+  loadMcpQuery,
+  loadMcpResourcesQuery,
+  seedActiveSessionStatuses,
+} from "./server-sync"
 import { ServerScope } from "@/utils/server-scope"
 import { createServerSession } from "./server-session"
 import type { ServerApi } from "@/utils/server"
 
 type McpApi = ServerApi["mcp"]
+
+describe("agent query invalidation", () => {
+  test("invalidates only agent queries for the disposed server scope", async () => {
+    const queryClient = new QueryClient()
+    const remote = "https://remote.example" as typeof ServerScope.local
+    const localAgents = [ServerScope.local, "/project", "agents"] as const
+    const localMcp = [ServerScope.local, "/project", "mcp"] as const
+    const remoteAgents = [remote, "/project", "agents"] as const
+
+    await Promise.all([
+      queryClient.fetchQuery({ queryKey: localAgents, queryFn: async () => [] }),
+      queryClient.fetchQuery({ queryKey: localMcp, queryFn: async () => [] }),
+      queryClient.fetchQuery({ queryKey: remoteAgents, queryFn: async () => [] }),
+    ])
+
+    await invalidateAgentQueries(queryClient, ServerScope.local)
+
+    expect(queryClient.getQueryState(localAgents)?.isInvalidated).toBe(true)
+    expect(queryClient.getQueryState(localMcp)?.isInvalidated).toBe(false)
+    expect(queryClient.getQueryState(remoteAgents)?.isInvalidated).toBe(false)
+  })
+})
 
 describe("MCP queries", () => {
   test("loads current servers for the requested location", async () => {

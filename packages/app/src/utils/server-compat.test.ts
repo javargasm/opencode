@@ -22,6 +22,21 @@ function setup(
           time: { created: 1, updated: 1 },
         })
       }
+      if (request.method === "POST" && new URL(request.url).pathname === "/session") {
+        const body = (await request.clone().json().catch(() => ({}))) as Record<string, any>
+        return Response.json({
+          id: "ses_1",
+          slug: "ses_1",
+          projectID: "project",
+          directory: "/repo",
+          title: body.title ?? "Session",
+          parentID: body.parentID,
+          agent: body.agent,
+          model: body.model,
+          version: "1",
+          time: { created: 1, updated: 1 },
+        })
+      }
       if (request.method === "POST" && request.url.endsWith("/prompt_async"))
         return new Response(undefined, { status: 204 })
       if (request.method === "POST" && request.url.endsWith("/prompt")) {
@@ -65,6 +80,27 @@ describe("createCompatibleApi", () => {
     expect(await requests[0]!.json()).toMatchObject({ time: { archived: expect.any(Number) } })
   })
   */
+
+  test("routes V1 rename through the legacy session update", async () => {
+    const { api, requests } = setup("v1")
+    await api.session.rename({ sessionID: "ses_1", title: "Renamed V1" })
+
+    expect(requests).toHaveLength(1)
+    const request = requests[0]!
+    expect(new URL(request.url).pathname).toBe("/session/ses_1")
+    expect(request.method).toBe("PATCH")
+    expect(await request.json()).toMatchObject({ title: "Renamed V1" })
+  })
+
+  test("routes V1 remove through the legacy session delete", async () => {
+    const { api, requests } = setup("v1")
+    await api.session.remove({ sessionID: "ses_1" })
+
+    expect(requests).toHaveLength(1)
+    const request = requests[0]!
+    expect(new URL(request.url).pathname).toBe("/session/ses_1")
+    expect(request.method).toBe("DELETE")
+  })
 
   test("converts current prompts to the V1 prompt contract", async () => {
     const { api, requests } = setup("v1")
@@ -163,6 +199,31 @@ describe("createCompatibleApi", () => {
     expect(await request.json()).toEqual({ providerID: "provider", modelID: "model" })
   })
 
+  test("uses legacy session update for V2 rename until the V2 endpoint is implemented", async () => {
+    const { api, requests } = setup("v2")
+
+    await api.session.rename({ sessionID: "ses_1", title: "Renamed Session" })
+
+    expect(requests).toHaveLength(1)
+    const request = requests[0]
+    if (!request) throw new Error("Expected a rename request")
+    expect(new URL(request.url).pathname).toBe("/session/ses_1")
+    expect(request.method).toBe("PATCH")
+    expect(await request.json()).toMatchObject({ title: "Renamed Session" })
+  })
+
+  test("uses legacy session delete for V2 remove until the V2 endpoint is implemented", async () => {
+    const { api, requests } = setup("v2")
+
+    await api.session.remove({ sessionID: "ses_1" })
+
+    expect(requests).toHaveLength(1)
+    const request = requests[0]
+    if (!request) throw new Error("Expected a remove request")
+    expect(new URL(request.url).pathname).toBe("/session/ses_1")
+    expect(request.method).toBe("DELETE")
+  })
+
   /*
   test("keeps V2 session actions on the current API", async () => {
     const { api, requests } = setup("v2")
@@ -248,5 +309,46 @@ describe("createCompatibleApi", () => {
     ])
     expect(requests[1]!.headers.get("x-opencode-directory")).toBe("%2Frepo")
     expect(requests[2]!.headers.get("x-opencode-directory")).toBeNull()
+  })
+
+  test("forwards model, agent, parentID, and title when creating a session in V1", async () => {
+    const { api, requests } = setup("v1")
+    const session = await api.session.create({
+      agent: "build",
+      model: { id: "claude-3-7-sonnet", providerID: "anthropic", variant: "high" },
+      parentID: "ses_parent",
+      title: "Subagent session",
+      location: { directory: "/repo" },
+    })
+
+    expect(new URL(requests[0]!.url).pathname).toBe("/session")
+    expect(requests[0]!.method).toBe("POST")
+    const body = await requests[0]!.json()
+    expect(body).toEqual({
+      parentID: "ses_parent",
+      title: "Subagent session",
+      agent: "build",
+      model: {
+        id: "claude-3-7-sonnet",
+        providerID: "anthropic",
+        variant: "high",
+      },
+    })
+    expect(session.agent).toBe("build")
+    expect(session.parentID).toBe("ses_parent")
+    expect(session.model?.variant).toBe("high")
+  })
+
+  test("normalizes default variant to undefined in sessionInfo", async () => {
+    const { api, requests } = setup("v1")
+    const session = await api.session.create({
+      agent: "build",
+      model: { id: "gpt-4o", providerID: "openai", variant: "default" },
+      location: { directory: "/repo" },
+    })
+
+    const body = await requests[0]!.json()
+    expect(body.model.variant).toBeUndefined()
+    expect(session.model?.variant).toBeUndefined()
   })
 })

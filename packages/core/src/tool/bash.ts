@@ -17,8 +17,16 @@ import { Tools } from "./tools"
 
 export const name = "bash"
 export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
-export const MAX_TIMEOUT_MS = 10 * 60 * 1_000
+export const MAX_TIMEOUT_MS = 60 * 60 * 1_000
 export const MAX_CAPTURE_BYTES = 1024 * 1024
+
+/**
+ * Bash timeouts have always crossed this tool boundary in milliseconds. Do not
+ * infer a unit from the magnitude: short, legacy millisecond values are valid.
+ */
+export const normalizeTimeoutMs = (timeout: number | undefined, defaultMs: number = DEFAULT_TIMEOUT_MS) => {
+  return timeout ?? defaultMs
+}
 
 export const Input = Schema.Struct({
   command: Schema.String.annotate({ description: "Shell command string to execute" }),
@@ -28,7 +36,7 @@ export const Input = Schema.Struct({
   timeout: PositiveInt.check(Schema.isLessThanOrEqualTo(MAX_TIMEOUT_MS))
     .pipe(Schema.optional)
     .annotate({
-      description: `Timeout in milliseconds. Defaults to ${DEFAULT_TIMEOUT_MS} and may not exceed ${MAX_TIMEOUT_MS}.`,
+      description: `Optional timeout in milliseconds. Defaults to ${DEFAULT_TIMEOUT_MS} and may not exceed ${MAX_TIMEOUT_MS}.`,
     }),
 })
 
@@ -162,7 +170,7 @@ const layer = Layer.effectDiscard(
                 detached: process.platform !== "win32",
                 forceKillAfter: Duration.seconds(3),
               })
-              const timeout = input.timeout ?? DEFAULT_TIMEOUT_MS
+              const timeout = normalizeTimeoutMs(input.timeout, DEFAULT_TIMEOUT_MS)
               const result = yield* appProcess
                 .run(command, {
                   combineOutput: true,

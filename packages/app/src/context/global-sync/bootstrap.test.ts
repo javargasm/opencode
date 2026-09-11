@@ -282,6 +282,25 @@ describe("query keys", () => {
     expect(result).toEqual([])
   })
 
+  test("loads agents from legacy v1 passing directory", async () => {
+    const calls: unknown[] = []
+    const legacy = {
+      app: {
+        agents: async (params?: unknown) => {
+          calls.push(params)
+          return { data: [{ name: "build", mode: "primary" as const, permission: [], options: {}, native: true }] }
+        },
+      },
+    } as unknown as OpencodeClient
+
+    const result = await new QueryClient().fetchQuery(
+      loadAgentsQuery(ServerScope.local, "/repo", {} as AgentApi, legacy, Promise.resolve("v1")),
+    )
+
+    expect(calls).toEqual([{ directory: "/repo" }])
+    expect(result).toEqual([{ name: "build", mode: "primary" as const, permission: [], options: {}, native: true }])
+  })
+
   test("loads commands from the current location-scoped endpoint", async () => {
     const calls: unknown[] = []
     const api = {
@@ -298,6 +317,32 @@ describe("query keys", () => {
 
     expect(calls).toEqual([{ location: { directory: "/repo" } }])
     expect(result).toEqual([{ name: "review", template: "Review files" /* source: "command" */ }])
+  })
+
+  test("loads commands from legacy v1 passing directory", async () => {
+    const calls: unknown[] = []
+    const legacy = {
+      command: {
+        list: async (params?: unknown) => {
+          calls.push(params)
+          return { data: [{ name: "test", template: "run test" }] }
+        },
+      },
+    } as unknown as OpencodeClient
+
+    const result = await loadCommands("/repo", {} as CommandApi, legacy, Promise.resolve("v1"))
+
+    expect(calls).toEqual([{ directory: "/repo" }])
+    expect(result).toEqual([
+      {
+        name: "test",
+        template: "run test",
+        description: undefined,
+        agent: undefined,
+        model: undefined,
+        subtask: undefined,
+      },
+    ])
   })
 
   test("loads projects from the current endpoint", async () => {

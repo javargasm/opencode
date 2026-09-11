@@ -86,6 +86,9 @@ function prepareSidecarEnv(password: string, userDataPath: string) {
     OPENCODE_SERVER_PASSWORD: password,
     OPENCODE_DISABLE_CHANNEL_DB: "1",
     OPENCODE_DB: "opencode.db",
+    OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS: "true",
+    OPENCODE_DISABLE_CLAUDE_CODE: "true",
+    OPENCODE_EXPERIMENTAL_EVENT_SYSTEM: "true",
     XDG_STATE_HOME: process.env.XDG_STATE_HOME ?? userDataPath,
   })
 }

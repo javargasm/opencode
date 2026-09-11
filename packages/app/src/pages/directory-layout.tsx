@@ -5,6 +5,7 @@ import { useLocation, useNavigate, useParams } from "@solidjs/router"
 import { type Accessor, createEffect, createMemo, createResource, onCleanup, type ParentProps, Show } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { LocalProvider } from "@/context/local"
+import { WorkspaceHealthFooter } from "@/components/workspace-health-footer"
 import { SDKProvider } from "@/context/sdk"
 import { useSync } from "@/context/sync"
 import { decode64 } from "@/utils/base64"
@@ -67,7 +68,10 @@ export function DirectoryDataProvider(
           onNavigateToSession={(sessionID: string) => navigate(href(sessionID))}
           onSessionHref={href}
         >
-          <LocalProvider>{props.children}</LocalProvider>
+          <LocalProvider>
+            {props.children}
+            <WorkspaceHealthFooter />
+          </LocalProvider>
         </DataProvider>
       )}
     </Show>

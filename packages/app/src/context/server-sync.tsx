@@ -33,7 +33,7 @@ import type { ProjectMeta } from "./global-sync/types"
 import { SESSION_RECENT_LIMIT } from "./global-sync/types"
 import { formatServerError } from "@/utils/server-errors"
 import { queryOptions, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/solid-query"
-import type { SolidQueryOptions } from "@tanstack/solid-query"
+import type { QueryClient, SolidQueryOptions } from "@tanstack/solid-query"
 import { createRefreshQueue } from "./global-sync/queue"
 import { directoryKey } from "./global-sync/utils"
 import { PathKey } from "@/utils/path-key"
@@ -201,6 +201,12 @@ function makeQueryOptionsApi(
   }
 }
 export type QueryOptionsApi = ReturnType<typeof makeQueryOptionsApi>
+
+export function invalidateAgentQueries(queryClient: QueryClient, scope: ServerScope) {
+  return queryClient.invalidateQueries({
+    predicate: (query) => query.queryKey[0] === scope && query.queryKey[2] === "agents",
+  })
+}
 
 export function createServerSyncContextInner(serverSDK: ServerSDK) {
   const language = useLanguage()
@@ -544,6 +550,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     if (eventType === "integration.connection.updated") void refreshProviders()
 
     if (directory === "global") {
+      if (eventType === "global.disposed") void invalidateAgentQueries(queryClient, serverSDK.scope)
       if (eventType === "server.connected" && activeSessionsQuery.data === undefined && !activeSessionsQuery.isFetching)
         void activeSessionsQuery.refetch()
       applyGlobalEvent({
@@ -596,6 +603,8 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       queue.push(key)
     if (eventType === "mcp.status.changed") void queryClient.invalidateQueries(queryOptionsApi.mcp(key))
     if (eventType === "mcp.resources.changed") void queryClient.invalidateQueries(queryOptionsApi.mcpResources(key))
+    if (eventType === "agent.updated" || eventType === "config.updated")
+      void queryClient.invalidateQueries(queryOptionsApi.agents(key))
     const [store, setStore] = existing
     applyDirectoryEvent({
       event,

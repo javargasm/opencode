@@ -129,6 +129,7 @@ export function createSessionComposerRegionController(input: {
     openParent: input.openParent,
     setPromptRef: input.setPromptRef,
     setDockRef: input.setDockRef,
+    sessionID: input.sessionID,
     parentID,
     child: () => !!parentID(),
     showComposer: () => !input.state.blocked() || !!parentID(),

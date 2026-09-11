@@ -7,6 +7,7 @@ import { useLanguage } from "@/context/language"
 import { useLayout } from "@/context/layout"
 import { usePermission } from "@/context/permission"
 import { usePrompt } from "@/context/prompt"
+import { hasStashablePrompt, usePromptStash } from "@/context/prompt-stash"
 import { useSDK } from "@/context/sdk"
 import { useSettings } from "@/context/settings"
 import { useSync } from "@/context/sync"
@@ -44,6 +45,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
   const language = useLanguage()
   const permission = usePermission()
   const prompt = usePrompt()
+  const stash = usePromptStash()
   const sdk = useSDK()
   const settings = useSettings()
   const sync = useSync()
@@ -421,6 +423,56 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     )
   }
 
+  const timeline = () => {
+    void openDialog(
+      () => import("@/components/dialog-timeline"),
+      (x) => dialog.show(() => <x.DialogTimeline sessionID={params.id} />),
+    )
+  }
+
+  const workspaceStatus = () => {
+    void openDialog(
+      () => import("@/components/dialog-status"),
+      (x) => dialog.show(() => <x.DialogStatus />),
+    )
+  }
+
+  const stashPrompt = () => {
+    if (!stash.ready()) return
+    const current = prompt.current()
+    const text = current.map((p) => ("content" in p ? p.content : "")).join("")
+    if (!hasStashablePrompt(current)) {
+      showToast({ title: "Draft prompt is empty", variant: "error" })
+      return
+    }
+    stash.push({ input: text, parts: current })
+    prompt.reset()
+    showToast({ title: "Prompt stashed", variant: "success" })
+  }
+
+  const popStash = () => {
+    if (!stash.ready()) return
+    const entry = stash.pop()
+    if (!entry) {
+      showToast({ title: "No stashes available", variant: "error" })
+      return
+    }
+    if (entry.parts && entry.parts.length > 0) {
+      prompt.set(entry.parts, entry.input.length)
+    } else {
+      prompt.set([{ type: "text", content: entry.input, start: 0, end: entry.input.length }], entry.input.length)
+    }
+    showToast({ title: "Restored stashed prompt", variant: "success" })
+  }
+
+  const listStash = () => {
+    if (!stash.ready()) return
+    void openDialog(
+      () => import("@/components/dialog-stash"),
+      (x) => dialog.show(() => <x.DialogStash />),
+    )
+  }
+
   const shareCmds = () => {
     if (sync().data.config.share === "disabled") return []
     return [
@@ -508,6 +560,46 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
         const id = params.id
         if (id) void sessionArchive.archive(id)
       },
+    }),
+    sessionCommand({
+      id: "session.timeline",
+      title: "Session Timeline",
+      description: "Jump to messages or fork from timeline",
+      slash: "timeline",
+      keybind: "mod+shift+g",
+      disabled: !params.id || visibleUserMessages().length === 0,
+      onSelect: timeline,
+    }),
+    sessionCommand({
+      id: "workspace.status",
+      title: "Workspace Status",
+      description: "View MCP, LSP, formatters and plugins status",
+      slash: "status",
+      onSelect: workspaceStatus,
+    }),
+    sessionCommand({
+      id: "prompt.stash",
+      title: "Stash prompt",
+      description: "Save current prompt draft to stash",
+      slash: "stash",
+      disabled: !stash.ready(),
+      onSelect: stashPrompt,
+    }),
+    sessionCommand({
+      id: "prompt.stash.pop",
+      title: "Pop stashed prompt",
+      description: "Restore latest draft from stash",
+      slash: "pop",
+      disabled: !stash.ready() || stash.list().length === 0,
+      onSelect: popStash,
+    }),
+    sessionCommand({
+      id: "prompt.stash.list",
+      title: "Prompt stash list",
+      description: "Browse and restore stashed prompts",
+      slash: "stashes",
+      disabled: !stash.ready() || stash.list().length === 0,
+      onSelect: listStash,
     }),
   ]
 

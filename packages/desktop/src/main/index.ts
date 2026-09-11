@@ -123,6 +123,9 @@ const main = Effect.gen(function* () {
   process.env.OPENCODE_DISABLE_EMBEDDED_WEB_UI = "true"
   process.env.OPENCODE_DISABLE_CHANNEL_DB = "1"
   process.env.OPENCODE_DB = "opencode.db"
+  process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = "true"
+  process.env.OPENCODE_DISABLE_CLAUDE_CODE = "true"
+  process.env.OPENCODE_EXPERIMENTAL_EVENT_SYSTEM = "true"
 
   const appId = app.isPackaged ? APP_IDS[CHANNEL] : "ai.opencode.desktop.dev"
   const onboardingTestRoot = ((): string | undefined => {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { hasCustomAgent, resolveAgent } from "./local-agent"
+import { hasCustomAgent, isAgentSelectorVisible, resolveAgent } from "./local-agent"
 
 describe("hasCustomAgent", () => {
   test("detects explicitly custom agents", () => {
@@ -8,6 +8,24 @@ describe("hasCustomAgent", () => {
 
   test("ignores built-in and unclassified agents", () => {
     expect(hasCustomAgent([{ native: true }, {}])).toBe(false)
+  })
+})
+
+describe("isAgentSelectorVisible", () => {
+  test("returns true if setting preference is enabled", () => {
+    expect(isAgentSelectorVisible(true, [{ native: true }])).toBe(true)
+  })
+
+  test("returns true if custom agents exist", () => {
+    expect(isAgentSelectorVisible(false, [{ native: true }, { native: false }])).toBe(true)
+  })
+
+  test("returns true if multiple agents exist (e.g. build and plan)", () => {
+    expect(isAgentSelectorVisible(false, [{ native: true }, { native: true }])).toBe(true)
+  })
+
+  test("returns false if only 1 native agent exists and preference is disabled", () => {
+    expect(isAgentSelectorVisible(false, [{ native: true }])).toBe(false)
   })
 })
 
