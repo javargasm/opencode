@@ -1,5 +1,5 @@
-import { Component, createMemo, createSignal, For, Show } from "solid-js"
-import { useNavigate, useParams } from "@solidjs/router"
+import { Component, createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js"
+import { useLocation, useNavigate, useParams } from "@solidjs/router"
 import { useOptionalSync } from "@/context/sync"
 import { useOptionalSDK } from "@/context/sdk"
 import { usePrompt } from "@/context/prompt"
@@ -12,7 +12,7 @@ import { showToast } from "@/utils/toast"
 import { extractPromptFromParts } from "@/utils/prompt"
 import { sessionHrefForRoute } from "@/utils/session-route"
 import { base64Encode } from "@opencode-ai/core/util/encode"
-import type { TextPart as SDKTextPart } from "@opencode-ai/sdk/v2/client"
+import type { Part, TextPart as SDKTextPart } from "@opencode-ai/sdk/v2/client"
 
 interface TimelineTurn {
   id: string
@@ -26,14 +26,44 @@ function formatTime(date: Date): string {
   return date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })
 }
 
-export function findTimelineMessageElement(root: ParentNode, messageID: string) {
-  return Array.from(root.querySelectorAll<HTMLElement>("[data-message-id]")).find(
-    (element) => element.getAttribute("data-message-id") === messageID,
-  )
+export async function loadTimelineHistory(input: {
+  sessionID: () => string | undefined
+  history: {
+    more: (sessionID: string) => boolean
+    loading: (sessionID: string) => boolean
+    loadMore: (sessionID: string) => Promise<void>
+  }
+  active?: () => boolean
+}) {
+  const id = input.sessionID()
+  if (!id || input.history.loading(id)) return
+
+  while (input.active?.() !== false && input.sessionID() === id && input.history.more(id) && !input.history.loading(id)) {
+    await input.history.loadMore(id)
+  }
+}
+
+export function timelineTurnText(parts: Part[], attachmentName: string) {
+  const fullText = parts
+    .filter((part): part is SDKTextPart => part.type === "text" && !part.synthetic && !part.ignored)
+    .map((part) => part.text)
+    .join(" ")
+    .trim()
+  if (fullText) return fullText
+
+  return parts
+    .flatMap((part) => {
+      if (part.type === "file") return [part.source?.text.value.trim() || part.filename?.trim() || attachmentName]
+      if (part.type === "agent") return [part.source?.value.trim() || `@${part.name}`]
+      return []
+    })
+    .join(" ")
+    .trim()
 }
 
 export const DialogTimeline: Component<{ sessionID?: string }> = (props) => {
   const params = useParams()
+  const location = useLocation()
   const navigate = useNavigate()
   const sync = useOptionalSync()
   const sdk = useOptionalSDK()
@@ -45,6 +75,23 @@ export const DialogTimeline: Component<{ sessionID?: string }> = (props) => {
   const [selectedTurnId, setSelectedTurnId] = createSignal<string>()
 
   const sessionID = () => props.sessionID ?? params.id
+  const historyLoads = new Set<string>()
+  let active = true
+
+  onCleanup(() => {
+    active = false
+  })
+
+  createEffect(() => {
+    const id = sessionID()
+    const s = sync()
+    if (!id || !s || historyLoads.has(id) || !s.session.history.more(id) || s.session.history.loading(id)) return
+
+    historyLoads.add(id)
+    void loadTimelineHistory({ sessionID, history: s.session.history, active: () => active })
+      .catch(() => {})
+      .finally(() => historyLoads.delete(id))
+  })
 
   const turns = createMemo((): TimelineTurn[] => {
     const id = sessionID()
@@ -60,11 +107,7 @@ export const DialogTimeline: Component<{ sessionID?: string }> = (props) => {
       turnCount++
 
       const parts = s.data.part[msg.id] ?? []
-      const textParts = parts.filter((x): x is SDKTextPart => x.type === "text" && !x.synthetic && !x.ignored)
-      const fullText = textParts
-        .map((t) => t.text)
-        .join(" ")
-        .trim()
+      const fullText = timelineTurnText(parts, language.t("common.attachment"))
       if (!fullText) continue
 
       result.push({
@@ -86,14 +129,10 @@ export const DialogTimeline: Component<{ sessionID?: string }> = (props) => {
     return all.filter((t) => t.fullText.toLowerCase().includes(q))
   })
 
-  const jumpToMessage = (messageID: string) => {
+  const jumpToMessage = (messageID: string, e?: MouseEvent) => {
+    e?.stopPropagation()
     dialog.close()
-    requestAnimationFrame(() => {
-      const el = findTimelineMessageElement(document, messageID)
-      if (el) {
-        el.scrollIntoView({ behavior: "smooth", block: "center" })
-      }
-    })
+    navigate(`${location.pathname}${location.search}#message-${messageID}`, { replace: true })
   }
 
   const forkFromTurn = async (turn: TimelineTurn, e: MouseEvent) => {
@@ -196,7 +235,7 @@ export const DialogTimeline: Component<{ sessionID?: string }> = (props) => {
                     <Button
                       size="small"
                       variant="ghost"
-                      onClick={() => jumpToMessage(turn.id)}
+                      onClick={(e: MouseEvent) => jumpToMessage(turn.id, e)}
                       title="Scroll to message in session"
                     >
                       Jump

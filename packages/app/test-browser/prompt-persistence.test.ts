@@ -8,6 +8,10 @@ import { createDraftStore } from "@/utils/draft-store"
 
 let read: ((value: string | null) => void) | undefined
 
+async function flushMicrotasks() {
+  for (const _ of Array.from({ length: 8 })) await Promise.resolve()
+}
+
 const storage: AsyncStorage = {
   getItem: () => new Promise((resolve) => (read = resolve)),
   setItem: async () => undefined,
@@ -146,4 +150,86 @@ test("does not let delayed blob migration overwrite a newer draft", async () => 
   await older
 
   expect(documents.get("prompt")).toContain("latest")
+})
+
+test("does not let a delayed write overwrite a later write", async () => {
+  const documents = new Map<string, string>()
+  const writeStarted = Promise.withResolvers<void>()
+  const releaseWrite = Promise.withResolvers<void>()
+  const store = createDraftStore({
+    get: async (key) => documents.get(key) ?? null,
+    set: async (key, value) => {
+      if (value === JSON.stringify({ value: "old" })) {
+        writeStarted.resolve()
+        await releaseWrite.promise
+      }
+      documents.set(key, value)
+    },
+    remove: async (key) => void documents.delete(key),
+    putBlob: async () => "unused",
+    getBlob: async () => null,
+  })
+
+  const old = store.setItem("draft", JSON.stringify({ value: "old" }))
+  await writeStarted.promise
+  const latest = store.setItem("draft", JSON.stringify({ value: "latest" }))
+  await flushMicrotasks()
+  releaseWrite.resolve()
+  await Promise.all([old, latest])
+
+  expect(documents.get("draft")).toBe(JSON.stringify({ value: "latest" }))
+})
+
+test("does not let a delayed write restore a removed draft", async () => {
+  const documents = new Map<string, string>()
+  const writeStarted = Promise.withResolvers<void>()
+  const releaseWrite = Promise.withResolvers<void>()
+  const store = createDraftStore({
+    get: async (key) => documents.get(key) ?? null,
+    set: async (key, value) => {
+      if (value === JSON.stringify({ value: "old" })) {
+        writeStarted.resolve()
+        await releaseWrite.promise
+      }
+      documents.set(key, value)
+    },
+    remove: async (key) => void documents.delete(key),
+    putBlob: async () => "unused",
+    getBlob: async () => null,
+  })
+
+  const old = store.setItem("draft", JSON.stringify({ value: "old" }))
+  await writeStarted.promise
+  const remove = store.removeItem("draft")
+  await flushMicrotasks()
+  releaseWrite.resolve()
+  await Promise.all([old, remove])
+
+  expect(documents.has("draft")).toBe(false)
+})
+
+test("does not let a delayed removal delete a later write", async () => {
+  const documents = new Map<string, string>([["draft", JSON.stringify({ value: "old" })]])
+  const removeStarted = Promise.withResolvers<void>()
+  const releaseRemove = Promise.withResolvers<void>()
+  const store = createDraftStore({
+    get: async (key) => documents.get(key) ?? null,
+    set: async (key, value) => void documents.set(key, value),
+    remove: async (key) => {
+      removeStarted.resolve()
+      await releaseRemove.promise
+      documents.delete(key)
+    },
+    putBlob: async () => "unused",
+    getBlob: async () => null,
+  })
+
+  const old = store.removeItem("draft")
+  await removeStarted.promise
+  const latest = store.setItem("draft", JSON.stringify({ value: "latest" }))
+  await flushMicrotasks()
+  releaseRemove.resolve()
+  await Promise.all([old, latest])
+
+  expect(documents.get("draft")).toBe(JSON.stringify({ value: "latest" }))
 })

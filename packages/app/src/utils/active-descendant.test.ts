@@ -42,6 +42,19 @@ describe("getActiveDescendantCount", () => {
     expect(getActiveDescendantCount("ses_grandchild", sessions, statuses)).toBe(0)
   })
 
+  test("counts only strict descendants in a reachable root-child cycle", () => {
+    const sessions = [
+      { id: "ses_root", parentID: "ses_child" },
+      { id: "ses_child", parentID: "ses_root" },
+    ]
+    const statuses: Record<string, SessionStatus> = {
+      ses_root: { type: "busy" },
+      ses_child: { type: "busy" },
+    }
+
+    expect(getActiveDescendantCount("ses_root", sessions, statuses)).toBe(1)
+  })
+
   test("avoids infinite loops on circular parent references", () => {
     const sessions = [
       { id: "ses_1", parentID: "ses_2" },

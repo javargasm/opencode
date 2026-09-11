@@ -88,6 +88,14 @@ import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
 export { createPromptInputHistory }
 export type { PromptInputControls, PromptInputHistory, PromptInputProps, PromptInputState, PromptInputSubmission }
 
+export function getPromptInputActiveSubagentCount(
+  sessionID: string | undefined,
+  sessions: Parameters<typeof getActiveDescendantCount>[1],
+  statuses: Parameters<typeof getActiveDescendantCount>[2],
+) {
+  return getActiveDescendantCount(sessionID, sessions, statuses)
+}
+
 const EXAMPLES = [
   "prompt.example.1",
   "prompt.example.2",
@@ -279,13 +287,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     const sessions = s.data.session ?? []
     const statuses = s.data.session_status ?? {}
     const sessionID = props.controls.session.id
-    const descendantCount = getActiveDescendantCount(sessionID, sessions, statuses)
-    if (descendantCount > 0) return descendantCount
-    return sessions.filter((sess) => {
-      if (!sess.parentID) return false
-      const status = statuses[sess.id]
-      return status && status.type !== "idle"
-    }).length
+    return getPromptInputActiveSubagentCount(sessionID, sessions, statuses)
   })
   const activeSubagentLabel = createMemo(() => sessionActivityLabel(activeSubagentCount()))
 

@@ -47,6 +47,19 @@ export type PromptInputV2ComposerController = PromptInputV2Interaction & {
   readonly session?: PromptInputProps["controls"]["session"]
 }
 
+export function getPromptInputV2ActiveSubagentCount(
+  sessionID: string | undefined,
+  sessions: Parameters<typeof getActiveDescendantCount>[1],
+  statuses: Parameters<typeof getActiveDescendantCount>[2],
+) {
+  if (sessionID) return getActiveDescendantCount(sessionID, sessions, statuses)
+  return sessions.filter((session) => {
+    if (!session.parentID) return false
+    const status = statuses[session.id]
+    return status && status.type !== "idle"
+  }).length
+}
+
 export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
   const sync = useSync()
   const dialog = useDialog()
@@ -58,13 +71,7 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
     const sessions = s.data.session ?? []
     const statuses = s.data.session_status ?? {}
     const sessionID = props.controller.session?.id
-    const descendantCount = getActiveDescendantCount(sessionID, sessions, statuses)
-    if (descendantCount > 0) return descendantCount
-    return sessions.filter((sess) => {
-      if (!sess.parentID) return false
-      const status = statuses[sess.id]
-      return status && status.type !== "idle"
-    }).length
+    return getPromptInputV2ActiveSubagentCount(sessionID, sessions, statuses)
   })
   const activeSubagentLabel = createMemo(() => sessionActivityLabel(activeSubagentCount()))
 

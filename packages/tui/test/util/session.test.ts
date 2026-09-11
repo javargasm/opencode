@@ -45,6 +45,15 @@ describe("util.session", () => {
     expect(getActiveDescendantCount("root", sessions, { "cycle-a": { type: "busy" } })).toBe(0)
   })
 
+  test("does not count the root as its own descendant through a reachable cycle", () => {
+    const sessions = [
+      { id: "root", parentID: "child" },
+      { id: "child", parentID: "root" },
+    ]
+
+    expect(getActiveDescendantCount("root", sessions, { root: { type: "busy" }, child: { type: "idle" } })).toBe(0)
+  })
+
   test("counts every active descendant and excludes idle and unrelated sessions", () => {
     const sessions = [
       { id: "root" },

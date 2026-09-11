@@ -35,6 +35,18 @@ export async function createBlobReference(blob: Blob): Promise<BlobReference> {
 
 export function createDraftStore(driver: Driver): DraftStore {
   const versions = new Map<string, number>()
+  const mutations = new Map<string, Promise<void>>()
+  // A driver mutation cannot be cancelled once it has started, so order them per key.
+  const queueMutation = (key: string, operation: () => Promise<void>) => {
+    const previous = mutations.get(key) ?? Promise.resolve()
+    const result = previous.then(operation, operation)
+    const next = result.catch(() => undefined)
+    mutations.set(key, next)
+    void next.then(() => {
+      if (mutations.get(key) === next) mutations.delete(key)
+    })
+    return result
+  }
   const putBlob = async (blob: Blob) => {
     const id = await driver.putBlob(blob)
     return { id, url: blobUrl(id, blob) }
@@ -84,11 +96,15 @@ export function createDraftStore(driver: Driver): DraftStore {
       const version = (versions.get(key) ?? 0) + 1
       versions.set(key, version)
       const encoded = JSON.stringify(await encode(JSON.parse(value)))
-      if (versions.get(key) === version) await driver.set(key, encoded)
+      if (versions.get(key) !== version) return
+      await queueMutation(key, async () => {
+        if (versions.get(key) !== version) return
+        await driver.set(key, encoded)
+      })
     },
     removeItem: async (key) => {
       versions.set(key, (versions.get(key) ?? 0) + 1)
-      await driver.remove(key)
+      await queueMutation(key, () => driver.remove(key))
     },
     putBlob,
   }
