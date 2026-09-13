@@ -119,4 +119,53 @@ describe("tui sync", () => {
       app.renderer.destroy()
     }
   })
+
+  test("keeps the newest pending inputs after an A-B-A workspace switch", async () => {
+    await using tmp = await tmpdir()
+    await Bun.write(`${tmp.path}/kv.json`, "{}")
+    const releases: Array<(response: Response) => void> = []
+    const { app, project, sync } = await mount((url) => {
+      if (url.pathname === "/session") return json([durableSession])
+      if (url.pathname === `/api/session/${durableSession.id}/input`)
+        return new Promise<Response>((resolve) => releases.push(resolve))
+      return undefined
+    }, tmp.path)
+
+    const pending = (id: string, admittedSeq: number) =>
+      json({
+        data: [
+          {
+            id,
+            sessionID: durableSession.id,
+            admittedSeq,
+            delivery: "queue",
+            prompt: { text: id },
+            timeCreated: admittedSeq,
+          },
+        ],
+      })
+
+    try {
+      await wait(() => releases.length === 1)
+
+      project.workspace.set("workspace_b")
+      await sync.bootstrap({ fatal: false })
+      await wait(() => releases.length === 2)
+
+      project.workspace.set(undefined)
+      await sync.bootstrap({ fatal: false })
+      await wait(() => releases.length === 3)
+
+      releases[2]!(pending("msg_new", 2))
+      await wait(() => sync.data.session_input[durableSession.id]?.[0]?.id === "msg_new")
+
+      releases[0]!(pending("msg_old", 1))
+      await Bun.sleep(30)
+
+      expect(sync.data.session_input[durableSession.id]?.map((input) => input.id)).toEqual(["msg_new"])
+      releases[1]!(json({ data: [] }))
+    } finally {
+      app.renderer.destroy()
+    }
+  })
 })

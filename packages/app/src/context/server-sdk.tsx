@@ -76,6 +76,11 @@ export function enqueueServerEvent(queue: QueuedServerEvent[], event: QueuedServ
   return true
 }
 
+/** An unlocated V2 connection event is server-wide and must reach each directory SDK. */
+export function isGlobalServerConnected(event: Pick<QueuedServerEvent, "directory" | "payload">) {
+  return event.directory === "global" && event.payload.type === "server.connected"
+}
+
 export function coalesceServerEvents(events: QueuedServerEvent[]) {
   const output: QueuedServerEvent[] = []
   events.forEach((event) => {
@@ -422,7 +427,16 @@ function createDirSdkContext(directory: string, serverSDK: ServerSDKBase) {
   const unsub = serverSDK.event.on(directory, (event) => {
     emitter.emit(event.type, event)
   })
-  onCleanup(unsub)
+  // V2 emits the connection lifecycle event without a location. It belongs to
+  // the server, but directory consumers (including SessionPage) need it to
+  // refresh their directory-scoped data after a reconnect.
+  const unsubConnected = serverSDK.event.on("global", (event) => {
+    if (isGlobalServerConnected({ directory: "global", payload: event })) emitter.emit(event.type, event)
+  })
+  onCleanup(() => {
+    unsub()
+    unsubConnected()
+  })
 
   return {
     scope: serverSDK.scope,

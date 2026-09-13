@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import { adaptServerEvent, coalesceServerEvents, enqueueServerEvent, resumeStreamAfterPageShow } from "./server-sdk"
+import {
+  adaptServerEvent,
+  coalesceServerEvents,
+  enqueueServerEvent,
+  isGlobalServerConnected,
+  resumeStreamAfterPageShow,
+} from "./server-sdk"
 import type { OpenCodeEvent } from "@opencode-ai/client/promise"
 import type { Event } from "@opencode-ai/sdk/v2/client"
 
@@ -192,5 +198,31 @@ describe("enqueueServerEvent", () => {
     enqueue("busy")
 
     expect(events).toHaveLength(2)
+  })
+})
+
+describe("isGlobalServerConnected", () => {
+  test("routes an unlocated V2 connection event to directory SDK contexts", () => {
+    expect(
+      isGlobalServerConnected({
+        directory: "global",
+        payload: { id: "evt_connected", type: "server.connected", properties: {} } as Event,
+      }),
+    ).toBe(true)
+  })
+
+  test("does not broadcast ordinary global events or already-scoped connections", () => {
+    expect(
+      isGlobalServerConnected({
+        directory: "global",
+        payload: { id: "evt_heartbeat", type: "server.heartbeat", properties: {} } as unknown as Event,
+      }),
+    ).toBe(false)
+    expect(
+      isGlobalServerConnected({
+        directory: "/repo",
+        payload: { id: "evt_connected", type: "server.connected", properties: {} } as Event,
+      }),
+    ).toBe(false)
   })
 })

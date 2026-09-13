@@ -158,29 +158,41 @@ export const {
     const statusRefreshInterval = input.sessionStatusTiming?.refreshInterval ?? sessionStatusRefreshInterval
     const statusRequestTimeout = input.sessionStatusTiming?.requestTimeout ?? sessionStatusRequestTimeout
     let pendingInputsWorkspace = project.workspace.current()
+    let pendingInputsGeneration = 0
     const pendingInputRequests = new Map<string, Promise<void>>()
 
     function adoptPendingInputsWorkspace(workspace: string | undefined) {
       if (workspace === pendingInputsWorkspace) return
       pendingInputsWorkspace = workspace
+      pendingInputsGeneration++
       pendingInputRequests.clear()
       setStore("session_input", reconcile({}))
     }
 
     async function refreshPendingInputs(sessionID: string, workspace = project.workspace.current()) {
       if (workspace !== project.workspace.current()) return
+      const generation = pendingInputsGeneration
       const requestKey = `${workspace ?? ""}:${sessionID}`
       const existing = pendingInputRequests.get(requestKey)
       if (existing) return existing
-      const task = (async () => {
+      const current = () =>
+        workspace === project.workspace.current() &&
+        workspace === pendingInputsWorkspace &&
+        generation === pendingInputsGeneration
+      let task: Promise<void>
+      task = (async () => {
         if (!(await sdk.durableSessionInputSupported())) {
-          if (workspace === project.workspace.current()) setStore("session_input", sessionID, [])
+          if (current()) setStore("session_input", sessionID, [])
           return
         }
         const response = await sdk.v2(workspace).v2.session.pendingInputs({ sessionID })
-        if (workspace !== project.workspace.current() || workspace !== pendingInputsWorkspace) return
+        if (!current()) return
         setStore("session_input", sessionID, reconcile(response.data?.data ?? []))
-      })().finally(() => pendingInputRequests.delete(requestKey))
+      })().finally(() => {
+        // An A → B → A switch can reuse this key. An old request must not
+        // remove the newer generation's de-duplication entry when it settles.
+        if (pendingInputRequests.get(requestKey) === task) pendingInputRequests.delete(requestKey)
+      })
       pendingInputRequests.set(requestKey, task)
       return task
     }
