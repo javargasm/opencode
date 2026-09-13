@@ -165,6 +165,72 @@ describe("SessionV2.prompt", () => {
     }),
   )
 
+  it.effect("lists unpromoted V2 inputs in admission order", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const queued = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Run after the current work" }),
+        delivery: "queue",
+        resume: false,
+      })
+      const steer = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Use the next safe boundary" }),
+        resume: false,
+      })
+      yield* SessionInput.admit(db, events, {
+        id: SessionMessage.ID.create(),
+        sessionID,
+        prompt: Prompt.make({ text: "Legacy bridge input" }),
+        delivery: "legacy",
+      })
+
+      expect(
+        (yield* session.pendingInputs(sessionID)).map((input) => ({
+          admittedSeq: input.admittedSeq,
+          id: input.id,
+          delivery: input.delivery,
+          text: input.prompt.text,
+        })),
+      ).toEqual([
+        {
+          admittedSeq: queued.admittedSeq,
+          id: queued.id,
+          delivery: "queue",
+          text: "Run after the current work",
+        },
+        {
+          admittedSeq: steer.admittedSeq,
+          id: steer.id,
+          delivery: "steer",
+          text: "Use the next safe boundary",
+        },
+      ])
+
+      yield* SessionInput.promoteOne(db, events, { sessionID, id: queued.id })
+
+      expect(
+        (yield* session.pendingInputs(sessionID)).map((input) => ({
+          admittedSeq: input.admittedSeq,
+          id: input.id,
+          delivery: input.delivery,
+          text: input.prompt.text,
+        })),
+      ).toEqual([
+        {
+          admittedSeq: steer.admittedSeq,
+          id: steer.id,
+          delivery: "steer",
+          text: "Use the next safe boundary",
+        },
+      ])
+    }),
+  )
+
   it.effect("resolves attachment MIME before admission", () =>
     Effect.gen(function* () {
       yield* setup

@@ -13,6 +13,7 @@ export type Event =
   | EventSessionUpdated
   | EventSessionDeleted
   | EventMessageUpdated
+  | EventSessionLegacyPromptMaterialized
   | EventMessageRemoved
   | EventMessagePartUpdated
   | EventMessagePartRemoved
@@ -21,6 +22,7 @@ export type Event =
   | EventSessionNextMoved
   | EventSessionNextPrompted
   | EventSessionNextPromptAdmitted
+  | EventSessionNextGoalUpdated
   | EventSessionNextContextUpdated
   | EventSessionNextSynthetic
   | EventSessionNextShellStarted
@@ -794,6 +796,16 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "session.legacy_prompt.materialized"
+        properties: {
+          sessionID: string
+          inputID: string
+          info: UserMessage
+          parts: Array<Part>
+        }
+      }
+    | {
+        id: string
         type: "message.removed"
         properties: {
           sessionID: string
@@ -856,7 +868,7 @@ export type GlobalEvent = {
           sessionID: string
           messageID: string
           prompt: Prompt
-          delivery: "steer" | "queue"
+          delivery: "steer" | "queue" | "legacy"
         }
       }
     | {
@@ -867,7 +879,16 @@ export type GlobalEvent = {
           sessionID: string
           messageID: string
           prompt: Prompt
-          delivery: "steer" | "queue"
+          delivery: "steer" | "queue" | "legacy"
+        }
+      }
+    | {
+        id: string
+        type: "session.next.goal.updated"
+        properties: {
+          timestamp: number
+          sessionID: string
+          goal: SessionGoalUpdate
         }
       }
     | {
@@ -1605,6 +1626,7 @@ export type GlobalEvent = {
     | SyncEventSessionUpdated
     | SyncEventSessionDeleted
     | SyncEventMessageUpdated
+    | SyncEventSessionLegacyPromptMaterialized
     | SyncEventMessageRemoved
     | SyncEventMessagePartUpdated
     | SyncEventMessagePartRemoved
@@ -1613,6 +1635,7 @@ export type GlobalEvent = {
     | SyncEventSessionNextMoved
     | SyncEventSessionNextPrompted
     | SyncEventSessionNextPromptAdmitted
+    | SyncEventSessionNextGoalUpdated
     | SyncEventSessionNextContextUpdated
     | SyncEventSessionNextSynthetic
     | SyncEventSessionNextShellStarted
@@ -2750,6 +2773,7 @@ export type SessionDurableEvent =
   | SessionNextMoved
   | SessionNextPrompted
   | SessionNextPromptAdmitted
+  | SessionNextGoalUpdated
   | SessionNextContextUpdated
   | SessionNextSynthetic
   | SessionNextShellStarted
@@ -2869,6 +2893,7 @@ export type V2Event =
   | SessionUpdated
   | SessionDeleted
   | MessageUpdated
+  | SessionLegacyPromptMaterialized
   | MessageRemoved
   | MessagePartUpdated
   | MessagePartRemoved
@@ -2877,6 +2902,7 @@ export type V2Event =
   | SessionNextMoved
   | SessionNextPrompted
   | SessionNextPromptAdmitted
+  | SessionNextGoalUpdated
   | SessionNextContextUpdated
   | SessionNextSynthetic
   | SessionNextShellStarted
@@ -3073,6 +3099,12 @@ export type PromptAgentAttachment = {
   source?: PromptSource
 }
 
+export type SessionGoalUpdate = {
+  objective: string
+  status: "active" | "paused" | "blocked" | "complete"
+  reason?: string
+}
+
 export type SessionErrorUnknown = {
   type: "unknown"
   message: string
@@ -3259,6 +3291,23 @@ export type SyncEventMessageUpdated = {
   }
 }
 
+export type SyncEventSessionLegacyPromptMaterialized = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.legacy_prompt.materialized.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      sessionID: string
+      inputID: string
+      info: UserMessage
+      parts: Array<Part>
+    }
+  }
+}
+
 export type SyncEventMessageRemoved = {
   type: "sync"
   id: string
@@ -3370,7 +3419,7 @@ export type SyncEventSessionNextPrompted = {
       sessionID: string
       messageID: string
       prompt: Prompt
-      delivery: "steer" | "queue"
+      delivery: "steer" | "queue" | "legacy"
     }
   }
 }
@@ -3388,7 +3437,23 @@ export type SyncEventSessionNextPromptAdmitted = {
       sessionID: string
       messageID: string
       prompt: Prompt
-      delivery: "steer" | "queue"
+      delivery: "steer" | "queue" | "legacy"
+    }
+  }
+}
+
+export type SyncEventSessionNextGoalUpdated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.goal.updated.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      timestamp: number
+      sessionID: string
+      goal: SessionGoalUpdate
     }
   }
 }
@@ -3949,9 +4014,26 @@ export type SessionInputAdmitted = {
   id: string
   sessionID: string
   prompt: Prompt
-  delivery: "steer" | "queue"
+  delivery: "steer" | "queue" | "legacy"
   timeCreated: number
   promotedSeq?: number
+}
+
+export type SessionInputPending = {
+  admittedSeq: number
+  id: string
+  sessionID: string
+  prompt: Prompt
+  delivery: "steer" | "queue"
+  timeCreated: number
+}
+
+export type SessionGoalInfo = {
+  sessionID: string
+  objective: string
+  status: "active" | "paused" | "blocked" | "complete"
+  reason?: string
+  updatedAt: number
 }
 
 export type SessionMessageAgentSwitched = {
@@ -4247,7 +4329,7 @@ export type SessionNextPrompted = {
     sessionID: string
     messageID: string
     prompt: Prompt
-    delivery: "steer" | "queue"
+    delivery: "steer" | "queue" | "legacy"
   }
 }
 
@@ -4268,7 +4350,26 @@ export type SessionNextPromptAdmitted = {
     sessionID: string
     messageID: string
     prompt: Prompt
-    delivery: "steer" | "queue"
+    delivery: "steer" | "queue" | "legacy"
+  }
+}
+
+export type SessionNextGoalUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.next.goal.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    timestamp: number
+    sessionID: string
+    goal: SessionGoalUpdate
   }
 }
 
@@ -5166,6 +5267,26 @@ export type MessageUpdated = {
   data: {
     sessionID: string
     info: Message
+  }
+}
+
+export type SessionLegacyPromptMaterialized = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.legacy_prompt.materialized"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    inputID: string
+    info: UserMessage
+    parts: Array<Part>
   }
 }
 
@@ -6227,6 +6348,17 @@ export type EventMessageUpdated = {
   }
 }
 
+export type EventSessionLegacyPromptMaterialized = {
+  id: string
+  type: "session.legacy_prompt.materialized"
+  properties: {
+    sessionID: string
+    inputID: string
+    info: UserMessage
+    parts: Array<Part>
+  }
+}
+
 export type EventMessageRemoved = {
   id: string
   type: "message.removed"
@@ -6297,7 +6429,7 @@ export type EventSessionNextPrompted = {
     sessionID: string
     messageID: string
     prompt: Prompt
-    delivery: "steer" | "queue"
+    delivery: "steer" | "queue" | "legacy"
   }
 }
 
@@ -6309,7 +6441,17 @@ export type EventSessionNextPromptAdmitted = {
     sessionID: string
     messageID: string
     prompt: Prompt
-    delivery: "steer" | "queue"
+    delivery: "steer" | "queue" | "legacy"
+  }
+}
+
+export type EventSessionNextGoalUpdated = {
+  id: string
+  type: "session.next.goal.updated"
+  properties: {
+    timestamp: number
+    sessionID: string
+    goal: SessionGoalUpdate
   }
 }
 
@@ -11261,6 +11403,7 @@ export type V2HealthGetResponses = {
    */
   200: {
     healthy: true
+    pid: number
   }
 }
 
@@ -11638,6 +11781,117 @@ export type V2SessionPromptResponses = {
 }
 
 export type V2SessionPromptResponse = V2SessionPromptResponses[keyof V2SessionPromptResponses]
+
+export type V2SessionPendingInputsData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/input"
+}
+
+export type V2SessionPendingInputsErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+}
+
+export type V2SessionPendingInputsError = V2SessionPendingInputsErrors[keyof V2SessionPendingInputsErrors]
+
+export type V2SessionPendingInputsResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: Array<SessionInputPending>
+  }
+}
+
+export type V2SessionPendingInputsResponse = V2SessionPendingInputsResponses[keyof V2SessionPendingInputsResponses]
+
+export type V2SessionGoalData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/goal"
+}
+
+export type V2SessionGoalErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+}
+
+export type V2SessionGoalError = V2SessionGoalErrors[keyof V2SessionGoalErrors]
+
+export type V2SessionGoalResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data?: SessionGoalInfo
+  }
+}
+
+export type V2SessionGoalResponse = V2SessionGoalResponses[keyof V2SessionGoalResponses]
+
+export type V2SessionSetGoalData = {
+  body: SessionGoalUpdate
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/goal"
+}
+
+export type V2SessionSetGoalErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+}
+
+export type V2SessionSetGoalError = V2SessionSetGoalErrors[keyof V2SessionSetGoalErrors]
+
+export type V2SessionSetGoalResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: SessionGoalInfo
+  }
+}
+
+export type V2SessionSetGoalResponse = V2SessionSetGoalResponses[keyof V2SessionSetGoalResponses]
 
 export type V2SessionCompactData = {
   body?: never

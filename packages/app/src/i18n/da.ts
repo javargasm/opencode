@@ -1,4 +1,7 @@
+import { sessionGoalFallback } from "./session-goal-fallback"
+
 export const dict = {
+  ...sessionGoalFallback,
   "command.category.suggested": "Foreslået",
   "command.category.view": "Vis",
   "command.category.project": "Projekt",

@@ -99,6 +99,20 @@ describe("RuntimeFlags", () => {
     }),
   )
 
+  it.effect("enables V1 durable session input through its dedicated flag only", () =>
+    Effect.gen(function* () {
+      const disabled = yield* readFlags.pipe(Effect.provide(fromConfig({})))
+      const explicit = yield* readFlags.pipe(
+        Effect.provide(fromConfig({ OPENCODE_EXPERIMENTAL_V1_DURABLE_SESSION_INPUT: "true" })),
+      )
+      const umbrella = yield* readFlags.pipe(Effect.provide(fromConfig({ OPENCODE_EXPERIMENTAL: "true" })))
+
+      expect(disabled.v1DurableSessionInput).toBe(false)
+      expect(explicit.v1DurableSessionInput).toBe(true)
+      expect(umbrella.v1DurableSessionInput).toBe(false)
+    }),
+  )
+
   it.effect("layer accepts partial test overrides and fills defaults from Config definitions", () =>
     Effect.gen(function* () {
       const flags = yield* readFlags.pipe(

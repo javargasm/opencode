@@ -8,6 +8,7 @@ import { Pty } from "../src/pty"
 import { Question } from "../src/question"
 import { Session } from "../src/session"
 import { SessionEvent } from "../src/session-event"
+import { SessionGoal } from "../src/session-goal"
 import { SessionTodo } from "../src/session-todo"
 import { optional } from "../src/schema"
 
@@ -26,6 +27,19 @@ describe("contract hygiene", () => {
       status: "waiting",
       priority: "urgent",
     })
+  })
+
+  test("session goal uses closed statuses and omits an absent reason", () => {
+    const decode = Schema.decodeUnknownSync(SessionGoal.Update)
+    expect(decode({ objective: "Ship the session flow", status: "blocked" })).toEqual({
+      objective: "Ship the session flow",
+      status: "blocked",
+    })
+    expect(Schema.encodeSync(SessionGoal.Update)({ objective: "Ship the session flow", status: "active" })).toEqual({
+      objective: "Ship the session flow",
+      status: "active",
+    })
+    expect(() => decode({ objective: "Ship the session flow", status: "waiting" })).toThrow()
   })
 
   test("current ID constructors expose create", () => {
@@ -47,6 +61,8 @@ describe("contract hygiene", () => {
       Project.Info,
       Pty.Info,
       Session.ListAnchor,
+      SessionGoal.Update,
+      SessionGoal.Info,
     ].map((schema) => schema.ast.annotations?.identifier)
 
     expect(identifiers.every((identifier) => typeof identifier === "string")).toBe(true)

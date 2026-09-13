@@ -1,6 +1,7 @@
 import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { describe, expect } from "bun:test"
+import { isAllowedCorsOrigin } from "@opencode-ai/server/cors"
+import { describe, expect, test } from "bun:test"
 import { Config, ConfigProvider, Effect, Layer } from "effect"
 import { HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/unstable/http"
 import * as Socket from "effect/unstable/socket/Socket"
@@ -41,6 +42,13 @@ const it = testEffect(
     ),
   ),
 )
+
+describe("isAllowedCorsOrigin", () => {
+  test("allows the exact renderer origin and rejects a prefix lookalike", () => {
+    expect(isAllowedCorsOrigin("oc://renderer")).toBe(true)
+    expect(isAllowedCorsOrigin("oc://renderer.evil.example")).toBe(false)
+  })
+})
 
 describe("HttpApi CORS", () => {
   it.live("allows browser preflight requests without credentials", () =>

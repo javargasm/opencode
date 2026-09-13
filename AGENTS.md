@@ -144,6 +144,19 @@ const table = sqliteTable("session", {
 - Test actual implementation, do not duplicate logic into tests
 - Tests cannot run from repo root (guard: `do-not-run-tests-from-root`); run from package dirs like `packages/opencode`.
 
+## Compaction Handoff
+
+- Before creating or updating **any** session-compaction summary, always read
+  `specs/v2/v1-durable-queue-migration.md`,
+  `specs/v2/tui-durable-queue-migration.md`, and `specs/v2/todo.md`.
+- Every session-compaction summary must explicitly include
+  `Engram #600 — Plan persistente V2 a V1 Queue` and state that both Markdown
+  documents above were read for that compaction.
+- Carry their approved decisions, current phase, open blockers, validation
+  state, and next concrete slice into the compacted summary. Update those
+  documents when a decision or execution state changes; do not treat a planned
+  item as implemented.
+
 ## Type Checking
 
 - Always run `bun typecheck` from package directories (e.g., `packages/opencode`), never `tsc` directly.

@@ -1,4 +1,7 @@
+import { sessionGoalFallback } from "./session-goal-fallback"
+
 export const dict: Record<string, string> = {
+  ...sessionGoalFallback,
   "desktop.menu.app": "OpenCode",
   "desktop.menu.file": "ফাইল",
   "desktop.menu.edit": "সম্পাদনা করুন",

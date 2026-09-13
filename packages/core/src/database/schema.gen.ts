@@ -185,6 +185,16 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_goal\` (
+          \`session_id\` text PRIMARY KEY,
+          \`objective\` text NOT NULL,
+          \`status\` text NOT NULL,
+          \`reason\` text,
+          \`updated_at\` integer NOT NULL,
+          CONSTRAINT \`fk_session_goal_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`session_input\` (
           \`id\` text PRIMARY KEY,
           \`session_id\` text NOT NULL,

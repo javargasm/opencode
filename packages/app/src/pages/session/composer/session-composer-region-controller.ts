@@ -1,5 +1,6 @@
 import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { useSpring } from "@opencode-ai/ui/motion-spring"
+import type { SessionGoalInfo, SessionGoalUpdate } from "@opencode-ai/sdk/v2/client"
 import { type Accessor, createEffect, createMemo, createResource, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { PromptInputState } from "@/components/prompt-input"
@@ -7,11 +8,25 @@ import { useSync } from "@/context/sync"
 import { getSessionHandoff, setSessionHandoff } from "@/pages/session/handoff"
 import type { SessionComposerController } from "./session-composer-state"
 
-export type SessionComposerFollowupDock = {
-  items: { id: string; text: string }[]
-  sending?: string
-  onSend: (id: string) => void
-  onEdit: (id: string) => void
+export type SessionComposerFollowupDock =
+  | {
+      kind: "durable"
+      items: { id: string; text: string; delivery: "steer" | "queue" }[]
+      mode: "steer" | "queue"
+    }
+  | {
+      kind: "local"
+      items: { id: string; text: string }[]
+      mode: "steer" | "queue"
+      sending?: string
+      onSend: (id: string) => void
+      onEdit: (id: string) => void
+    }
+
+export type SessionComposerGoal = {
+  sessionID: string
+  goal?: SessionGoalInfo
+  onSave: (input: SessionGoalUpdate) => Promise<SessionGoalInfo>
 }
 
 export type SessionComposerRevertDock = {
@@ -32,6 +47,7 @@ export function createSessionComposerRegionController(input: {
     collapsed: Accessor<boolean>
     onToggle: () => void
   }
+  goal?: Accessor<SessionComposerGoal | undefined>
   followup: Accessor<SessionComposerFollowupDock | undefined>
   revert: Accessor<SessionComposerRevertDock | undefined>
   onResponseSubmit: () => void
@@ -123,6 +139,7 @@ export function createSessionComposerRegionController(input: {
     state: input.state,
     centered: input.centered,
     todo: input.todo,
+    goal: input.goal ?? (() => undefined),
     followup: input.followup,
     revert: input.revert,
     onResponseSubmit: input.onResponseSubmit,
@@ -138,7 +155,9 @@ export function createSessionComposerRegionController(input: {
     dock: () => (store.ready && input.state.dock()) || value() > 0.001,
     dockProgress: value,
     dockHeight: () => Math.max(78, store.height),
-    lift: () => (input.revert()?.items.length ? 18 : 36 * value()),
+    // A goal panel is an independent product-state form. Keep it out of the
+    // animated todo overlap so the prompt never covers its controls.
+    lift: () => (input.goal?.() ? 0 : input.revert()?.items.length ? 18 : 36 * value()),
     setDockBodyRef: (el: HTMLDivElement) => setStore("body", el),
   }
 }

@@ -12,6 +12,7 @@ import { Project } from "@opencode-ai/schema/project"
 import { ProjectDirectories } from "@opencode-ai/schema/project-directories"
 import { PermissionV1 } from "@opencode-ai/schema/permission-v1"
 import { Session } from "@opencode-ai/schema/session"
+import { SessionGoal } from "@opencode-ai/schema/session-goal"
 import { SessionInput } from "@opencode-ai/schema/session-input"
 import { SessionMessage } from "@opencode-ai/schema/session-message"
 import { Workspace } from "@opencode-ai/schema/workspace"
@@ -47,6 +48,7 @@ test("Core reuses the canonical shared schemas", async () => {
     coreProject,
     coreReference,
     coreSessionInput,
+    coreSessionGoal,
     coreSessionMessage,
     coreSessionTodo,
     corePrompt,
@@ -69,6 +71,7 @@ test("Core reuses the canonical shared schemas", async () => {
     import("@opencode-ai/core/project/schema"),
     import("@opencode-ai/core/reference"),
     import("@opencode-ai/core/session/input"),
+    import("@opencode-ai/core/session/goal"),
     import("@opencode-ai/core/session/message"),
     import("@opencode-ai/core/session/todo"),
     import("@opencode-ai/core/session/prompt"),
@@ -142,6 +145,10 @@ test("Core reuses the canonical shared schemas", async () => {
     [SessionV2.ListAnchor, Session.ListAnchor],
     [coreSessionInput.Delivery, SessionInput.Delivery],
     [coreSessionInput.Admitted, SessionInput.Admitted],
+    [coreSessionInput.Pending, SessionInput.Pending],
+    [coreSessionGoal.Status, SessionGoal.Status],
+    [coreSessionGoal.Update, SessionGoal.Update],
+    [coreSessionGoal.Info, SessionGoal.Info],
     [coreSessionMessage.ID, SessionMessage.ID],
     [coreSessionMessage.UnknownError, SessionMessage.UnknownError],
     [coreSessionMessage.AgentSwitched, SessionMessage.AgentSwitched],

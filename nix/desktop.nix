@@ -55,6 +55,10 @@ stdenv.mkDerivation (finalAttrs: {
 
   env = opencode.env // {
     ELECTRON_SKIP_BINARY_DOWNLOAD = "1";
+    # Nix Desktop builds the V2 sidecar from this checkout and ships it as an
+    # Electron extra resource instead of downloading a published CLI.
+    OPENCODE_BUNDLE_SOURCE_CLI = "1";
+    OPENCODE_SOURCE_CLI_PATH = "${opencode}/libexec/opencode-cli";
   };
 
   postPatch =

@@ -2,6 +2,38 @@
 
 ok we need to work towards a launch of v2 so we can get out of this rebuild phase
 
+## Bridge V1-capable: Queue durable
+
+Plan de referencia: [bridge de Queue durable V2 para V1](./v1-durable-queue-migration.md).
+Plan de ejecución TUI: [Queue durable V1-capable en TUI](./tui-durable-queue-migration.md).
+Referencia persistente de compactación: `Engram #600 — Plan persistente V2 a V1 Queue`.
+El bridge backend, la capability y el transporte App están implementados. La
+recuperación tras reinicio y la concurrencia entre runtimes V1 ya tienen
+cobertura reproducible; quedan las validaciones integrales de UI, permisos,
+fallback, migración y rollout. No ampliar el alcance a `SessionGoal` ni a
+acciones mutables de Queue.
+
+- [x] Ejecutar el spike `SessionInput` → runner V1 y confirmar identidad de
+      sesión, almacenamiento y ruta `legacy`.
+- [x] Añadir la capability V1 versionada `durableSessionInput: 1` sin cambiar
+      la clasificación del protocolo ni romper clientes antiguos.
+- [x] Implementar el bridge de admisión, promoción FIFO y recuperación V1,
+      preservando idempotencia por `messageID`.
+- [x] Conservar `/prompt_async` y su semántica legacy durante el primer corte.
+- [x] Añadir eventos/refetch de reconnect para inputs admitidos y promovidos.
+- [x] Implementar `QueueTransport` durable en App y reservar
+      `followup.v1` para servidores sin capability.
+- [x] Migrar automáticamente sólo entradas locales verificables, una a una y
+      con IDs estables; dejar los casos ambiguos en `needs-review`.
+- [x] Corregir el matcher CORS por prefijo y añadir pruebas negativas antes de
+      habilitar la capability.
+- [x] Cubrir recuperación tras reinicio y concurrencia entre runtimes V1:
+      las entradas Queue persistidas se promueven una vez y conservan FIFO.
+- [ ] Cubrir navegación, múltiples ventanas de UI, retries idempotentes,
+      permisos/preguntas, fallback legacy y migración local.
+- [ ] Habilitar primero en Dev/Beta con rollback que detenga nuevas admisiones
+      sin abandonar filas durable ya admitidas.
+
 ## Post-Hono cleanup - Kit
 
 The opencode server has moved to the Effect HttpApi backend. Remaining work is

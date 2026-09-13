@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { detectServerProtocol } from "./server-protocol"
+import { detectServerProfile, detectServerProtocol } from "./server-protocol"
 
 const server = { url: "http://localhost:4096" }
 const json = (value: unknown, status = 200) =>
@@ -36,5 +36,33 @@ describe("detectServerProtocol", () => {
     })
 
     expect(await detectServerProtocol(server, fetcher)).toBe("v1")
+  })
+
+  test("keeps a capable legacy server on V1 while preserving its durable input capability", async () => {
+    const fetcher = mockFetch((input) => {
+      const path = new URL(input instanceof Request ? input.url : input).pathname
+      if (path === "/global/health")
+        return Promise.resolve(json({ healthy: true, capabilities: { durableSessionInput: 1 } }))
+      return Promise.resolve(json({ healthy: true, pid: 123 }))
+    })
+
+    expect(await detectServerProfile(server, fetcher)).toEqual({
+      protocol: "v1",
+      capabilities: { durableSessionInput: 1 },
+    })
+    expect(await detectServerProtocol(server, fetcher)).toBe("v1")
+  })
+
+  test("does not enable durable input for malformed legacy capability values", async () => {
+    for (const value of [0, "1", 2, true, undefined]) {
+      const fetcher = mockFetch((input) => {
+        const path = new URL(input instanceof Request ? input.url : input).pathname
+        if (path === "/global/health")
+          return Promise.resolve(json({ healthy: true, capabilities: { durableSessionInput: value } }))
+        return Promise.resolve(json({}, 404))
+      })
+
+      expect(await detectServerProfile(server, fetcher)).toEqual({ protocol: "v1", capabilities: {} })
+    }
   })
 })

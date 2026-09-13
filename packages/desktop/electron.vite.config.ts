@@ -11,6 +11,7 @@ const channel = (() => {
   if (process.env.OPENCODE_CHANNEL === "latest") return "prod"
   return "dev"
 })()
+const sourceCliBundled = process.env.OPENCODE_BUNDLE_SOURCE_CLI === "1"
 
 const nodePtyPkg = `@lydell/node-pty-${process.platform}-${process.arch}`
 
@@ -35,6 +36,7 @@ export default defineConfig({
   main: {
     define: {
       "import.meta.env.OPENCODE_CHANNEL": JSON.stringify(channel),
+      "import.meta.env.OPENCODE_BUNDLE_SOURCE_CLI": JSON.stringify(sourceCliBundled),
     },
     build: {
       rollupOptions: {

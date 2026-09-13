@@ -1,4 +1,7 @@
+import { sessionGoalFallback } from "./session-goal-fallback"
+
 export const dict = {
+  ...sessionGoalFallback,
   "desktop.menu.app": "OpenCode",
   "desktop.menu.file": "Tệp",
   "desktop.menu.edit": "Chỉnh sửa",

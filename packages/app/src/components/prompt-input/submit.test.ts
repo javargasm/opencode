@@ -4,6 +4,7 @@ import type { Prompt, PromptStore } from "@/context/prompt"
 import type { ModelSelection } from "@/context/local"
 
 let createPromptSubmit: typeof import("./submit").createPromptSubmit
+let sendFollowupDraft: typeof import("./submit").sendFollowupDraft
 
 const createdClients: string[] = []
 const createdSessions: string[] = []
@@ -33,6 +34,8 @@ const promptInputs: unknown[] = []
 const sentCommands: unknown[] = []
 const commands: Array<{ name: string }> = []
 let serverSessionSyncs = 0
+let promptResets = 0
+let removedPromptContext = 0
 
 let params: { id?: string } = {}
 let search: { draftId?: string } = {}
@@ -57,11 +60,15 @@ const prompt = {
     current: () => undefined,
     set: () => undefined,
   },
-  reset: () => undefined,
+  reset: () => {
+    promptResets++
+  },
   set: () => undefined,
   context: {
     add: () => undefined,
-    remove: () => undefined,
+    remove: () => {
+      removedPromptContext++
+    },
     removeComment: () => undefined,
     updateComment: () => undefined,
     replaceComments: () => undefined,
@@ -135,6 +142,7 @@ beforeAll(async () => {
   mock.module("@opencode-ai/ui/toast", () => ({
     Toast: { Region: () => null },
     showToast: () => 0,
+    toaster: { dismiss: () => undefined },
   }))
 
   mock.module("@opencode-ai/core/util/encode", () => ({
@@ -276,6 +284,7 @@ beforeAll(async () => {
 
   const mod = await import("./submit")
   createPromptSubmit = mod.createPromptSubmit
+  sendFollowupDraft = mod.sendFollowupDraft
 })
 
 beforeEach(() => {
@@ -301,6 +310,8 @@ beforeEach(() => {
   permissionServer = "server-a"
   createSessionGate = undefined
   serverSessionSyncs = 0
+  promptResets = 0
+  removedPromptContext = 0
   for (const key of Object.keys(storedSessions)) delete storedSessions[key]
 })
 
@@ -494,11 +505,11 @@ describe("prompt submit worktree selection", () => {
     ])
   })
 
-  test("submits slash commands through the current session API", async () => {
+  test("submits whitespace-separated slash commands through the current session API", async () => {
     params = { id: "session-1" }
     variant = "high"
     commands.push({ name: "review" })
-    promptValue = [{ type: "text", content: "/review staged changes", start: 0, end: 22 }]
+    promptValue = [{ type: "text", content: "/review\nstaged changes", start: 0, end: 22 }]
 
     const submit = createPromptSubmit({
       prompt,
@@ -531,6 +542,344 @@ describe("prompt submit worktree selection", () => {
       },
     ])
     expect(serverSessionSyncs).toBe(0)
+  })
+
+  test("dispatches tab-separated custom commands instead of admitting them to the queue", async () => {
+    params = { id: "session-1" }
+    commands.push({ name: "review" })
+    promptValue = [{ type: "text", content: "/review\tstaged changes", start: 0, end: 22 }]
+    const queued: unknown[] = []
+    const submit = createPromptSubmit({
+      prompt,
+      info: () => ({ id: "session-1" }),
+      imageAttachments: () => [],
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "normal",
+      working: () => true,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+      shouldQueue: () => true,
+      onQueue: async (input) => {
+        queued.push(input)
+      },
+    })
+
+    await submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+
+    expect(queued).toEqual([])
+    expect(sentCommands).toEqual([
+      expect.objectContaining({
+        command: "review",
+        arguments: "staged changes",
+      }),
+    ])
+  })
+
+  test("sends whitespace-separated V1 queued commands through the command API", async () => {
+    const sent: unknown[] = []
+
+    await sendFollowupDraft({
+      api: {
+        command: async (input: unknown) => {
+          sent.push(input)
+        },
+      } as never,
+      serverSync: undefined as never,
+      sync: {
+        data: { command: [{ name: "review" }] },
+      } as never,
+      draft: {
+        sessionID: "session-1",
+        sessionDirectory: "/repo/main",
+        prompt: [{ type: "text", content: "/review\tstaged changes", start: 0, end: 22 }],
+        context: [],
+        agent: "agent",
+        model: { providerID: "provider", modelID: "model" },
+      },
+    })
+
+    expect(sent).toEqual([
+      expect.objectContaining({
+        sessionID: "session-1",
+        command: "review",
+        arguments: "staged changes",
+      }),
+    ])
+  })
+
+  test("admits queue-mode prompts durably before clearing the composer", async () => {
+    params = { id: "session-1" }
+    const queued: unknown[] = []
+    const submit = createPromptSubmit({
+      prompt,
+      info: () => ({ id: "session-1" }),
+      imageAttachments: () => [],
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "normal",
+      working: () => true,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+      shouldQueue: () => true,
+      onQueue: async (input) => {
+        queued.push(input)
+      },
+    })
+
+    await submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+
+    expect(queued).toEqual([
+      {
+        sessionID: "session-1",
+        id: expect.stringMatching(/^msg_/),
+        prompt: { text: "ls" },
+      },
+    ])
+    expect(promptResets).toBe(1)
+    expect(removedPromptContext).toBe(0)
+    expect(sentPrompts).toEqual([])
+    expect(optimistic).toEqual([])
+  })
+
+  test("queues V1 follow-ups locally without sending immediately", async () => {
+    params = { id: "session-1" }
+    const queued: unknown[] = []
+    const submit = createPromptSubmit({
+      prompt,
+      info: () => ({ id: "session-1" }),
+      imageAttachments: () => [],
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "normal",
+      working: () => true,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+      shouldQueue: () => true,
+      queueDelivery: () => "local",
+      onQueue: async () => {
+        throw new Error("V1 must not use durable admission")
+      },
+      onLocalQueue: (draft) => queued.push(draft),
+    })
+
+    await submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+
+    expect(queued).toEqual([
+      expect.objectContaining({
+        sessionID: "session-1",
+        prompt: [{ type: "text", content: "ls", start: 0, end: 2 }],
+      }),
+    ])
+    expect(promptResets).toBe(1)
+    expect(sentPrompts).toEqual([])
+    expect(optimistic).toEqual([])
+  })
+
+  test("keeps queue-mode input while the server protocol is unknown", async () => {
+    params = { id: "session-1" }
+    const durable: unknown[] = []
+    const local: unknown[] = []
+    const submit = createPromptSubmit({
+      prompt,
+      info: () => ({ id: "session-1" }),
+      imageAttachments: () => [],
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "normal",
+      working: () => true,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+      shouldQueue: () => true,
+      queueDelivery: () => undefined,
+      onQueue: async (input) => {
+        durable.push(input)
+      },
+      onLocalQueue: (input) => local.push(input),
+    })
+
+    await submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+
+    expect(durable).toEqual([])
+    expect(local).toEqual([])
+    expect(promptResets).toBe(0)
+    expect(sentPrompts).toEqual([])
+  })
+
+  test("keeps queue-mode input intact when durable admission fails", async () => {
+    params = { id: "session-1" }
+    const submit = createPromptSubmit({
+      prompt,
+      info: () => ({ id: "session-1" }),
+      imageAttachments: () => [],
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "normal",
+      working: () => true,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+      shouldQueue: () => true,
+      onQueue: async () => {
+        throw new Error("offline")
+      },
+    })
+
+    await submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+
+    expect(promptResets).toBe(0)
+    expect(removedPromptContext).toBe(0)
+    expect(promptValue).toEqual([{ type: "text", content: "ls", start: 0, end: 2 }])
+    expect(sentPrompts).toEqual([])
+    expect(optimistic).toEqual([])
+  })
+
+  test("coalesces concurrent durable queue submits for the same composer snapshot", async () => {
+    params = { id: "session-1" }
+    let release = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const queued: string[] = []
+    const submit = createPromptSubmit({
+      prompt,
+      info: () => ({ id: "session-1" }),
+      imageAttachments: () => [],
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "normal",
+      working: () => true,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+      shouldQueue: () => true,
+      onQueue: async (input) => {
+        queued.push(input.id)
+        await gate
+      },
+    })
+
+    const event = { preventDefault: () => undefined } as unknown as Event
+    const first = submit.handleSubmit(event)
+    await Promise.resolve()
+    const second = submit.handleSubmit(event)
+    await Promise.resolve()
+    release()
+    await Promise.all([first, second])
+
+    expect(queued).toHaveLength(1)
+  })
+
+  test("preserves composer edits made while durable queue admission is pending", async () => {
+    params = { id: "session-1" }
+    let current: Prompt = [{ type: "text", content: "first", start: 0, end: 5 }]
+    let resets = 0
+    const mutablePrompt: typeof prompt = {
+      ...prompt,
+      current: () => current,
+      capture: () => mutablePrompt,
+      reset: () => {
+        resets++
+        current = []
+      },
+    }
+    let release = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const submit = createPromptSubmit({
+      prompt: mutablePrompt,
+      info: () => ({ id: "session-1" }),
+      imageAttachments: () => [],
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "normal",
+      working: () => true,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+      shouldQueue: () => true,
+      onQueue: async () => gate,
+    })
+
+    const pending = submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+    await Promise.resolve()
+    current = [{ type: "text", content: "typed while waiting", start: 0, end: 18 }]
+    release()
+    await pending
+
+    expect(resets).toBe(0)
+    expect(current).toEqual([{ type: "text", content: "typed while waiting", start: 0, end: 18 }])
+  })
+
+  test("retries a pre-commit durable admission failure with the same canonical input", async () => {
+    params = { id: "session-1" }
+    const admitted: Array<{ id: string; prompt: unknown }> = []
+    let first = true
+    const submit = createPromptSubmit({
+      prompt,
+      info: () => ({ id: "session-1" }),
+      imageAttachments: () => [],
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "normal",
+      working: () => true,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+      shouldQueue: () => true,
+      onQueue: async (input) => {
+        admitted.push(input)
+        if (first) {
+          first = false
+          throw new Error("offline before commit")
+        }
+      },
+    })
+
+    const event = { preventDefault: () => undefined } as unknown as Event
+    await submit.handleSubmit(event)
+    await submit.handleSubmit(event)
+
+    expect(admitted).toHaveLength(2)
+    expect(admitted[1]).toBe(admitted[0])
+    expect(admitted[1]?.id).toBe(admitted[0]?.id)
   })
 
   test("uses an injected model selection", async () => {

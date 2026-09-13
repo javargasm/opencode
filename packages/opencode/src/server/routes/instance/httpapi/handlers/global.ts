@@ -5,6 +5,7 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { Installation } from "@/installation"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Effect, Queue } from "effect"
 import * as Stream from "effect/Stream"
 import { HttpServerResponse } from "effect/unstable/http"
@@ -61,10 +62,15 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
   Effect.gen(function* () {
     const config = yield* Config.Service
     const installation = yield* Installation.Service
+    const flags = yield* RuntimeFlags.Service
     const bridge = yield* EffectBridge.make()
 
     const health = Effect.fn("GlobalHttpApi.health")(function* () {
-      return { healthy: true as const, version: InstallationVersion }
+      return {
+        healthy: true as const,
+        version: InstallationVersion,
+        ...(flags.v1DurableSessionInput ? { capabilities: { durableSessionInput: 1 as const } } : {}),
+      }
     })
 
     const event = Effect.fn("GlobalHttpApi.event")(function* () {

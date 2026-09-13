@@ -12,7 +12,7 @@ import { SessionMessage } from "./message"
 import { SessionMessageUpdater } from "./message-updater"
 import { SessionInput } from "./input"
 import { WorkspaceV2 } from "../workspace"
-import { MessageTable, PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
+import { MessageTable, PartTable, SessionGoalTable, SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
 import type { DeepMutable } from "../schema"
 
 type DatabaseService = Database.Interface["db"]
@@ -273,7 +273,8 @@ const layer = Layer.effectDiscard(
     )
     yield* events.project(SessionV1.Event.LegacyPromptMaterialized, (event) =>
       Effect.gen(function* () {
-        if (event.durable === undefined) return yield* Effect.die("Durable legacy prompt event is missing aggregate sequence")
+        if (event.durable === undefined)
+          return yield* Effect.die("Durable legacy prompt event is missing aggregate sequence")
         if (
           event.data.info.id !== event.data.inputID ||
           event.data.info.sessionID !== event.data.sessionID ||
@@ -297,12 +298,7 @@ const layer = Layer.effectDiscard(
         const existing = yield* db
           .select()
           .from(PartTable)
-          .where(
-            and(
-              eq(PartTable.message_id, event.data.inputID),
-              eq(PartTable.session_id, event.data.sessionID),
-            ),
-          )
+          .where(and(eq(PartTable.message_id, event.data.inputID), eq(PartTable.session_id, event.data.sessionID)))
           .all()
           .pipe(Effect.orDie)
         yield* Effect.forEach(
@@ -315,12 +311,7 @@ const layer = Layer.effectDiscard(
         )
         yield* db
           .delete(PartTable)
-          .where(
-            and(
-              eq(PartTable.message_id, event.data.inputID),
-              eq(PartTable.session_id, event.data.sessionID),
-            ),
-          )
+          .where(and(eq(PartTable.message_id, event.data.inputID), eq(PartTable.session_id, event.data.sessionID)))
           .run()
           .pipe(Effect.orDie)
         yield* Effect.forEach(
@@ -452,6 +443,28 @@ const layer = Layer.effectDiscard(
           timeCreated: event.data.timestamp,
         })
       }),
+    )
+    yield* events.project(SessionEvent.Goal.Updated, (event) =>
+      db
+        .insert(SessionGoalTable)
+        .values({
+          session_id: event.data.sessionID,
+          objective: event.data.goal.objective,
+          status: event.data.goal.status,
+          reason: event.data.goal.reason ?? null,
+          updated_at: DateTime.toEpochMillis(event.data.timestamp),
+        })
+        .onConflictDoUpdate({
+          target: SessionGoalTable.session_id,
+          set: {
+            objective: event.data.goal.objective,
+            status: event.data.goal.status,
+            reason: event.data.goal.reason ?? null,
+            updated_at: DateTime.toEpochMillis(event.data.timestamp),
+          },
+        })
+        .run()
+        .pipe(Effect.orDie),
     )
     yield* events.project(SessionEvent.ContextUpdated, (event) => run(db, event))
     yield* events.project(SessionEvent.Synthetic, (event) => run(db, event))

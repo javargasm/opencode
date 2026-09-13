@@ -78,6 +78,7 @@ import { getScrollAcceleration } from "../../util/scroll"
 import { collapseToolOutput } from "../../util/collapse-tool-output"
 import { usePluginRuntime } from "../../plugin/runtime"
 import { DialogRetryAction } from "../../component/dialog-retry-action"
+import { DialogQueuedPrompts } from "./dialog-queued-prompts"
 import { getRevertDiffFiles } from "../../util/revert-diff"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
@@ -129,6 +130,7 @@ const sessionBindingCommands = [
   "session.toggle.actions",
   "session.toggle.scrollbar",
   "session.toggle.generic_tool_output",
+  "session.queued_prompts",
   "session.first",
   "session.last",
   "session.messages_last_user",
@@ -240,6 +242,11 @@ export function Session() {
   })
   const visible = createMemo(() => !session()?.parentID && permissions().length === 0 && questions().length === 0)
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
+  const queuedPrompts = createMemo(() => sync.data.session_input[route.sessionID] ?? [])
+
+  createEffect(() => {
+    void sync.session.refreshPendingInputs(route.sessionID).catch(() => {})
+  })
 
   const pending = createMemo(() => {
     const completed = messages().findLastIndex((message) => message.role === "assistant" && message.time.completed)
@@ -464,6 +471,15 @@ export function Session() {
   }
 
   const sessionCommandList = createMemo(() => [
+    {
+      title: "Queued prompts",
+      value: "session.queued_prompts",
+      category: "Session",
+      enabled: sync.data.capabilities.durableSessionInput,
+      run: () => {
+        dialog.replace(() => <DialogQueuedPrompts inputs={queuedPrompts()} />)
+      },
+    },
     {
       title: session()?.share?.url ? "Copy share link" : "Share session",
       value: "session.share",

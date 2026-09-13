@@ -1,4 +1,4 @@
-import type { Message, Session } from "@opencode-ai/sdk/v2/client"
+import type { Message, PromptInput as V2PromptInput, Session } from "@opencode-ai/sdk/v2/client"
 import { showToast } from "@/utils/toast"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { Binary } from "@opencode-ai/core/util/binary"
@@ -15,7 +15,7 @@ import { useSDK, type DirectorySDK } from "@/context/sdk"
 import { useSync, type DirectorySync } from "@/context/sync"
 import { Identifier } from "@/utils/id"
 import { Worktree as WorktreeState } from "@/utils/worktree"
-import { buildRequestParts } from "./build-request-parts"
+import { buildRequestParts, toV2PromptInput } from "./build-request-parts"
 import { setCursorPosition } from "./editor-dom"
 import { formatServerError } from "@/utils/server-errors"
 import { ScopedKey } from "@/utils/server-scope"
@@ -39,6 +39,25 @@ export type FollowupDraft = {
   agent: string
   model: { providerID: string; modelID: string }
   variant?: string
+}
+
+export type DurableQueueInput = {
+  sessionID: string
+  id: string
+  prompt: V2PromptInput
+}
+
+type DurableQueueAdmission = {
+  snapshot: string
+  id: string
+  input?: DurableQueueInput
+  pending?: Promise<{ ok: true } | { ok: false; error: unknown }>
+}
+
+function parseSlashCommand(text: string) {
+  const [head, ...arguments_] = text.split(/\s+/)
+  if (!head?.startsWith("/")) return
+  return { name: head.slice(1), arguments: arguments_.join(" ") }
 }
 
 type FollowupSendInput = {
@@ -74,9 +93,8 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
     return true
   }
 
-  const [head, ...tail] = text.split(" ")
-  const cmd = head?.startsWith("/") ? head.slice(1) : undefined
-  if (cmd && input.sync.data.command.find((item) => item.name === cmd)) {
+  const command = parseSlashCommand(text)
+  if (command && input.sync.data.command.find((item) => item.name === command.name)) {
     setBusy()
     try {
       if (!(await wait())) {
@@ -88,8 +106,8 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
       await input.api.command({
         sessionID: input.draft.sessionID,
         id: messageID,
-        command: cmd,
-        arguments: tail.join(" "),
+        command: command.name,
+        arguments: command.arguments,
         agent: input.draft.agent,
         model: {
           id: input.draft.model.modelID,
@@ -225,7 +243,9 @@ type PromptSubmitInput = {
   newSessionWorktree?: Accessor<string | undefined>
   onNewSessionWorktreeReset?: () => void
   shouldQueue?: Accessor<boolean>
-  onQueue?: (draft: FollowupDraft) => void
+  queueDelivery?: Accessor<"durable" | "local" | undefined>
+  onQueue?: (input: DurableQueueInput) => Promise<void>
+  onLocalQueue?: (draft: FollowupDraft) => void
   onAbort?: () => void
   onSubmit?: () => void
   model?: ModelSelection
@@ -244,6 +264,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
   const params = useParams()
   const [search] = useSearchParams<{ draftId?: string }>()
   const tabs = useTabs()
+  const queueAdmissions = new WeakMap<ReturnType<ReturnType<typeof usePrompt>["capture"]>, DurableQueueAdmission>()
   const pendingKey = (sessionID: string) => ScopedKey.from(sdk().scope, sessionID)
 
   const errorMessage = (err: unknown) => {
@@ -347,14 +368,29 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return
     }
 
-    input.addToHistory(currentPrompt, mode)
-    input.resetHistoryNavigation()
-
     const projectDirectory = sdk().directory
     const permissionState = permission.currentServerState()
     const isNewSession = !params.id
     const shouldAutoAccept = isNewSession && input.autoAccept()
     const worktreeSelection = input.newSessionWorktree?.() || "main"
+    const command = parseSlashCommand(text)
+    const isCustomCommand = command && sync().data.command.some((item) => item.name === command.name)
+    const queueSnapshot = JSON.stringify({ prompt: currentPrompt, context })
+    const canQueue = !isNewSession && mode === "normal" && !isCustomCommand && input.shouldQueue?.() === true
+    const queueDelivery = input.queueDelivery?.()
+    const localQueue = canQueue && queueDelivery === "local"
+    const durableQueue = canQueue && (queueDelivery === "durable" || (!input.queueDelivery && !!input.onQueue))
+    const queued = queueAdmissions.get(target)
+    if (durableQueue && queued?.snapshot === queueSnapshot && queued.pending) {
+      await queued.pending
+      return
+    }
+    if (durableQueue && queued?.pending) await queued.pending
+
+    if (canQueue && input.queueDelivery && !queueDelivery) return
+
+    input.addToHistory(currentPrompt, mode)
+    input.resetHistoryNavigation()
 
     let sessionDirectory = projectDirectory
     let client = sdk().client
@@ -479,10 +515,82 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return true
     }
 
-    if (!isNewSession && mode === "normal" && input.shouldQueue?.()) {
-      input.onQueue?.(draft)
+    if (localQueue) {
+      const onLocalQueue = input.onLocalQueue
+      if (!onLocalQueue) return
+      onLocalQueue(draft)
       clearContext(submission.target())
       clearInput()
+      return
+    }
+
+    if (durableQueue && input.onQueue) {
+      const onQueue = input.onQueue
+      const queued = queueAdmissions.get(target)
+      const admission: DurableQueueAdmission =
+        queued?.snapshot === queueSnapshot
+          ? queued
+          : {
+              snapshot: queueSnapshot,
+              id: Identifier.ascending("message"),
+            }
+      queueAdmissions.set(target, admission)
+      if (admission.pending) {
+        await admission.pending
+        return
+      }
+      const pending = (async () => {
+        try {
+          const cachedInput = admission.input
+          if (cachedInput) {
+            await onQueue(cachedInput)
+            return { ok: true as const }
+          }
+          const encodedImages = await Promise.all(
+            images.map(async (attachment) => ({
+              ...attachment,
+              dataUrl: await blobDataUrl(attachment.blob, attachment.mime),
+            })),
+          )
+          const { requestParts } = buildRequestParts({
+            prompt: currentPrompt,
+            context,
+            images: encodedImages,
+            text,
+            sessionID: session.id,
+            messageID: admission.id,
+            sessionDirectory,
+          })
+          const queueInput = {
+            sessionID: session.id,
+            id: admission.id,
+            prompt: toV2PromptInput(requestParts),
+          }
+          admission.input = queueInput
+          await onQueue(queueInput)
+          return { ok: true as const }
+        } catch (error) {
+          return { ok: false as const, error }
+        }
+      })()
+      admission.pending = pending
+      const result = await pending
+      if (admission.pending === pending) admission.pending = undefined
+      if (!result.ok) {
+        showToast({
+          title: language.t("prompt.toast.promptSendFailed.title"),
+          description: errorMessage(result.error),
+        })
+        return
+      }
+      if (queueAdmissions.get(target) === admission) queueAdmissions.delete(target)
+      if (
+        submission.current(prompt.capture()) &&
+        JSON.stringify({ prompt: submission.target().current(), context: submission.target().context.items() }) === queueSnapshot
+      ) {
+        clearContext(submission.target())
+        clearInput()
+      }
       return
     }
 
@@ -509,10 +617,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return
     }
 
-    if (text.startsWith("/")) {
-      const [cmdName, ...args] = text.split(" ")
-      const commandName = cmdName.slice(1)
-      const customCommand = sync().data.command.find((c) => c.name === commandName)
+    if (command) {
+      const customCommand = sync().data.command.find((item) => item.name === command.name)
       if (customCommand) {
         clearInput()
         const messageID = Identifier.ascending("message")
@@ -521,8 +627,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           .api.session.command({
             sessionID: session.id,
             id: messageID,
-            command: commandName,
-            arguments: args.join(" "),
+            command: command.name,
+            arguments: command.arguments,
             agent,
             model: { id: model.modelID, providerID: model.providerID, variant },
             files: await Promise.all(

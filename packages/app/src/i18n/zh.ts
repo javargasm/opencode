@@ -1,8 +1,10 @@
 import { dict as en } from "./en"
+import { sessionGoalFallback } from "./session-goal-fallback"
 
 type Keys = keyof typeof en
 
 export const dict = {
+  ...sessionGoalFallback,
   "desktop.menu.app": "OpenCode",
   "desktop.menu.file": "文件",
   "desktop.menu.edit": "编辑",

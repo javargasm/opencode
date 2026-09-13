@@ -11,7 +11,7 @@ import { ServerConnection, useServer } from "./server"
 import { createRefCountMap } from "@/utils/refcount"
 import { useGlobal } from "./global"
 import { ServerScope } from "@/utils/server-scope"
-import { detectServerProtocol, type ServerProtocol } from "@/utils/server-protocol"
+import { detectServerProfile, type ServerCapabilities, type ServerProtocol } from "@/utils/server-protocol"
 import { createCompatibleApi, type CompatibleApi } from "@/utils/server-compat"
 
 const isAbortError = (error: unknown) =>
@@ -170,6 +170,7 @@ type ServerSDKBase = {
   scope: ServerScope
   protocol: Promise<ServerProtocol>
   protocolKind: Accessor<ServerProtocol | undefined>
+  capabilities: Accessor<ServerCapabilities | undefined>
   url: string
   client: ReturnType<typeof createSdkForServer>
   api: CompatibleApi
@@ -205,11 +206,11 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     fetch: eventFetch,
     server: server.http,
   })
-  const protocol = detectServerProtocol(server.http, platform.fetch ?? globalThis.fetch)
-  const [protocolKind] = createResource(
-    () => protocol,
-    (value) => value,
-  )
+  const profile = detectServerProfile(server.http, platform.fetch ?? globalThis.fetch)
+  const protocol = profile.then((value) => value.protocol)
+  const [profileValue] = createResource(() => profile, (value) => value)
+  const protocolKind = () => profileValue()?.protocol
+  const capabilities = () => profileValue()?.capabilities
   const emitter = createGlobalEmitter<{
     [key: string]: ServerEvent
   }>()
@@ -353,6 +354,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     scope,
     protocol,
     protocolKind,
+    capabilities,
     url: server.http.url,
     client: sdk,
     api,

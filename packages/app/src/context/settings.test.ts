@@ -8,6 +8,7 @@ import {
   newLayoutDesignsDefault,
   nextSunsetCheckDelay,
   resolveNewLayoutDesigns,
+  resolveFollowup,
   shouldDisplayTabsToast,
   shouldEnableNewLayout,
 } from "./settings"
@@ -25,6 +26,14 @@ describe("agent visibility", () => {
   test("preserves the preference after initialization", () => {
     expect(initialAgentVisibility(true, true, "1.18.8")).toBeUndefined()
     expect(initialAgentVisibility(true, false)).toBeUndefined()
+  })
+})
+
+describe("follow-up behavior", () => {
+  test("preserves queue instead of coercing it to steer", () => {
+    expect(resolveFollowup(undefined)).toBe("steer")
+    expect(resolveFollowup("steer")).toBe("steer")
+    expect(resolveFollowup("queue")).toBe("queue")
   })
 })
 

@@ -15,6 +15,18 @@ test("sessions.get returns the decoded Effect projection", async () => {
   expect(DateTime.toEpochMillis(result.time.created)).toBe(1_717_171_717_000)
 })
 
+test("sessions.goal decodes an absent optional goal", async () => {
+  const httpClient = HttpClient.make((request) =>
+    Effect.succeed(HttpClientResponse.fromWeb(request, Response.json({}))),
+  )
+  const result = await Effect.gen(function* () {
+    const client = yield* OpenCode.make({ baseUrl: "http://localhost:3000" })
+    return yield* client.sessions.goal({ sessionID: Session.ID.make("ses_test") })
+  }).pipe(Effect.provideService(HttpClient.HttpClient, httpClient), Effect.runPromise)
+
+  expect(result).toBeUndefined()
+})
+
 test("events.subscribe exposes and decodes the native Effect event stream", async () => {
   const httpClient = HttpClient.make((request) =>
     Effect.succeed(
@@ -89,6 +101,12 @@ test("session methods retain decoded Effect inputs and outputs", async () => {
     if (url.includes("/prompt")) {
       return Effect.succeed(HttpClientResponse.fromWeb(request, Response.json(admission)))
     }
+    if (url.includes("/input")) {
+      return Effect.succeed(HttpClientResponse.fromWeb(request, Response.json({ data: [pendingInput] })))
+    }
+    if (url.includes("/goal")) {
+      return Effect.succeed(HttpClientResponse.fromWeb(request, Response.json(sessionGoal)))
+    }
     if (url.includes("/context")) {
       return Effect.succeed(HttpClientResponse.fromWeb(request, Response.json({ data: [] })))
     }
@@ -127,6 +145,14 @@ test("session methods retain decoded Effect inputs and outputs", async () => {
       prompt: Prompt.make({ text: "Hello" }),
       resume: false,
     })
+    const pendingInputs = yield* client.sessions.pendingInputs({ sessionID: Session.ID.make("ses_test") })
+    const goal = yield* client.sessions.goal({ sessionID: Session.ID.make("ses_test") })
+    const updatedGoal = yield* client.sessions.setGoal({
+      sessionID: Session.ID.make("ses_test"),
+      objective: "Ship the canonical session flow",
+      status: "blocked",
+      reason: "Awaiting durable sections",
+    })
     yield* client.sessions.compact({ sessionID: Session.ID.make("ses_test") })
     yield* client.sessions.wait({ sessionID: Session.ID.make("ses_test") })
     const context = yield* client.sessions.context({ sessionID: Session.ID.make("ses_test") })
@@ -150,7 +176,20 @@ test("session methods retain decoded Effect inputs and outputs", async () => {
       sessionID: Session.ID.make("ses_test"),
       messageID: SessionMessage.ID.make("msg_model"),
     })
-    return { page, active, created, admitted, context, history, historyNext, events, message }
+    return {
+      page,
+      active,
+      created,
+      admitted,
+      pendingInputs,
+      goal,
+      updatedGoal,
+      context,
+      history,
+      historyNext,
+      events,
+      message,
+    }
   }).pipe(Effect.provideService(HttpClient.HttpClient, httpClient), Effect.runPromise)
 
   expect(DateTime.toEpochMillis(result.page.data[0].time.created)).toBe(1_717_171_717_000)
@@ -161,6 +200,12 @@ test("session methods retain decoded Effect inputs and outputs", async () => {
   expect(Object.getPrototypeOf(result.admitted)).toBe(Object.prototype)
   expect(Object.getPrototypeOf(result.admitted.prompt)).toBe(Object.prototype)
   expect(DateTime.toEpochMillis(result.admitted.timeCreated)).toBe(1_717_171_717_000)
+  expect(result.pendingInputs).toHaveLength(1)
+  expect(result.pendingInputs[0]).toMatchObject({ id: "msg_pending", delivery: "queue" })
+  expect(DateTime.toEpochMillis(result.pendingInputs[0]!.timeCreated)).toBe(1_717_171_717_000)
+  expect(result.goal).toMatchObject({ status: "blocked", reason: "Awaiting durable sections" })
+  expect(result.updatedGoal).toEqual(result.goal)
+  expect(DateTime.toEpochMillis(result.goal!.updatedAt)).toBe(1_717_171_717_000)
   expect(result.context).toEqual([])
   expect(DateTime.toEpochMillis(result.history.data[0].data.timestamp)).toBe(1_717_171_717_000)
   expect(result.history).toEqual(expect.objectContaining({ hasMore: true }))
@@ -223,6 +268,25 @@ const admission = {
     prompt: { text: "Hello" },
     delivery: "steer",
     timeCreated: 1_717_171_717_000,
+  },
+}
+
+const pendingInput = {
+  admittedSeq: 1,
+  id: "msg_pending",
+  sessionID: "ses_test",
+  prompt: { text: "Queue this next" },
+  delivery: "queue",
+  timeCreated: 1_717_171_717_000,
+}
+
+const sessionGoal = {
+  data: {
+    sessionID: "ses_test",
+    objective: "Ship the canonical session flow",
+    status: "blocked",
+    reason: "Awaiting durable sections",
+    updatedAt: 1_717_171_717_000,
   },
 }
 

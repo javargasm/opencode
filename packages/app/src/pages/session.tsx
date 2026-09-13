@@ -63,7 +63,8 @@ import { PromptInputV2Composer, usePromptInputV2Controller } from "@/components/
 import { useSettingsCommand } from "@/components/settings-dialog"
 import { setCursorPosition } from "@/components/prompt-input/editor-dom"
 import { promptLength } from "@/components/prompt-input/history"
-import { type FollowupDraft, sendFollowupDraft } from "@/components/prompt-input/submit"
+import type { SessionInputPending } from "@opencode-ai/sdk/v2/client"
+import { type DurableQueueInput, type FollowupDraft, sendFollowupDraft } from "@/components/prompt-input/submit"
 import {
   createPromptInputController,
   createSessionComposerController,
@@ -103,6 +104,7 @@ import { legacySessionHref, requireServerKey, sessionHref } from "@/utils/sessio
 import { useUsageExceededDialogs } from "./session/usage-exceeded-dialogs"
 import { createSessionOwnership } from "./session/session-ownership"
 import { createSessionLineage } from "./session/session-lineage"
+import { mergePendingSessionInput } from "./session/session-input-cache"
 
 type FollowupItem = FollowupDraft & { id: string }
 type FollowupEdit = Pick<FollowupItem, "id" | "prompt" | "context">
@@ -119,6 +121,12 @@ const sessionViewState = () => ({
 function isCurrentSessionNotFoundError(error: unknown, sessionID: string | undefined) {
   if (!sessionID) return false
   return isSessionNotFoundError(error, sessionID) || isLocalSessionNotFoundError(error, sessionID)
+}
+
+function sessionIDFromEvent(event: { properties?: unknown }) {
+  const properties = event.properties
+  if (!properties || typeof properties !== "object" || !("sessionID" in properties)) return
+  return typeof properties.sessionID === "string" ? properties.sessionID : undefined
 }
 
 async function runPromptRollbackMutation<T, R>(input: {
@@ -533,6 +541,44 @@ export default function Page() {
 
   const info = createMemo(() => (params.id ? sync().session.get(params.id) : undefined))
   const isChildSession = createMemo(() => !!info()?.parentID)
+  const sessionV2Supported = createMemo(() => serverSDK().protocolKind() === "v2")
+  const sessionV1Supported = createMemo(() => serverSDK().protocolKind() === "v1")
+  const durableSessionInputSupported = createMemo(
+    () => sessionV2Supported() || serverSDK().capabilities()?.durableSessionInput === 1,
+  )
+  const localFollowupSupported = createMemo(() => sessionV1Supported() && !durableSessionInputSupported())
+  const sessionFlowKey = (sessionID: string, resource: "pending-inputs" | "goal") =>
+    [serverSDK().scope, sdk().directory, "session-flow", sessionID, resource] as const
+  const pendingInputsQuery = createQuery(() => {
+    const sessionID = params.id
+    return {
+      queryKey: sessionFlowKey(sessionID ?? "", "pending-inputs"),
+      enabled: durableSessionInputSupported() && !!sessionID && !isChildSession(),
+      queryFn: sessionID
+        ? () =>
+            sdk()
+              .client.v2.session.pendingInputs({ sessionID })
+              .then((result) => result.data?.data ?? [])
+        : skipToken,
+      refetchOnMount: true,
+      refetchOnReconnect: true,
+    }
+  })
+  const goalQuery = createQuery(() => {
+    const sessionID = params.id
+    return {
+      queryKey: sessionFlowKey(sessionID ?? "", "goal"),
+      enabled: sessionV2Supported() && !!sessionID,
+      queryFn: sessionID
+        ? () =>
+            sdk()
+              .client.v2.session.goal({ sessionID })
+              .then((result) => result.data?.data)
+        : skipToken,
+      refetchOnMount: true,
+      refetchOnReconnect: true,
+    }
+  })
   const canReview = createMemo(() => !!sync().project)
   const reviewTab = createMemo(() => isDesktop())
   const tabState = createSessionTabs({
@@ -961,6 +1007,33 @@ export default function Page() {
     refreshVcs()
   })
   onCleanup(stopVcs)
+
+  const stopSessionFlow = sdk().event.listen((evt) => {
+    const event = evt.details as { type: string; properties?: unknown }
+    if (event.type === "server.connected") {
+      const sessionID = params.id
+      if (!sessionID) return
+      if (durableSessionInputSupported())
+        void queryClient.invalidateQueries({ queryKey: sessionFlowKey(sessionID, "pending-inputs") })
+      if (sessionV2Supported()) void queryClient.invalidateQueries({ queryKey: sessionFlowKey(sessionID, "goal") })
+      return
+    }
+
+    const sessionID = sessionIDFromEvent(event)
+    if (!sessionID) return
+    if (
+      event.type === "session.next.prompt.admitted" ||
+      event.type === "session.next.prompted" ||
+      event.type === "session.legacy_prompt.materialized"
+    ) {
+      if (durableSessionInputSupported())
+        void queryClient.invalidateQueries({ queryKey: sessionFlowKey(sessionID, "pending-inputs") })
+      return
+    }
+    if (event.type === "session.next.goal.updated" && sessionV2Supported())
+      void queryClient.invalidateQueries({ queryKey: sessionFlowKey(sessionID, "goal") })
+  })
+  onCleanup(stopSessionFlow)
 
   createEffect(
     on(
@@ -1757,6 +1830,11 @@ export default function Page() {
     return settings.general.followup() === "queue" && busy(id) && !composer.blocked() && !isChildSession()
   })
 
+  const queueDelivery = createMemo<"durable" | "local" | undefined>(() => {
+    if (durableSessionInputSupported()) return "durable"
+    if (localFollowupSupported()) return "local"
+  })
+
   const followupText = (item: FollowupDraft) => {
     const text = item.prompt
       .map((part) => {
@@ -1815,6 +1893,59 @@ export default function Page() {
     const id = params.id
     if (!id) return
     setFollowup("edit", id, undefined)
+  }
+
+  const pendingInputText = (item: { prompt: { text: string } }) => {
+    const text = item.prompt.text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => !!line)
+
+    if (text) return text
+    return `[${language.t("common.attachment")}]`
+  }
+
+  const pendingInputsDock = createMemo(() =>
+    (pendingInputsQuery.data ?? []).map((item) => ({
+      id: item.id,
+      text: pendingInputText(item),
+      delivery: item.delivery,
+    })),
+  )
+
+  const queueDurablePrompt = async (input: DurableQueueInput) => {
+    const result = await sdk().client.v2.session.prompt({
+      sessionID: input.sessionID,
+      id: input.id,
+      prompt: input.prompt,
+      delivery: "queue",
+      ...(sessionV1Supported() ? { resume: false } : {}),
+    })
+    const admitted = result.data?.data
+    if (!admitted) throw new Error(language.t("common.requestFailed"))
+    queryClient.setQueryData<SessionInputPending[]>(sessionFlowKey(input.sessionID, "pending-inputs"), (current) =>
+      mergePendingSessionInput(current, admitted),
+    )
+    void queryClient.invalidateQueries({ queryKey: sessionFlowKey(input.sessionID, "pending-inputs") })
+  }
+
+  const saveSessionGoal = async (input: {
+    objective: string
+    status: "active" | "paused" | "blocked" | "complete"
+    reason?: string
+  }) => {
+    const sessionID = params.id
+    if (!sessionID) throw new Error(language.t("prompt.toast.promptSendFailed.description"))
+    try {
+      const result = await sdk().client.v2.session.setGoal({ sessionID, sessionGoalUpdate: input })
+      void queryClient.invalidateQueries({ queryKey: sessionFlowKey(sessionID, "goal") })
+      const goal = result.data?.data
+      if (!goal) throw new Error(language.t("common.requestFailed"))
+      return goal
+    } catch (error) {
+      fail(error)
+      throw error
+    }
   }
 
   const halt = (sessionID: string) =>
@@ -1926,6 +2057,7 @@ export default function Page() {
   const actions = { revert, openAttachment }
 
   createEffect(() => {
+    if (!localFollowupSupported()) return
     const sessionID = params.id
     if (!sessionID) return
 
@@ -2141,15 +2273,33 @@ export default function Page() {
               collapsed: () => view().todoCollapsed.get(),
               onToggle: () => view().todoCollapsed.set(!view().todoCollapsed.get()),
             },
-            followup: () =>
-              params.id && !isChildSession()
+            goal: () =>
+              params.id && sessionV2Supported()
                 ? {
-                    items: followupDock(),
-                    sending: sendingFollowup(),
-                    onSend: (id) => void sendFollowup(params.id!, id, { manual: true }),
-                    onEdit: editFollowup,
+                    sessionID: params.id,
+                    goal: goalQuery.data,
+                    onSave: saveSessionGoal,
                   }
                 : undefined,
+            followup: () => {
+              if (!params.id || isChildSession()) return
+              if (durableSessionInputSupported()) {
+                return {
+                  kind: "durable" as const,
+                  items: pendingInputsDock(),
+                  mode: settings.general.followup(),
+                }
+              }
+              if (!localFollowupSupported()) return
+              return {
+                kind: "local" as const,
+                items: followupDock(),
+                mode: settings.general.followup(),
+                sending: sendingFollowup(),
+                onSend: (id) => void sendFollowup(params.id!, id, { manual: true }),
+                onEdit: editFollowup,
+              }
+            },
             revert: () =>
               rolled().length > 0
                 ? {
@@ -2194,11 +2344,14 @@ export default function Page() {
                         comments.clear()
                         resumeScroll()
                       }}
-                      edit={editingFollowup()}
-                      onEditLoaded={clearFollowupEdit}
+                      edit={localFollowupSupported() ? editingFollowup() : undefined}
+                      onEditLoaded={localFollowupSupported() ? clearFollowupEdit : undefined}
                       shouldQueue={queueEnabled}
-                      onQueue={queueFollowup}
+                      queueDelivery={queueDelivery}
+                      onQueue={queueDurablePrompt}
+                      onLocalQueue={queueFollowup}
                       onAbort={() => {
+                        if (!localFollowupSupported()) return
                         const id = params.id
                         if (!id) return
                         setFollowup("paused", id, true)
@@ -2223,12 +2376,19 @@ export default function Page() {
                         resumeScroll()
                       },
                       get edit() {
+                        if (!localFollowupSupported()) return
                         return editingFollowup()
                       },
-                      onEditLoaded: clearFollowupEdit,
+                      onEditLoaded: () => {
+                        if (!localFollowupSupported()) return
+                        clearFollowupEdit()
+                      },
                       shouldQueue: queueEnabled,
-                      onQueue: queueFollowup,
+                      queueDelivery,
+                      onQueue: queueDurablePrompt,
+                      onLocalQueue: queueFollowup,
                       onAbort: () => {
+                        if (!localFollowupSupported()) return
                         const id = params.id
                         if (!id) return
                         setFollowup("paused", id, true)

@@ -19,6 +19,7 @@ import type {
   VcsInfo,
   SnapshotFileDiff,
   ConsoleState,
+  SessionInputPending,
 } from "@opencode-ai/sdk/v2"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useProject } from "./project"
@@ -77,6 +78,7 @@ export const {
       console_state: ConsoleState
       capabilities: {
         experimentalBackgroundSubagents: boolean
+        durableSessionInput: boolean
       }
       provider_auth: Record<string, ProviderAuthMethod[]>
       agent: Agent[]
@@ -94,6 +96,9 @@ export const {
       }
       session_diff: {
         [sessionID: string]: SnapshotFileDiff[]
+      }
+      session_input: {
+        [sessionID: string]: SessionInputPending[]
       }
       todo: {
         [sessionID: string]: Todo[]
@@ -122,6 +127,7 @@ export const {
       console_state: emptyConsoleState,
       capabilities: {
         experimentalBackgroundSubagents: false,
+        durableSessionInput: false,
       },
       provider_auth: {},
       config: {},
@@ -135,6 +141,7 @@ export const {
       session: [],
       session_status: {},
       session_diff: {},
+      session_input: {},
       todo: {},
       message: {},
       part: {},
@@ -150,6 +157,33 @@ export const {
     const sdk = useSDK()
     const statusRefreshInterval = input.sessionStatusTiming?.refreshInterval ?? sessionStatusRefreshInterval
     const statusRequestTimeout = input.sessionStatusTiming?.requestTimeout ?? sessionStatusRequestTimeout
+    let pendingInputsWorkspace = project.workspace.current()
+    const pendingInputRequests = new Map<string, Promise<void>>()
+
+    function adoptPendingInputsWorkspace(workspace: string | undefined) {
+      if (workspace === pendingInputsWorkspace) return
+      pendingInputsWorkspace = workspace
+      pendingInputRequests.clear()
+      setStore("session_input", reconcile({}))
+    }
+
+    async function refreshPendingInputs(sessionID: string, workspace = project.workspace.current()) {
+      if (workspace !== project.workspace.current()) return
+      const requestKey = `${workspace ?? ""}:${sessionID}`
+      const existing = pendingInputRequests.get(requestKey)
+      if (existing) return existing
+      const task = (async () => {
+        if (!(await sdk.durableSessionInputSupported())) {
+          if (workspace === project.workspace.current()) setStore("session_input", sessionID, [])
+          return
+        }
+        const response = await sdk.v2(workspace).v2.session.pendingInputs({ sessionID })
+        if (workspace !== project.workspace.current() || workspace !== pendingInputsWorkspace) return
+        setStore("session_input", sessionID, reconcile(response.data?.data ?? []))
+      })().finally(() => pendingInputRequests.delete(requestKey))
+      pendingInputRequests.set(requestKey, task)
+      return task
+    }
 
     const fullSyncedSessions = new Set<string>()
     const syncingSessions = new Map<string, Promise<void>>()
@@ -258,12 +292,15 @@ export const {
         case "server.connected": {
           const current = project.workspace.current()
           if (workspace !== undefined && workspace !== current) break
+          adoptPendingInputsWorkspace(current)
           sessionStatusRevision++
           void refreshSessionStatus(current, true).catch(() => {})
+          for (const session of store.session) void refreshPendingInputs(session.id, current).catch(() => {})
           break
         }
         case "server.instance.disposed":
           if (workspace !== undefined && workspace !== project.workspace.current()) break
+          adoptPendingInputsWorkspace(project.workspace.current())
           sessionStatusRevision++
           void bootstrap()
           break
@@ -407,6 +444,7 @@ export const {
           adoptSessionStatusWorkspace(workspace)
           sessionStatusRevision++
           setStore("session_status", event.properties.sessionID, event.properties.status)
+          void refreshPendingInputs(event.properties.sessionID, workspace).catch(() => {})
           break
         }
 
@@ -551,6 +589,7 @@ export const {
     async function bootstrap(input: { fatal?: boolean } = {}) {
       const fatal = input.fatal ?? true
       const workspace = project.workspace.current()
+      adoptPendingInputsWorkspace(workspace)
       adoptSessionStatusWorkspace(workspace)
       const projectPromise = project.sync()
       const sessionListPromise = projectPromise.then(() => listSessions())
@@ -608,6 +647,7 @@ export const {
               setStore("provider_default", reconcile(providers.default))
               setStore("provider_next", reconcile(providerList))
               setStore("capabilities", "experimentalBackgroundSubagents", capabilities?.backgroundSubagents === true)
+              setStore("capabilities", "durableSessionInput", false)
               setStore("console_state", reconcile(consoleState))
               setStore("agent", reconcile(agents))
               setStore("config", reconcile(config))
@@ -629,6 +669,12 @@ export const {
               .then((x) => setStore("mcp_resource", reconcile(x.data ?? {}))),
             sdk.client.formatter.status({ workspace }).then((x) => setStore("formatter", reconcile(x.data ?? []))),
             refreshSessionStatus(workspace).catch(() => {}),
+            sdk.durableSessionInputSupported().then((supported) => {
+              if (workspace !== project.workspace.current()) return
+              setStore("capabilities", "durableSessionInput", supported)
+              if (!supported) return
+              for (const session of store.session) void refreshPendingInputs(session.id, workspace).catch(() => {})
+            }),
             sdk.client.provider.auth({ workspace }).then((x) => setStore("provider_auth", reconcile(x.data ?? {}))),
             sdk.client.vcs.get({ workspace }).then((x) => setStore("vcs", reconcile(x.data))),
             project.workspace.sync(),
@@ -705,6 +751,7 @@ export const {
           if (last.role === "user") return "working"
           return last.time.completed ? "idle" : "working"
         },
+        refreshPendingInputs,
         async sync(sessionID: string) {
           if (fullSyncedSessions.has(sessionID)) return
           const syncing = syncingSessions.get(sessionID)

@@ -14,6 +14,7 @@ import { Timestamps } from "../database/schema.sql"
 import type { SystemContext } from "../system-context/index"
 import { AgentV2 } from "../agent"
 import type { Revert } from "@opencode-ai/schema/revert"
+import type { SessionGoal } from "@opencode-ai/schema/session-goal"
 
 type SessionMessageData = Omit<(typeof SessionMessage.Message)["Encoded"], "type" | "id">
 type V1MessageData = Omit<SessionV1.Info, "id" | "sessionID">
@@ -164,6 +165,17 @@ export const SessionInputTable = sqliteTable(
     uniqueIndex("session_input_session_promoted_seq_idx").on(table.session_id, table.promoted_seq),
   ],
 )
+
+export const SessionGoalTable = sqliteTable("session_goal", {
+  session_id: text()
+    .$type<SessionSchema.ID>()
+    .primaryKey()
+    .references(() => SessionTable.id, { onDelete: "cascade" }),
+  objective: text().notNull(),
+  status: text().$type<SessionGoal.Status>().notNull(),
+  reason: text(),
+  updated_at: integer().notNull(),
+})
 
 export const SessionContextEpochTable = sqliteTable("session_context_epoch", {
   session_id: text()

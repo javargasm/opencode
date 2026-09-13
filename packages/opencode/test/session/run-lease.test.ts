@@ -119,6 +119,38 @@ test("releases a scoped exclusive claim when its fiber is interrupted", async ()
   )
 })
 
+test("reports only unexpired leases owned by its current process incarnation", async () => {
+  await using tmp = await tmpdir()
+  const filename = path.join(tmp.path, "session-active-owner.sqlite")
+
+  await run(
+    Effect.gen(function* () {
+      const database = Context.get(yield* Layer.build(Layer.fresh(Database.layerFromPath(filename))), Database.Service)
+      const sessionID = yield* seed().pipe(Effect.provideService(Database.Service, database))
+      const otherSessionID = yield* seed().pipe(Effect.provideService(Database.Service, database))
+      const owner = yield* SessionRunLease.make({ processID: 101 }).pipe(
+        Effect.provideService(Database.Service, database),
+      )
+      const other = yield* SessionRunLease.make({ processID: 202 }).pipe(
+        Effect.provideService(Database.Service, database),
+      )
+
+      yield* owner.requestWake(sessionID)
+      const claim = yield* owner.claim(sessionID)
+      if (!claim) throw new Error("owner did not claim its session")
+      yield* other.requestWake(otherSessionID)
+      const otherClaim = yield* other.claim(otherSessionID)
+      if (!otherClaim) throw new Error("other process did not claim its session")
+
+      expect(yield* owner.active).toEqual(new Set([sessionID]))
+      expect(yield* other.active).toEqual(new Set([otherSessionID]))
+
+      expect(yield* owner.release(sessionID, claim.token)).toBe(true)
+      expect(yield* owner.active).toEqual(new Set())
+    }),
+  )
+})
+
 test("treats cancellation of an unknown session as a no-op", async () => {
   await using tmp = await tmpdir()
   const filename = path.join(tmp.path, "session-unknown-cancel.sqlite")

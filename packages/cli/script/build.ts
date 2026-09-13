@@ -18,6 +18,7 @@ const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
 const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")
+const targetFlag = process.argv.find((arg) => arg.startsWith("--target="))?.slice("--target=".length)
 const plugin = createSolidTransformPlugin()
 
 const allTargets: {
@@ -40,18 +41,8 @@ const allTargets: {
   { os: "win32", arch: "x64", avx2: false },
 ]
 
-const targets = singleFlag
-  ? allTargets.filter((item) => {
-      if (item.os !== process.platform || item.arch !== process.arch) return false
-      if (item.avx2 === false) return baselineFlag
-      return item.abi === undefined
-    })
-  : allTargets
-
-if (!skipInstall) await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]}`
-
-for (const item of targets) {
-  const target = [
+function compileTarget(item: (typeof allTargets)[number]) {
+  return [
     binary,
     item.os === "win32" ? "windows" : item.os,
     item.arch,
@@ -60,7 +51,31 @@ for (const item of targets) {
   ]
     .filter(Boolean)
     .join("-")
-  const name = target.replace(binary, "cli")
+}
+
+function outputName(item: (typeof allTargets)[number]) {
+  return compileTarget(item).replace(binary, "cli")
+}
+
+const targets = targetFlag
+  ? allTargets.filter((item) => outputName(item) === targetFlag)
+  : singleFlag
+    ? allTargets.filter((item) => {
+        if (item.os !== process.platform || item.arch !== process.arch) return false
+        if (item.avx2 === false) return baselineFlag
+        return item.abi === undefined
+      })
+    : allTargets
+
+if (targets.length === 0) {
+  throw new Error(`No CLI build target matched ${targetFlag ?? `${process.platform}/${process.arch}`}`)
+}
+
+if (!skipInstall) await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]}`
+
+for (const item of targets) {
+  const target = compileTarget(item)
+  const name = outputName(item)
   console.log(`building ${name}`)
   const result = await Bun.build({
     entrypoints: ["./src/index.ts"],

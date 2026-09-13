@@ -54,6 +54,15 @@ test("sessions.get returns the wire projection", async () => {
   expect(result.time.created).toBe(1_717_171_717_000)
 })
 
+test("sessions.goal returns undefined when a session has no goal", async () => {
+  const client = OpenCode.make({
+    baseUrl: "http://localhost:3000",
+    fetch: async () => Response.json({}),
+  })
+
+  expect(await client.sessions.goal({ sessionID: "ses_test" })).toBeUndefined()
+})
+
 test("events.subscribe exposes the Promise event stream wire projection", async () => {
   const client = OpenCode.make({
     baseUrl: "http://localhost:3000",
@@ -103,6 +112,8 @@ test("session methods use the public HTTP contract", async () => {
         )
       }
       if (url.includes("/prompt")) return Response.json(admission)
+      if (url.includes("/input")) return Response.json({ data: [pendingInput.data] })
+      if (url.includes("/goal")) return Response.json(sessionGoal)
       if (url.includes("/context")) return Response.json({ data: [] })
       if (url.includes("/message/")) return Response.json({ data: modelSwitchedMessage })
       if (url.endsWith("/api/session/active")) return Response.json({ data: { ses_test: { type: "running" } } })
@@ -125,6 +136,14 @@ test("session methods use the public HTTP contract", async () => {
     prompt: { text: "Hello" },
     resume: false,
   })
+  const pendingInputs = await client.sessions.pendingInputs({ sessionID: "ses_test" })
+  const goal = await client.sessions.goal({ sessionID: "ses_test" })
+  const updatedGoal = await client.sessions.setGoal({
+    sessionID: "ses_test",
+    objective: "Ship the canonical session flow",
+    status: "blocked",
+    reason: "Awaiting durable sections",
+  })
   await client.sessions.compact({ sessionID: "ses_test" })
   await client.sessions.wait({ sessionID: "ses_test" })
   const context = await client.sessions.context({ sessionID: "ses_test" })
@@ -142,6 +161,9 @@ test("session methods use the public HTTP contract", async () => {
   expect(active).toEqual({ ses_test: { type: "running" } })
   expect(created.id).toBe("ses_test")
   expect(admitted.id).toBe("msg_test")
+  expect(pendingInputs).toEqual([pendingInput.data])
+  expect(goal).toEqual(sessionGoal.data)
+  expect(updatedGoal).toEqual(sessionGoal.data)
   expect(context).toEqual([])
   expect(history).toEqual({ data: [modelSwitchedEvent], hasMore: true })
   expect(historyNext).toEqual({ data: [], hasMore: false })
@@ -154,6 +176,9 @@ test("session methods use the public HTTP contract", async () => {
     ["POST", "http://localhost:3000/api/session/ses_test/agent"],
     ["POST", "http://localhost:3000/api/session/ses_test/model"],
     ["POST", "http://localhost:3000/api/session/ses_test/prompt"],
+    ["GET", "http://localhost:3000/api/session/ses_test/input"],
+    ["GET", "http://localhost:3000/api/session/ses_test/goal"],
+    ["PUT", "http://localhost:3000/api/session/ses_test/goal"],
     ["POST", "http://localhost:3000/api/session/ses_test/compact"],
     ["POST", "http://localhost:3000/api/session/ses_test/wait"],
     ["GET", "http://localhost:3000/api/session/ses_test/context"],
@@ -168,6 +193,15 @@ test("session methods use the public HTTP contract", async () => {
   expect(JSON.parse(body)).toEqual({
     prompt: { text: "Hello" },
     resume: false,
+  })
+  const goalBody = requests.find(
+    (request) => request.init?.method === "PUT" && request.url.endsWith("/api/session/ses_test/goal"),
+  )?.init?.body
+  if (typeof goalBody !== "string") throw new Error("Expected JSON goal request body")
+  expect(JSON.parse(goalBody)).toEqual({
+    objective: "Ship the canonical session flow",
+    status: "blocked",
+    reason: "Awaiting durable sections",
   })
 })
 
@@ -232,6 +266,27 @@ const admission = {
     prompt: { text: "Hello" },
     delivery: "steer",
     timeCreated: 1_717_171_717_000,
+  },
+}
+
+const pendingInput = {
+  data: {
+    admittedSeq: 1,
+    id: "msg_pending",
+    sessionID: "ses_test",
+    prompt: { text: "Queue this next" },
+    delivery: "queue",
+    timeCreated: 1_717_171_717_000,
+  },
+}
+
+const sessionGoal = {
+  data: {
+    sessionID: "ses_test",
+    objective: "Ship the canonical session flow",
+    status: "blocked",
+    reason: "Awaiting durable sections",
+    updatedAt: 1_717_171_717_000,
   },
 }
 

@@ -34,6 +34,7 @@ const channel = (() => {
   if (raw === "dev" || raw === "beta" || raw === "prod") return raw
   return "dev"
 })()
+const bundleSourceCli = channel === "dev" || process.env.OPENCODE_BUNDLE_SOURCE_CLI === "1"
 
 const APP_IDS = {
   dev: "ai.opencode.desktop.dev",
@@ -57,7 +58,7 @@ const getBase = (appId: string): Configuration => ({
   },
   files: ["out/**/*", "resources/**/*", "!resources/opencode-cli*"],
   extraResources: [
-    ...(channel === "dev"
+    ...(bundleSourceCli
       ? [
           {
             from: "resources/",

@@ -4,12 +4,13 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, Effect, Exit, Layer } from "effect"
+import { Cause, Config, ConfigProvider, Effect, Exit, Layer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { AppNodeBuilderV1 } from "../../src/effect/app-node-builder-v1"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { registerAdapter } from "../../src/control-plane/adapters"
@@ -25,8 +26,11 @@ import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/grou
 import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
 import { Session } from "@/session/session"
 import { BackgroundTaskExecution } from "@/background/task-execution"
+import { V1DurableQueue } from "@/session/durable-queue"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
+import { Prompt } from "@opencode-ai/core/session/prompt"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -61,6 +65,25 @@ const httpApiLayer = servedRoutes.pipe(
   Layer.provideMerge(NodeServices.layer),
 )
 const it = testEffect(Layer.mergeAll(appLayer, httpApiLayer))
+const durableSessionInputRoutes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer> = HttpRouter.serve(
+  HttpApiApp.routes,
+  {
+    disableListenLog: true,
+    disableLogger: true,
+  },
+)
+const durableSessionInputHttpApiLayer = durableSessionInputRoutes.pipe(
+  Layer.provide(layerWebSocketConstructorGlobal),
+  Layer.provideMerge(NodeHttpServer.layerTest),
+  Layer.provideMerge(NodeServices.layer),
+)
+const durableSessionInputIt = testEffect(
+  Layer.mergeAll(appLayer, durableSessionInputHttpApiLayer).pipe(
+    Layer.provide(
+      ConfigProvider.layer(ConfigProvider.fromUnknown({ OPENCODE_EXPERIMENTAL_V1_DURABLE_SESSION_INPUT: "true" })),
+    ),
+  ),
+)
 
 function pathFor(path: string, params: Record<string, string>) {
   return Object.entries(params).reduce((result, [key, value]) => result.replace(`:${key}`, value), path)
@@ -730,6 +753,259 @@ describe("session HttpApi", () => {
         expect(message).toMatchObject({ id: wakeID, type: "user" })
       }),
     { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  durableSessionInputIt.live(
+    "bridges durable Queue admission through the V1 runner with FIFO retries and interrupt ownership",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({
+          git: true,
+          config: { ...testProviderConfig(llm.url), snapshot: false },
+        })
+        const headers = { "content-type": "application/json", "x-opencode-directory": directory }
+        expect(yield* requestJson<{ capabilities?: { durableSessionInput?: number } }>("/global/health")).toMatchObject({
+          capabilities: { durableSessionInput: 1 },
+        })
+        const session = yield* createSession({ title: "V1 durable Queue HTTP" }).pipe(provideInstanceEffect(directory))
+        const firstID = "msg_v1_durable_queue_first"
+        const secondID = "msg_v1_durable_queue_second"
+        const admit = (id: string, text: string) =>
+          request(`/api/session/${session.id}/prompt`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ id, prompt: { text }, delivery: "queue", resume: false }),
+          })
+
+        yield* llm.hang
+        const first = yield* admit(firstID, "first durable Queue input")
+        const retried = yield* admit(firstID, "first durable Queue input")
+        const second = yield* admit(secondID, "second durable Queue input")
+
+        type PromptBody = { id: string; prompt: { text: string }; delivery: string; promotedSeq?: number }
+        expect(first.status).toBe(200)
+        expect(retried.status).toBe(200)
+        expect(second.status).toBe(200)
+        expect((yield* json<{ data: PromptBody }>(first)).data).toMatchObject({
+          id: firstID,
+          prompt: { text: "first durable Queue input" },
+          delivery: "queue",
+        })
+        expect((yield* json<{ data: PromptBody }>(retried)).data).toMatchObject({
+          id: firstID,
+          prompt: { text: "first durable Queue input" },
+          delivery: "queue",
+        })
+        expect((yield* json<{ data: PromptBody }>(second)).data).toMatchObject({
+          id: secondID,
+          prompt: { text: "second durable Queue input" },
+          delivery: "queue",
+        })
+
+        const calls = yield* pollWithTimeout(
+          llm.calls.pipe(Effect.map((count) => (count >= 1 ? count : undefined))),
+          "V1 Queue did not start the first legacy runner turn",
+          "10 seconds",
+        )
+        expect(calls).toBeGreaterThanOrEqual(1)
+
+        const inputs = yield* Database.Service.use(({ db }) =>
+          db
+            .select()
+            .from(SessionInputTable)
+            .where(eq(SessionInputTable.session_id, session.id))
+            .all()
+            .pipe(Effect.orDie),
+        )
+        const firstInput = inputs.find((input) => input.id === firstID)
+        const secondInput = inputs.find((input) => input.id === secondID)
+        expect(inputs).toHaveLength(2)
+        expect(firstInput).toMatchObject({ delivery: "queue" })
+        expect(secondInput).toMatchObject({ delivery: "queue", promoted_seq: null })
+        expect(firstInput?.promoted_seq).toBeNumber()
+        expect(firstInput?.admitted_seq).toBeLessThan(secondInput!.admitted_seq)
+
+        const firstMaterialized = yield* pollWithTimeout(
+          requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID: session.id }), { headers }).pipe(
+            Effect.map((messages) => (messages.some((message) => message.info.id === firstID) ? messages : undefined)),
+          ),
+          "V1 Queue did not materialize the first legacy prompt",
+          "10 seconds",
+        )
+        expect(firstMaterialized.filter((message) => message.info.id === firstID)).toHaveLength(1)
+        expect(firstMaterialized.find((message) => message.info.id === secondID)).toBeUndefined()
+
+        const active = yield* pollWithTimeout(
+          requestJson<{ data: Record<string, { type: string }> }>("/api/session/active", { headers }).pipe(
+            Effect.map((result) => (result.data[session.id] ? result : undefined)),
+          ),
+          "V1 Queue lease was not exposed by the active-session endpoint",
+          "10 seconds",
+        )
+        expect(active.data[session.id]).toEqual({ type: "running" })
+
+        // The first V1 turn remains blocked in the fake provider. Queue the
+        // response for its FIFO successor before cancellation releases it.
+        yield* llm.text("second Queue reply")
+        const interrupted = yield* request(`/api/session/${session.id}/interrupt`, { method: "POST", headers })
+        expect(interrupted.status).toBe(204)
+
+        const materialized = yield* pollWithTimeout(
+          requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID: session.id }), { headers }).pipe(
+            Effect.map((messages) => (messages.some((message) => message.info.id === secondID) ? messages : undefined)),
+          ),
+          "V1 Queue did not continue with the FIFO successor after interrupt",
+          "10 seconds",
+        )
+        const queueUsers = materialized.filter(
+          (message) => message.info.id === firstID || message.info.id === secondID,
+        )
+        expect(queueUsers.map((message) => String(message.info.id))).toEqual([firstID, secondID])
+        expect(queueUsers).toHaveLength(2)
+
+        const promoted = yield* Database.Service.use(({ db }) =>
+          db
+            .select()
+            .from(SessionInputTable)
+            .where(eq(SessionInputTable.session_id, session.id))
+            .all()
+            .pipe(Effect.orDie),
+        )
+        const promotedFirst = promoted.find((input) => input.id === firstID)
+        const promotedSecond = promoted.find((input) => input.id === secondID)
+        expect(promoted).toHaveLength(2)
+        expect(promotedFirst?.promoted_seq).toBeNumber()
+        expect(promotedSecond?.promoted_seq).toBeNumber()
+        expect(promotedFirst?.promoted_seq).toBeLessThan(promotedSecond!.promoted_seq!)
+
+        const inactive = yield* pollWithTimeout(
+          requestJson<{ data: Record<string, { type: string }> }>("/api/session/active", { headers }).pipe(
+            Effect.map((result) => (result.data[session.id] === undefined ? result : undefined)),
+          ),
+          "V1 Queue session remained active after its successor completed",
+          "10 seconds",
+        )
+        expect(inactive.data[session.id]).toBeUndefined()
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  durableSessionInputIt.live(
+    "recovers pre-existing durable Queue inputs once across concurrent V1 runtime restarts",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({
+          git: true,
+          config: { ...testProviderConfig(llm.url), snapshot: false },
+        })
+        const session = yield* createSession({ title: "V1 durable Queue recovery" }).pipe(provideInstanceEffect(directory))
+        const firstID = SessionMessage.ID.make("msg_v1_durable_queue_recovery_first")
+        const secondID = SessionMessage.ID.make("msg_v1_durable_queue_recovery_second")
+        const database = yield* Database.Service
+        const instances = yield* InstanceStore.Service
+
+        // These rows predate the newly built Queue layers, just as they would
+        // after an old V1 process exited between durable admission and drain.
+        // Seeding the persisted projection directly keeps the previous runtime
+        // from receiving an in-memory admission notification.
+        yield* database.db
+          .insert(SessionInputTable)
+          .values([
+            {
+              id: firstID,
+              session_id: session.id,
+              prompt: Prompt.make({ text: "recover the first durable Queue input" }),
+              delivery: "queue",
+              admitted_seq: 1,
+              time_created: Date.now(),
+            },
+            {
+              id: secondID,
+              session_id: session.id,
+              prompt: Prompt.make({ text: "recover the second durable Queue input" }),
+              delivery: "queue",
+              admitted_seq: 2,
+              time_created: Date.now(),
+            },
+          ])
+          .run()
+          .pipe(Effect.orDie)
+
+        yield* llm.text("first recovered Queue reply")
+        yield* llm.text("second recovered Queue reply")
+        const recoveryLayer = AppNodeBuilderV1.build(
+          LayerNode.group([SessionProjector.node, V1DurableQueue.node]),
+          [
+            [Database.node, Layer.succeed(Database.Service, database)],
+            [InstanceStore.node, Layer.succeed(InstanceStore.Service, instances)],
+          ],
+        ).pipe(Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({}))))
+        // Separate fresh service graphs emulate two V1 processes starting at
+        // once. Each performs automatic recovery; leases must ensure that the
+        // persisted inputs are materialized and run exactly once overall.
+        yield* Effect.all([Layer.build(Layer.fresh(recoveryLayer)), Layer.build(Layer.fresh(recoveryLayer))], {
+          concurrency: "unbounded",
+          discard: true,
+        })
+        const sessions = yield* Session.Service
+
+        const promoted = yield* pollWithTimeout(
+          database.db
+            .select()
+            .from(SessionInputTable)
+            .where(eq(SessionInputTable.session_id, session.id))
+            .all()
+            .pipe(
+              Effect.orDie,
+              Effect.map((inputs) => (inputs.every((input) => input.promoted_seq !== null) ? inputs : undefined)),
+            ),
+          "V1 Queue recovery did not promote the pre-existing durable inputs",
+          "10 seconds",
+        )
+        expect(promoted.map((input) => input.id)).toEqual([firstID, secondID])
+
+        const recovered = yield* pollWithTimeout(
+          sessions.messages({ sessionID: session.id }).pipe(
+            Effect.map((messages) => {
+              const first = messages.find((message) => String(message.info.id) === firstID)
+              const second = messages.find((message) => String(message.info.id) === secondID)
+              const replies = messages.filter(
+                (message) =>
+                  message.info.role === "assistant" &&
+                  ((message.info.parentID === first?.info.id &&
+                    message.parts.some((part) => part.type === "text" && part.text === "first recovered Queue reply")) ||
+                    (message.info.parentID === second?.info.id &&
+                      message.parts.some((part) => part.type === "text" && part.text === "second recovered Queue reply"))),
+              )
+              return first && second && replies.length === 2 ? messages : undefined
+            }),
+          ),
+          "V1 Queue recovery did not resume the pre-existing durable inputs",
+          "10 seconds",
+        )
+        const users = recovered.filter(
+          (message) => String(message.info.id) === firstID || String(message.info.id) === secondID,
+        )
+        expect(users.map((message) => String(message.info.id))).toEqual([firstID, secondID])
+        expect(users).toHaveLength(2)
+        expect(yield* llm.calls).toBe(2)
+
+        const stored = yield* database.db
+          .select()
+          .from(SessionInputTable)
+          .where(eq(SessionInputTable.session_id, session.id))
+          .all()
+          .pipe(Effect.orDie)
+        const first = stored.find((input) => input.id === firstID)
+        const second = stored.find((input) => input.id === secondID)
+        expect(stored).toHaveLength(2)
+        expect(first?.promoted_seq).toBeNumber()
+        expect(second?.promoted_seq).toBeNumber()
+        expect(first?.promoted_seq).toBeLessThan(second!.promoted_seq!)
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
   )
 
   it.instance(

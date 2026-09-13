@@ -1,8 +1,16 @@
 /** @jsxImportSource @opentui/solid */
 import { describe, expect, test } from "bun:test"
 import { tmpdir } from "../../../fixture/fixture"
-import { mount, wait } from "./sync-fixture"
+import { json, mount, wait } from "./sync-fixture"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
+
+const durableSession = {
+  id: "ses_durable",
+  title: "durable",
+  time: { created: 0, updated: 0 },
+  version: "2.0.0",
+  directory: "/tmp/opencode/packages/tui",
+}
 
 function branchEvent(branch: string, workspace?: string): GlobalEvent {
   return {
@@ -58,6 +66,55 @@ describe("tui sync", () => {
       await wait(() => sync.data.vcs?.branch === "feature")
 
       expect(sync.data.vcs?.branch).toBe("feature")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("keeps durable pending inputs scoped to the active workspace", async () => {
+    await using tmp = await tmpdir()
+    await Bun.write(`${tmp.path}/kv.json`, "{}")
+    let pendingRequests = 0
+    const { app, project, sync } = await mount((url) => {
+      if (url.pathname === "/session") return json([durableSession])
+      if (url.pathname === `/api/session/${durableSession.id}/input`) {
+        pendingRequests++
+        return json({
+          data:
+            pendingRequests === 1
+              ? [
+                  {
+                    id: "msg_first",
+                    sessionID: durableSession.id,
+                    admittedSeq: 1,
+                    delivery: "queue",
+                    prompt: { text: "first" },
+                    timeCreated: 1,
+                  },
+                ]
+              : [
+                  {
+                    id: "msg_second",
+                    sessionID: durableSession.id,
+                    admittedSeq: 2,
+                    delivery: "queue",
+                    prompt: { text: "second" },
+                    timeCreated: 2,
+                  },
+                ],
+        })
+      }
+      return undefined
+    }, tmp.path)
+
+    try {
+      await wait(() => sync.data.session_input[durableSession.id]?.[0]?.id === "msg_first")
+      project.workspace.set("other")
+      await sync.bootstrap({ fatal: false })
+      await wait(() => sync.data.session_input[durableSession.id]?.[0]?.id === "msg_second")
+
+      expect(sync.data.session_input[durableSession.id]).toHaveLength(1)
+      expect(sync.data.session_input[durableSession.id][0]?.id).toBe("msg_second")
     } finally {
       app.renderer.destroy()
     }

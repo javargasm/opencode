@@ -3,7 +3,12 @@ import { useLanguage } from "@/context/language"
 import { useSettings } from "@/context/settings"
 import { SessionPermissionDock } from "@/pages/session/composer/session-permission-dock"
 import { SessionQuestionDock } from "@/pages/session/composer/session-question-dock"
-import { SessionFollowupDock } from "@/pages/session/composer/session-followup-dock"
+import {
+  SessionFollowupDock,
+  SessionFollowupMode,
+  SessionLocalFollowupDock,
+} from "@/pages/session/composer/session-followup-dock"
+import { SessionGoalPanel } from "@/pages/session/composer/session-goal-panel"
 import { SessionRevertDock } from "@/pages/session/composer/session-revert-dock"
 import { SessionTodoDock } from "@/pages/session/composer/session-todo-dock"
 import { SubagentFooter } from "@/pages/session/composer/subagent-footer"
@@ -19,6 +24,16 @@ export function SessionComposerRegion(props: {
   const rolled = () => {
     const revert = controller.revert()
     return revert?.items.length ? revert : undefined
+  }
+  const durableFollowup = () => {
+    const followup = controller.followup()
+    if (followup?.kind !== "durable") return
+    return followup
+  }
+  const localFollowup = () => {
+    const followup = controller.followup()
+    if (followup?.kind !== "local") return
+    return followup
   }
 
   return (
@@ -124,6 +139,20 @@ export function SessionComposerRegion(props: {
                 </div>
               )}
             </Show>
+            <Show when={controller.goal()}>
+              {(goal) => (
+                <div class="mb-2">
+                  <SessionGoalPanel
+                    sessionID={() => goal().sessionID}
+                    goal={() => goal().goal}
+                    onSave={(input) => goal().onSave(input)}
+                  />
+                </div>
+              )}
+            </Show>
+            <Show when={controller.followup()?.mode === "queue"}>
+              <SessionFollowupMode />
+            </Show>
             <div
               classList={{
                 "relative z-[70]": true,
@@ -132,12 +161,15 @@ export function SessionComposerRegion(props: {
                 "margin-top": `${-controller.lift()}px`,
               }}
             >
-              <Show when={controller.followup()?.items.length}>
-                <SessionFollowupDock
-                  items={controller.followup()!.items}
-                  sending={controller.followup()!.sending}
-                  onSend={controller.followup()!.onSend}
-                  onEdit={controller.followup()!.onEdit}
+              <Show when={durableFollowup()?.items.length}>
+                <SessionFollowupDock items={durableFollowup()!.items} />
+              </Show>
+              <Show when={localFollowup()?.items.length}>
+                <SessionLocalFollowupDock
+                  items={localFollowup()!.items}
+                  sending={localFollowup()!.sending}
+                  onSend={localFollowup()!.onSend}
+                  onEdit={localFollowup()!.onEdit}
                 />
               </Show>
               <Show

@@ -724,12 +724,13 @@ const layer = Layer.effect(
       type Draft<T> = T extends SessionV1.Part ? Omit<T, "id"> & { id?: string } : never
       const assign = (part: Draft<SessionV1.Part>, index: number): SessionV1.Part => ({
         ...part,
-        id:
-          part.id
-            ? PartID.make(part.id)
-            : input.messageID
-              ? PartID.ascending(`prt_${createHash("sha256").update(`generated:${input.messageID}:${index}`).digest("hex")}`)
-              : PartID.ascending(),
+        id: part.id
+          ? PartID.make(part.id)
+          : input.messageID
+            ? PartID.ascending(
+                `prt_${createHash("sha256").update(`generated:${input.messageID}:${index}`).digest("hex")}`,
+              )
+            : PartID.ascending(),
       })
 
       const resolvePart: (part: PromptInput["parts"][number]) => Effect.Effect<Draft<SessionV1.Part>[]> = Effect.fn(
@@ -1588,6 +1589,28 @@ export const PromptInput = Schema.Struct({
   ),
 })
 export type PromptInput = Schema.Schema.Type<typeof PromptInput>
+
+export function durableQueueParts(prompt: import("@opencode-ai/core/session/prompt").Prompt): PromptInput["parts"] {
+  return [
+    { type: "text", text: prompt.text },
+    ...(prompt.files ?? []).map((file) => ({
+      type: "file" as const,
+      url: file.uri,
+      mime: file.mime,
+      ...(file.name === undefined ? {} : { filename: file.name }),
+      ...(file.source === undefined
+        ? {}
+        : {
+            source: {
+              type: "file" as const,
+              path: file.uri,
+              text: { value: file.source.text, start: file.source.start, end: file.source.end },
+            },
+          }),
+    })),
+    ...(prompt.agents ?? []).map((agent) => ({ type: "agent" as const, name: agent.name })),
+  ]
+}
 
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,

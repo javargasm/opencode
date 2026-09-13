@@ -74,6 +74,8 @@ export const requestCancel = Effect.fn("SessionRunLease.requestCancel")(function
 export interface Interface {
   readonly leaseMillis: number
   readonly requestWake: (sessionID: SessionID) => Effect.Effect<number>
+  /** Sessions whose unexpired lease is owned by this exact process incarnation. */
+  readonly active: Effect.Effect<ReadonlySet<SessionID>>
   readonly claim: (sessionID: SessionID) => Effect.Effect<Claim | undefined>
   readonly claimExclusive: (sessionID: SessionID) => Effect.Effect<Claim | undefined>
   readonly claimScoped: (sessionID: SessionID) => Effect.Effect<Claim | undefined, never, Scope.Scope>
@@ -133,6 +135,23 @@ export function make(options?: {
     })
 
     const request: Interface["requestWake"] = (sessionID) => requestWake(db, sessionID, now())
+
+    const active: Interface["active"] = Effect.fn("SessionRunLease.active")(function* () {
+      const time = now()
+      const rows = yield* db
+        .select({ sessionID: SessionRunLeaseTable.session_id })
+        .from(SessionRunLeaseTable)
+        .where(
+          and(
+            eq(SessionRunLeaseTable.owner_pid, processID),
+            eq(SessionRunLeaseTable.owner_incarnation_id, incarnation.incarnationID),
+            gt(SessionRunLeaseTable.lease_expires_at, time),
+          ),
+        )
+        .all()
+        .pipe(Effect.orDie)
+      return new Set(rows.map((row) => SessionID.make(row.sessionID)))
+    })()
 
     const acquire = Effect.fn("SessionRunLease.acquire")(function* (sessionID: SessionID, pendingOnly: boolean) {
       yield* ensureRow(sessionID)
@@ -329,6 +348,7 @@ export function make(options?: {
     return Service.of({
       leaseMillis,
       requestWake: request,
+      active,
       claim,
       claimExclusive,
       claimScoped,

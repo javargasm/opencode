@@ -216,6 +216,11 @@ export const SettingsGeneral: Component = () => {
     })),
   )
 
+  const followupOptions = createMemo(() => [
+    { id: "steer" as const, label: language.t("settings.general.row.followup.option.steer") },
+    { id: "queue" as const, label: language.t("settings.general.row.followup.option.queue") },
+  ])
+
   const noneSound = { id: "none", label: "sound.option.none" } as const
   const soundOptions = [noneSound, ...SOUND_OPTIONS]
   const mono = () => monoInput(settings.appearance.font())
@@ -344,6 +349,23 @@ export const SettingsGeneral: Component = () => {
             size="small"
             triggerVariant="settings"
             triggerStyle={{ "min-width": "180px" }}
+          />
+        </SettingsRow>
+
+        <SettingsRow
+          title={language.t("settings.general.row.followup.title")}
+          description={language.t("settings.general.row.followup.description")}
+        >
+          <Select
+            data-action="settings-followup"
+            options={followupOptions()}
+            current={followupOptions().find((option) => option.id === settings.general.followup())}
+            value={(option) => option.id}
+            label={(option) => option.label}
+            onSelect={(option) => option && settings.general.setFollowup(option.id)}
+            variant="secondary"
+            size="small"
+            triggerVariant="settings"
           />
         </SettingsRow>
 

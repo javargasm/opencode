@@ -101,7 +101,7 @@ export type ProjectCopyError = {
 export const isProjectCopyError = (value: unknown): value is ProjectCopyError =>
   typeof value === "object" && value !== null && "name" in value && value["name"] === "ProjectCopyError"
 
-export type HealthGetOutput = { readonly healthy: true }
+export type HealthGetOutput = { readonly healthy: true; readonly pid: number }
 
 export type LocationGetInput = {
   readonly location?: {
@@ -486,6 +486,73 @@ export type SessionsPromptOutput = {
   }
 }["data"]
 
+export type SessionsPendingInputsInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
+
+export type SessionsPendingInputsOutput = {
+  readonly data: ReadonlyArray<{
+    readonly admittedSeq: number
+    readonly id: string
+    readonly sessionID: string
+    readonly prompt: {
+      readonly text: string
+      readonly files?: ReadonlyArray<{
+        readonly uri: string
+        readonly mime: string
+        readonly name?: string
+        readonly description?: string
+        readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+      }>
+      readonly agents?: ReadonlyArray<{
+        readonly name: string
+        readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+      }>
+    }
+    readonly delivery: "steer" | "queue"
+    readonly timeCreated: number
+  }>
+}["data"]
+
+export type SessionsGoalInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
+
+export type SessionsGoalOutput = {
+  readonly data?: {
+    readonly sessionID: string
+    readonly objective: string
+    readonly status: "active" | "paused" | "blocked" | "complete"
+    readonly reason?: string
+    readonly updatedAt: number
+  }
+}["data"]
+
+export type SessionsSetGoalInput = {
+  readonly sessionID: { readonly sessionID: string }["sessionID"]
+  readonly objective: {
+    readonly objective: string
+    readonly status: "active" | "paused" | "blocked" | "complete"
+    readonly reason?: string
+  }["objective"]
+  readonly status: {
+    readonly objective: string
+    readonly status: "active" | "paused" | "blocked" | "complete"
+    readonly reason?: string
+  }["status"]
+  readonly reason?: {
+    readonly objective: string
+    readonly status: "active" | "paused" | "blocked" | "complete"
+    readonly reason?: string
+  }["reason"]
+}
+
+export type SessionsSetGoalOutput = {
+  readonly data: {
+    readonly sessionID: string
+    readonly objective: string
+    readonly status: "active" | "paused" | "blocked" | "complete"
+    readonly reason?: string
+    readonly updatedAt: number
+  }
+}["data"]
+
 export type SessionsCompactInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
 export type SessionsCompactOutput = void
@@ -779,6 +846,22 @@ export type SessionsHistoryOutput = {
             }>
           }
           readonly delivery: "steer" | "queue" | "legacy"
+        }
+      }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.goal.updated"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: {
+          readonly timestamp: number
+          readonly sessionID: string
+          readonly goal: {
+            readonly objective: string
+            readonly status: "active" | "paused" | "blocked" | "complete"
+            readonly reason?: string
+          }
         }
       }
     | {
@@ -1237,6 +1320,22 @@ export type SessionsEventsOutput =
           }>
         }
         readonly delivery: "steer" | "queue" | "legacy"
+      }
+    }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.goal.updated"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: {
+        readonly timestamp: number
+        readonly sessionID: string
+        readonly goal: {
+          readonly objective: string
+          readonly status: "active" | "paused" | "blocked" | "complete"
+          readonly reason?: string
+        }
       }
     }
   | {

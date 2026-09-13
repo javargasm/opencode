@@ -12,7 +12,7 @@ import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
 import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
-import { HttpRouter, HttpServer } from "effect/unstable/http"
+import { HttpMiddleware, HttpRouter, HttpServer } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { Layer, Option } from "effect"
 import { Api } from "./api"
@@ -23,6 +23,9 @@ import { schemaErrorLayer } from "./middleware/schema-error"
 import { PtyEnvironment } from "./pty-environment"
 import { layer as locationLayer } from "./location"
 import { sessionLocationLayer } from "./middleware/session-location"
+import { isAllowedCorsOrigin } from "./cors"
+import { corsVaryFix } from "./middleware/cors-vary"
+import { SessionInputAdmission } from "./session-input-admission"
 
 const applicationServices = LayerNode.group([
   Database.node,
@@ -37,6 +40,14 @@ const applicationServices = LayerNode.group([
   PtyEnvironment.node,
   LocationServiceMap.node,
 ])
+
+const cors = HttpRouter.middleware(
+  HttpMiddleware.cors({
+    allowedOrigins: (origin) => isAllowedCorsOrigin(origin),
+    maxAge: 86_400,
+  }),
+  { global: true },
+)
 
 export function createRoutes(password?: string) {
   return makeRoutes(
@@ -60,7 +71,9 @@ function makeRoutes<AuthError, AuthServices>(auth: Layer.Layer<ServerAuth.Config
     Layer.provide(authorizationLayer),
     Layer.provide(schemaErrorLayer),
     Layer.provide(auth),
+    Layer.provide(SessionInputAdmission.layer),
     Layer.provide(serviceLayer),
+    Layer.provide([corsVaryFix, cors]),
   )
 }
 

@@ -67,6 +67,8 @@ import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
 import { readLocalAttachment } from "./local-attachment"
 import { useLocation } from "../../context/location"
+import { Identifier } from "@opencode-ai/core/id/id"
+import { admitQueue, toDurablePromptInput, type LegacyPromptPart } from "../../session-input/durable"
 
 registerOpencodeSpinner()
 
@@ -149,6 +151,7 @@ function formatEditorContext(selection: EditorSelection) {
 }
 
 let stashed: { prompt: PromptInfo; cursor: number } | undefined
+const queueAdmissions = new Map<string, { snapshot: string; id: string }>()
 
 export function Prompt(props: PromptProps) {
   let input: TextareaRenderable
@@ -1111,6 +1114,35 @@ export function Prompt(props: PromptProps) {
         parts: nonTextParts.filter((x) => x.type === "file"),
       })
     } else {
+      const legacyParts: LegacyPromptPart[] = [
+        ...editorParts,
+        { type: "text", text: inputText },
+        ...nonTextParts,
+      ]
+      const shouldQueue =
+        props.sessionID !== undefined &&
+        status().type !== "idle" &&
+        (await sdk.durableSessionInputSupported())
+
+      if (shouldQueue) {
+        const prompt = toDurablePromptInput(legacyParts)
+        const key = `${sessionID}:${JSON.stringify(prompt)}`
+        const admission = queueAdmissions.get(key) ?? { snapshot: key, id: Identifier.ascending("message") }
+        queueAdmissions.set(key, admission)
+        try {
+          await admitQueue(sdk.v2(workspaceID), { sessionID, id: admission.id, prompt })
+          queueAdmissions.delete(key)
+          void sync.session.refreshPendingInputs(sessionID, workspaceID).catch(() => {})
+        } catch (error) {
+          toast.show({
+            title: "Failed to queue prompt",
+            message: errorMessage(error),
+            variant: "error",
+          })
+          if (finishMoveProgress) move.finishSubmit()
+          return false
+        }
+      } else {
       move.startSubmit()
       sdk.client.session
         .prompt(
@@ -1120,14 +1152,7 @@ export function Prompt(props: PromptProps) {
             agent: agent.name,
             model: selectedModel,
             variant,
-            parts: [
-              ...editorParts,
-              {
-                type: "text",
-                text: inputText,
-              },
-              ...nonTextParts,
-            ],
+            parts: legacyParts,
           },
           { throwOnError: true },
         )
@@ -1139,6 +1164,7 @@ export function Prompt(props: PromptProps) {
           })
         })
       if (editorParts.length > 0) editor.markSelectionSent()
+      }
     }
     history.append({
       ...store.prompt,

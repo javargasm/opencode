@@ -1,8 +1,10 @@
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+import { createOpencodeClient as createV2Client } from "@opencode-ai/sdk/v2/client"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { createSimpleContext } from "./helper"
 import { batch, onCleanup, onMount } from "solid-js"
+import { detectServerProfile, supportsDurableSessionInput } from "./server-profile"
 
 export type EventSource = {
   subscribe: (handler: (event: GlobalEvent) => void) => Promise<() => void>
@@ -31,6 +33,23 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
     }
 
     let sdk = createSDK()
+    const v2Clients = new Map<string | undefined, ReturnType<typeof createV2Client>>()
+    let profile: Promise<Awaited<ReturnType<typeof detectServerProfile>>> | undefined
+
+    function v2(workspace?: string) {
+      const cached = v2Clients.get(workspace)
+      if (cached) return cached
+      const client = createV2Client({
+        baseUrl: props.url,
+        signal: abort.signal,
+        directory: props.directory,
+        experimental_workspaceID: workspace,
+        fetch: props.fetch,
+        headers: props.headers,
+      })
+      v2Clients.set(workspace, client)
+      return client
+    }
 
     const handlers = new Set<(event: GlobalEvent) => void>()
     const emitter = {
@@ -141,6 +160,13 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
     return {
       get client() {
         return sdk
+      },
+      v2,
+      serverProfile() {
+        return (profile ??= detectServerProfile({ url: props.url, fetch: props.fetch ?? fetch, headers: props.headers }))
+      },
+      async durableSessionInputSupported() {
+        return supportsDurableSessionInput(await this.serverProfile())
       },
       directory: props.directory,
       event: emitter,

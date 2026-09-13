@@ -1,8 +1,8 @@
 export * as SessionInput from "./input"
 
-import { and, asc, eq, isNull, lte } from "drizzle-orm"
+import { and, asc, eq, isNull, lte, or } from "drizzle-orm"
 import { DateTime, Effect, Schema } from "effect"
-import { Admitted, Delivery, V2Delivery } from "@opencode-ai/schema/session-input"
+import { Admitted, Delivery, Pending, V2Delivery } from "@opencode-ai/schema/session-input"
 import type { Database } from "../database/database"
 import type { EventV2 } from "../event"
 import { SessionEvent } from "./event"
@@ -15,7 +15,7 @@ import { SessionV1 } from "../v1/session"
 type DatabaseService = Database.Interface["db"]
 type DatabaseClient = DatabaseService | Parameters<Parameters<DatabaseService["transaction"]>[0]>[0]
 
-export { Admitted, Delivery, V2Delivery }
+export { Admitted, Delivery, Pending, V2Delivery }
 
 const decodePrompt = Schema.decodeUnknownSync(Prompt)
 const encodePrompt = Schema.encodeSync(Prompt)
@@ -195,6 +195,71 @@ export const hasPending = Effect.fn("SessionInput.hasPending")(function* (
   return row !== undefined
 })
 
+export const listPending = Effect.fn("SessionInput.listPending")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+) {
+  const rows = yield* db
+    .select()
+    .from(SessionInputTable)
+    .where(
+      and(
+        eq(SessionInputTable.session_id, sessionID),
+        isNull(SessionInputTable.promoted_seq),
+        or(eq(SessionInputTable.delivery, "steer"), eq(SessionInputTable.delivery, "queue"))!,
+      ),
+    )
+    .orderBy(asc(SessionInputTable.admitted_seq))
+    .all()
+    .pipe(Effect.orDie)
+  return rows.flatMap((row) => {
+    if (row.delivery === "legacy") return []
+    return [
+      Pending.make({
+        admittedSeq: row.admitted_seq,
+        id: SessionMessage.ID.make(row.id),
+        sessionID: SessionSchema.ID.make(row.session_id),
+        prompt: decodePrompt(row.prompt),
+        delivery: row.delivery,
+        timeCreated: DateTime.makeUnsafe(row.time_created),
+      }),
+    ]
+  })
+})
+
+export const nextQueued = Effect.fn("SessionInput.nextQueued")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+) {
+  const row = yield* db
+    .select()
+    .from(SessionInputTable)
+    .where(
+      and(
+        eq(SessionInputTable.session_id, sessionID),
+        isNull(SessionInputTable.promoted_seq),
+        eq(SessionInputTable.delivery, "queue"),
+      ),
+    )
+    .orderBy(asc(SessionInputTable.admitted_seq))
+    .limit(1)
+    .get()
+    .pipe(Effect.orDie)
+  return row === undefined ? undefined : fromRow(row)
+})
+
+/** Session IDs whose FIFO Queue has work to recover after a V1 process restart. */
+export const pendingQueueSessions = Effect.fn("SessionInput.pendingQueueSessions")(function* (db: DatabaseService) {
+  const rows = yield* db
+    .select({ sessionID: SessionInputTable.session_id })
+    .from(SessionInputTable)
+    .where(and(isNull(SessionInputTable.promoted_seq), eq(SessionInputTable.delivery, "queue")))
+    .orderBy(asc(SessionInputTable.admitted_seq))
+    .all()
+    .pipe(Effect.orDie)
+  return Array.from(new Set(rows.map((row) => SessionSchema.ID.make(row.sessionID))))
+})
+
 export const equivalent = (
   input: Admitted,
   expected: {
@@ -274,8 +339,17 @@ export const promoteSteers = Effect.fn("SessionInput.promoteSteers")(function* (
 
 export const projectLegacyMaterialized = Effect.fn("SessionInput.projectLegacyMaterialized")(function* (
   db: DatabaseService,
-  input: { readonly sessionID: SessionSchema.ID; readonly id: SessionMessage.ID; readonly promotedSeq: number },
+  input: {
+    readonly sessionID: SessionSchema.ID
+    readonly id: SessionMessage.ID
+    readonly promotedSeq: number
+    readonly delivery?: Extract<Delivery, "legacy" | "queue">
+  },
 ) {
+  const allowedDelivery =
+    input.delivery === undefined
+      ? or(eq(SessionInputTable.delivery, "legacy"), eq(SessionInputTable.delivery, "queue"))!
+      : eq(SessionInputTable.delivery, input.delivery)
   const updated = yield* db
     .update(SessionInputTable)
     .set({ promoted_seq: input.promotedSeq })
@@ -283,7 +357,7 @@ export const projectLegacyMaterialized = Effect.fn("SessionInput.projectLegacyMa
       and(
         eq(SessionInputTable.id, input.id),
         eq(SessionInputTable.session_id, input.sessionID),
-        eq(SessionInputTable.delivery, "legacy"),
+        allowedDelivery,
         isNull(SessionInputTable.promoted_seq),
       ),
     )
@@ -294,7 +368,9 @@ export const projectLegacyMaterialized = Effect.fn("SessionInput.projectLegacyMa
   const existing = yield* find(db, input.id)
   if (
     existing?.sessionID === input.sessionID &&
-    existing.delivery === "legacy" &&
+    (input.delivery === undefined
+      ? existing.delivery === "legacy" || existing.delivery === "queue"
+      : existing.delivery === input.delivery) &&
     existing.promotedSeq === input.promotedSeq
   ) {
     return false
@@ -310,11 +386,13 @@ export const consumeLegacy = Effect.fn("SessionInput.consumeLegacy")(function* (
     readonly id: SessionMessage.ID
     readonly info: SessionV1.User
     readonly parts: ReadonlyArray<SessionV1.Part>
+    readonly delivery?: Extract<Delivery, "legacy" | "queue">
     readonly commit?: (seq: number) => Effect.Effect<void>
   },
 ) {
+  const delivery = input.delivery ?? "legacy"
   const existing = yield* find(db, input.id)
-  if (existing?.sessionID !== input.sessionID || existing.delivery !== "legacy")
+  if (existing?.sessionID !== input.sessionID || existing.delivery !== delivery)
     return yield* Effect.die(new LifecycleConflict({ id: input.id }))
   if (existing.promotedSeq !== undefined) return false
   if (
@@ -342,7 +420,7 @@ export const consumeLegacy = Effect.fn("SessionInput.consumeLegacy")(function* (
           ? find(db, input.id).pipe(
               Effect.flatMap((stored) =>
                 stored?.sessionID === input.sessionID &&
-                stored.delivery === "legacy" &&
+                stored.delivery === delivery &&
                 stored.promotedSeq !== undefined
                   ? Effect.succeed(false)
                   : Effect.die(defect),

@@ -1,5 +1,11 @@
 import { getFilename } from "@opencode-ai/core/util/path"
-import { type AgentPartInput, type FilePartInput, type Part, type TextPartInput } from "@opencode-ai/sdk/v2/client"
+import {
+  type AgentPartInput,
+  type FilePartInput,
+  type Part,
+  type PromptInput as V2PromptInput,
+  type TextPartInput,
+} from "@opencode-ai/sdk/v2/client"
 import type { FileSelection } from "@/context/file"
 import { encodeFilePath } from "@/context/file/path"
 import type { AgentPart, FileAttachmentPart, ImageAttachmentPart, Prompt } from "@/context/prompt"
@@ -7,6 +13,8 @@ import { Identifier } from "@/utils/id"
 import { createCommentMetadata, formatCommentNote } from "@/utils/comment-note"
 
 type PromptRequestPart = (TextPartInput | FilePartInput | AgentPartInput) & { id: string }
+type V2FileAttachment = NonNullable<V2PromptInput["files"]>[number]
+type V2AgentAttachment = NonNullable<V2PromptInput["agents"]>[number]
 
 type ContextFile = {
   key: string
@@ -209,5 +217,56 @@ export function buildRequestParts(input: BuildRequestPartsInput) {
   return {
     requestParts,
     optimisticParts: requestParts.map((part) => toOptimisticPart(part, input.sessionID, input.messageID)),
+  }
+}
+
+/**
+ * Convert the normalized legacy composer parts into the durable V2 prompt
+ * contract. This deliberately retains text synthesized from comments, file
+ * references (including data URL images), and agent mentions, while dropping
+ * V1-only rendering metadata that is not part of `PromptInput`.
+ */
+export function toV2PromptInput(parts: readonly (TextPartInput | FilePartInput | AgentPartInput)[]): V2PromptInput {
+  const files = parts.flatMap((part): V2FileAttachment[] => {
+    if (part.type !== "file") return []
+    const source = part.source?.text
+    return [
+      {
+        uri: part.url,
+        ...(part.filename === undefined ? {} : { name: part.filename }),
+        ...(source === undefined
+          ? {}
+          : {
+              source: {
+                text: source.value,
+                start: source.start,
+                end: source.end,
+              },
+            }),
+      },
+    ]
+  })
+  const agents = parts.flatMap((part): V2AgentAttachment[] => {
+    if (part.type !== "agent") return []
+    return [
+      {
+        name: part.name,
+        ...(part.source === undefined
+          ? {}
+          : {
+              source: {
+                text: part.source.value,
+                start: part.source.start,
+                end: part.source.end,
+              },
+            }),
+      },
+    ]
+  })
+
+  return {
+    text: parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n"),
+    ...(files.length === 0 ? {} : { files }),
+    ...(agents.length === 0 ? {} : { agents }),
   }
 }

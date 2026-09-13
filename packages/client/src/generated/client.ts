@@ -19,6 +19,12 @@ import type {
   SessionsSwitchModelOutput,
   SessionsPromptInput,
   SessionsPromptOutput,
+  SessionsPendingInputsInput,
+  SessionsPendingInputsOutput,
+  SessionsGoalInput,
+  SessionsGoalOutput,
+  SessionsSetGoalInput,
+  SessionsSetGoalOutput,
   SessionsCompactInput,
   SessionsCompactOutput,
   SessionsWaitInput,
@@ -388,6 +394,40 @@ export function make(options: ClientOptions) {
             body: { id: input["id"], prompt: input["prompt"], delivery: input["delivery"], resume: input["resume"] },
             successStatus: 200,
             declaredStatuses: [409, 404, 400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
+      pendingInputs: (input: SessionsPendingInputsInput, requestOptions?: RequestOptions) =>
+        request<{ readonly data: SessionsPendingInputsOutput }>(
+          {
+            method: "GET",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/input`,
+            successStatus: 200,
+            declaredStatuses: [404, 400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
+      goal: (input: SessionsGoalInput, requestOptions?: RequestOptions) =>
+        request<{ readonly data: SessionsGoalOutput }>(
+          {
+            method: "GET",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/goal`,
+            successStatus: 200,
+            declaredStatuses: [404, 400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
+      setGoal: (input: SessionsSetGoalInput, requestOptions?: RequestOptions) =>
+        request<{ readonly data: SessionsSetGoalOutput }>(
+          {
+            method: "PUT",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/goal`,
+            body: { objective: input["objective"], status: input["status"], reason: input["reason"] },
+            successStatus: 200,
+            declaredStatuses: [404, 400, 401],
             empty: false,
           },
           requestOptions,

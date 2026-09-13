@@ -8,7 +8,6 @@ import { app } from "electron"
 
 const execFileAsync = promisify(execFile)
 const root = dirname(fileURLToPath(import.meta.url))
-const stateHome = process.env.XDG_STATE_HOME
 const desktopStateNames = ["ai.opencode.desktop.dev", "ai.opencode.desktop.beta", "ai.opencode.desktop"]
 
 type Logger = {
@@ -17,6 +16,10 @@ type Logger = {
 }
 
 export async function startBackgroundCli(logger: Logger, shellStateHome?: string) {
+  // Desktop initializes its isolated user-data/state paths after modules load.
+  // Read this at startup so test and packaged profiles do not fall back to the
+  // shell's state directory captured during module evaluation.
+  const stateHome = process.env.XDG_STATE_HOME
   const bundled = app.isPackaged
     ? join(process.resourcesPath, executableName())
     : join(root, "../../resources", executableName())
@@ -41,7 +44,7 @@ export async function startBackgroundCli(logger: Logger, shellStateHome?: string
 
   const daemonStateHome = found?.stateHome ?? stateHome
   const url = await run(binary, ["service", "start"], logger, { stateHome: daemonStateHome })
-  const password = await run(binary, ["service", "get", "password"], logger, {
+  const password = await run(binary, ["service", "password"], logger, {
     redact: true,
     stateHome: daemonStateHome,
   })

@@ -32,6 +32,7 @@ import { LocationServiceMap } from "./location-service-map"
 import { MessageDecodeError } from "./session/error"
 import { SessionEvent } from "./session/event"
 import { SessionInput } from "./session/input"
+import { SessionGoal } from "./session/goal"
 import { Snapshot } from "./snapshot"
 import { SessionRevert } from "./session/revert"
 import { Revert } from "@opencode-ai/schema/revert"
@@ -151,6 +152,15 @@ export interface Interface {
     delivery?: SessionInput.V2Delivery
     resume?: boolean
   }) => Effect.Effect<SessionInput.Admitted, NotFoundError | PromptConflictError>
+  readonly pendingInputs: (
+    sessionID: SessionSchema.ID,
+  ) => Effect.Effect<ReadonlyArray<SessionInput.Pending>, NotFoundError>
+  readonly goal: {
+    readonly get: (sessionID: SessionSchema.ID) => Effect.Effect<SessionGoal.Info | undefined, NotFoundError>
+    readonly set: (
+      input: { readonly sessionID: SessionSchema.ID } & SessionGoal.Update,
+    ) => Effect.Effect<SessionGoal.Info, NotFoundError>
+  }
   readonly shell: (input: {
     id?: EventV2.ID
     sessionID: SessionSchema.ID
@@ -190,6 +200,7 @@ const layer = Layer.effect(
     const projects = yield* ProjectV2.Service
     const execution = yield* SessionExecution.Service
     const store = yield* SessionStore.Service
+    const goal = yield* SessionGoal.Service
     const locations = yield* LocationServiceMap.Service
     const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
     const isDurableSessionEvent = Schema.is(SessionEvent.Durable)
@@ -384,6 +395,20 @@ const layer = Layer.effect(
           }),
         ),
       ),
+      pendingInputs: Effect.fn("V2Session.pendingInputs")(function* (sessionID) {
+        yield* result.get(sessionID)
+        return yield* SessionInput.listPending(db, sessionID)
+      }),
+      goal: {
+        get: Effect.fn("V2Session.goal.get")(function* (sessionID) {
+          yield* result.get(sessionID)
+          return yield* goal.get(sessionID)
+        }),
+        set: Effect.fn("V2Session.goal.set")(function* (input) {
+          yield* result.get(input.sessionID)
+          return yield* goal.set(input)
+        }),
+      },
       shell: Effect.fn("V2Session.shell")(function* () {
         return yield* new OperationUnavailableError({ operation: "shell" })
       }),
@@ -480,6 +505,7 @@ export const node = makeGlobalNode({
     ProjectV2.node,
     SessionExecution.node,
     SessionStore.node,
+    SessionGoal.node,
     LocationServiceMap.node,
     SessionProjector.node,
   ],

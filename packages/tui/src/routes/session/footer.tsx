@@ -17,6 +17,10 @@ export function Footer() {
     if (route.data.type !== "session") return []
     return sync.data.permission[route.data.sessionID] ?? []
   })
+  const queuedPrompts = createMemo(() => {
+    if (route.data.type !== "session") return 0
+    return sync.data.session_input[route.data.sessionID]?.length ?? 0
+  })
   const directory = useDirectory()
   const connected = useConnected()
 
@@ -65,6 +69,9 @@ export function Footer() {
                 <span style={{ fg: theme.warning }}>△</span> {permissions().length} Permission
                 {permissions().length > 1 ? "s" : ""}
               </text>
+            </Show>
+            <Show when={queuedPrompts() > 0}>
+              <text fg={theme.textMuted}>{queuedPrompts()} queued</text>
             </Show>
             <text fg={theme.text}>
               <span style={{ fg: lsp().length > 0 ? theme.success : theme.textMuted }}>•</span> {lsp().length} LSP

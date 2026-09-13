@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { Prompt } from "@/context/prompt"
-import { buildRequestParts } from "./build-request-parts"
+import { buildRequestParts, toV2PromptInput } from "./build-request-parts"
 
 describe("buildRequestParts", () => {
   test("builds typed request and optimistic parts without cast path", () => {
@@ -47,6 +47,40 @@ describe("buildRequestParts", () => {
 
     expect(result.optimisticParts).toHaveLength(result.requestParts.length)
     expect(result.optimisticParts.every((part) => part.sessionID === "ses_1" && part.messageID === "msg_1")).toBe(true)
+  })
+
+  test("adapts normalized parts to the durable V2 prompt contract", () => {
+    const result = buildRequestParts({
+      prompt: [
+        { type: "text", content: "inspect this", start: 0, end: 12 },
+        { type: "file", path: "src/input.ts", content: "@src/input.ts", start: 12, end: 25 },
+        { type: "agent", name: "planner", content: "@planner", start: 25, end: 33 },
+      ],
+      context: [{ key: "ctx:1", type: "file", path: "src/context.ts", comment: "also check this" }],
+      images: [
+        { type: "image", id: "img_1", filename: "image.png", mime: "image/png", dataUrl: "data:image/png;base64,AAA" },
+      ],
+      text: "inspect this @src/input.ts @planner",
+      messageID: "msg_1",
+      sessionID: "ses_1",
+      sessionDirectory: "/repo",
+    })
+
+    expect(toV2PromptInput(result.requestParts)).toMatchObject({
+      text: expect.stringContaining("inspect this @src/input.ts @planner"),
+      files: expect.arrayContaining([
+        expect.objectContaining({ uri: "file:///repo/src/input.ts", name: "input.ts" }),
+        expect.objectContaining({ uri: "file:///repo/src/context.ts", name: "context.ts" }),
+        expect.objectContaining({ uri: "data:image/png;base64,AAA", name: "image.png" }),
+      ]),
+      agents: [
+        {
+          name: "planner",
+          source: { text: "@planner", start: 25, end: 33 },
+        },
+      ],
+    })
+    expect(toV2PromptInput(result.requestParts).text).toContain("also check this")
   })
 
   test("keeps multiple uploaded attachments in order", () => {

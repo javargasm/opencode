@@ -52,7 +52,10 @@ stdenvNoCC.mkDerivation (finalAttrs: {
   buildPhase = ''
     runHook preBuild
 
-    cd ./packages/opencode
+    cd ./packages/cli
+    bun --bun ./script/build.ts --single --skip-install
+
+    cd ../opencode
     bun --bun ./script/build.ts --single --skip-install
     bun --bun ./script/schema.ts schema.json
 
@@ -62,8 +65,10 @@ stdenvNoCC.mkDerivation (finalAttrs: {
   installPhase = ''
     runHook preInstall
 
-    install -Dm755 dist/opencode-*/bin/opencode $out/bin/opencode
-    install -Dm644 schema.json $out/share/opencode/schema.json
+    cd "$sourceRoot"
+    install -Dm755 packages/opencode/dist/opencode-*/bin/opencode $out/bin/opencode
+    install -Dm755 packages/cli/dist/cli-*/bin/lildax $out/libexec/opencode-cli
+    install -Dm644 packages/opencode/schema.json $out/share/opencode/schema.json
 
     wrapProgram $out/bin/opencode \
       --prefix PATH : ${

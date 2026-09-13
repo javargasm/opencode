@@ -43,5 +43,6 @@ export const migrations = (
     import("./migration/20260805174858_background_task_execution"),
     import("./migration/20260805222957_grey_klaw"),
     import("./migration/20260821165526_blue_spitfire"),
+    import("./migration/20260912231108_glamorous_stryfe"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

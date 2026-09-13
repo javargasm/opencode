@@ -23,3 +23,13 @@ export const Admitted = Schema.Struct({
   timeCreated: DateTimeUtcFromMillis,
   promotedSeq: NonNegativeInt.pipe(optional),
 }).annotate({ identifier: "SessionInput.Admitted" })
+
+export interface Pending extends Schema.Schema.Type<typeof Pending> {}
+export const Pending = Schema.Struct({
+  admittedSeq: NonNegativeInt,
+  id: SessionMessage.ID,
+  sessionID: SessionID,
+  prompt: Prompt,
+  delivery: V2Delivery,
+  timeCreated: DateTimeUtcFromMillis,
+}).annotate({ identifier: "SessionInput.Pending" })

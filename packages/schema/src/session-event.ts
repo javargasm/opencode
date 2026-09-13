@@ -12,6 +12,7 @@ import { SessionID } from "./session-id"
 import { Location } from "./location"
 import { SessionMessage } from "./session-message"
 import { Revert } from "./revert"
+import { SessionGoal } from "./session-goal"
 
 export { FileAttachment }
 
@@ -97,6 +98,18 @@ export const PromptAdmitted = Event.define({
   schema: PromptFields,
 })
 export type PromptAdmitted = typeof PromptAdmitted.Type
+
+export namespace Goal {
+  export const Updated = Event.define({
+    type: "session.next.goal.updated",
+    ...options,
+    schema: {
+      ...Base,
+      goal: SessionGoal.Update,
+    },
+  })
+  export type Updated = typeof Updated.Type
+}
 
 export const ContextUpdated = Event.define({
   type: "session.next.context.updated",
@@ -451,6 +464,7 @@ export const DurableDefinitions = Event.inventory(
   Moved,
   Prompted,
   PromptAdmitted,
+  Goal.Updated,
   ContextUpdated,
   Synthetic,
   Shell.Started,
@@ -482,6 +496,7 @@ export const Definitions = Event.inventory(
   Moved,
   Prompted,
   PromptAdmitted,
+  Goal.Updated,
   ContextUpdated,
   Synthetic,
   Shell.Started,

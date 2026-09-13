@@ -1,9 +1,6 @@
 import { $ } from "bun"
-import { chmod, copyFile, mkdtemp, rm } from "node:fs/promises"
-import { tmpdir } from "node:os"
+import { chmod, copyFile } from "node:fs/promises"
 import { join } from "node:path"
-
-const CLI_VERSION = "0.0.0-next-16350"
 
 export type Channel = "dev" | "beta" | "prod"
 
@@ -13,42 +10,36 @@ export function resolveChannel(): Channel {
   return "dev"
 }
 
-export const CLI_BINARIES: Array<{ rustTarget: string; package: string; os: string; cpu: string }> = [
+export const CLI_TARGETS: Array<{ rustTarget: string; output: string; os: string }> = [
   {
     rustTarget: "aarch64-apple-darwin",
-    package: "@opencode-ai/cli-darwin-arm64",
+    output: "cli-darwin-arm64",
     os: "darwin",
-    cpu: "arm64",
   },
   {
     rustTarget: "x86_64-apple-darwin",
-    package: "@opencode-ai/cli-darwin-x64-baseline",
+    output: "cli-darwin-x64-baseline",
     os: "darwin",
-    cpu: "x64",
   },
   {
     rustTarget: "aarch64-pc-windows-msvc",
-    package: "@opencode-ai/cli-windows-arm64",
+    output: "cli-windows-arm64",
     os: "win32",
-    cpu: "arm64",
   },
   {
     rustTarget: "x86_64-pc-windows-msvc",
-    package: "@opencode-ai/cli-windows-x64-baseline",
+    output: "cli-windows-x64-baseline",
     os: "win32",
-    cpu: "x64",
   },
   {
     rustTarget: "x86_64-unknown-linux-gnu",
-    package: "@opencode-ai/cli-linux-x64-baseline",
+    output: "cli-linux-x64-baseline",
     os: "linux",
-    cpu: "x64",
   },
   {
     rustTarget: "aarch64-unknown-linux-gnu",
-    package: "@opencode-ai/cli-linux-arm64",
+    output: "cli-linux-arm64",
     os: "linux",
-    cpu: "arm64",
   },
 ]
 
@@ -63,35 +54,47 @@ function nativeTarget() {
 }
 
 export function getCurrentCli(target = RUST_TARGET ?? nativeTarget()) {
-  const binaryConfig = CLI_BINARIES.find((item) => item.rustTarget === target)
-  if (!binaryConfig) throw new Error(`CLI configuration not available for target '${target}'`)
+  const binaryConfig = CLI_TARGETS.find((item) => item.rustTarget === target)
+  if (!binaryConfig) throw new Error(`CLI source build target is not available for '${target}'`)
 
   return binaryConfig
 }
 
-export async function downloadCliToResources() {
-  const cli = getCurrentCli()
-  const directory = await mkdtemp(join(tmpdir(), "opencode-cli-"))
-  const dest = windowsify("resources/opencode-cli")
-  try {
-    await $`bun install --no-save --cwd ${directory} ${`${cli.package}@${CLI_VERSION}`} ${`--os=${cli.os}`} ${`--cpu=${cli.cpu}`}`
-    await copyFile(
-      join(directory, "node_modules", cli.package, "bin", cli.os === "win32" ? "opencode2.exe" : "opencode2"),
-      dest,
-    )
-  } finally {
-    await rm(directory, { recursive: true, force: true })
-  }
-  if (process.platform !== "win32") await chmod(dest, 0o755)
-  if (process.platform === "win32" && process.env.GITHUB_ACTIONS === "true") {
-    await $`pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File ../../script/sign-windows.ps1 ${dest}`
-  }
-  if (process.platform === "darwin") await $`codesign --force --sign - ${dest}`
-
-  console.log(`Copied ${cli.package} to ${dest}`)
+export function shouldBundleSourceCli(channel = resolveChannel()) {
+  return channel === "dev" || Bun.env.OPENCODE_BUNDLE_SOURCE_CLI === "1"
 }
 
-export function windowsify(path: string) {
+export async function buildSourceCliToResources() {
+  const cli = getCurrentCli()
+  const cliDirectory = join(import.meta.dir, "../../cli")
+  const destination = windowsify(join(import.meta.dir, "../resources/opencode-cli"), cli.os)
+  const source = join(cliDirectory, "dist", cli.output, "bin", cli.os === "win32" ? "lildax.exe" : "lildax")
+  const prebuiltSource = Bun.env.OPENCODE_SOURCE_CLI_PATH
+
+  if (prebuiltSource) {
+    await copyFile(prebuiltSource, destination)
+  } else {
+    // A native checkout already has the required platform module. Cross-arch
+    // Electron release builds need build.ts to install the target runtime.
+    if (cli.rustTarget === nativeTarget()) {
+      await $`bun script/build.ts --single --skip-install --target=${cli.output}`.cwd(cliDirectory)
+    } else {
+      await $`bun script/build.ts --single --target=${cli.output}`.cwd(cliDirectory)
+    }
+    await copyFile(source, destination)
+  }
+
+  if (cli.os !== "win32") await chmod(destination, 0o755)
+  if (cli.os === "win32" && process.platform === "win32" && process.env.GITHUB_ACTIONS === "true") {
+    const dest = destination
+    await $`pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File ../../script/sign-windows.ps1 ${dest}`
+  }
+  if (cli.os === "darwin" && process.platform === "darwin") await $`codesign --force --sign - ${destination}`
+
+  console.log(`${prebuiltSource ? "Copied" : "Built"} ${cli.output} source CLI to ${destination}`)
+}
+
+export function windowsify(path: string, targetOs = process.platform) {
   if (path.endsWith(".exe")) return path
-  return `${path}${process.platform === "win32" ? ".exe" : ""}`
+  return `${path}${targetOs === "win32" ? ".exe" : ""}`
 }
