@@ -325,7 +325,7 @@ describe("BackgroundTaskExecution", () => {
     }).pipe(Effect.provide(Logger.layer([logger])))
   })
 
-  it.live("keeps an expired owner's terminal local and rejects a late prior-generation terminal", () =>
+  it.live("recovers an expired owner's terminal from a successor runtime and rejects a late prior-generation terminal", () =>
     Effect.gen(function* () {
       const ids = yield* seed()
       let now = 1_000
@@ -342,22 +342,24 @@ describe("BackgroundTaskExecution", () => {
       yield* first.claim({ ...claim(ids, "generation-1"), wakeRequired: true })
       now = 1_101
 
-      expect(yield* second.pendingTerminals(ids.parent)).toEqual([])
+      expect(yield* second.pendingTerminals(ids.parent)).toEqual([
+        expect.objectContaining({ generation: "generation-1", state: "error" }),
+      ])
       expect(yield* first.pendingTerminals(ids.parent)).toEqual([
         expect.objectContaining({ generation: "generation-1", state: "error" }),
       ])
 
-      const delivery = yield* first.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
+      const delivery = yield* second.claimDelivery({ sessionID: ids.child, generation: "generation-1" })
       if (!delivery) throw new Error("terminal delivery was not claimed")
-      yield* first.completeDelivery({
+      yield* second.completeDelivery({
         sessionID: ids.child,
         generation: "generation-1",
         token: delivery.token,
       })
-      const wake = yield* first.claimWake({ sessionID: ids.child, generation: "generation-1" })
+      const wake = yield* second.claimWake({ sessionID: ids.child, generation: "generation-1" })
       if (!wake) throw new Error("terminal wake was not claimed")
       expect(
-        yield* first.completeWake({
+        yield* second.completeWake({
           sessionID: ids.child,
           generation: "generation-1",
           token: wake.token,

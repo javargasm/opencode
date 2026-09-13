@@ -140,12 +140,13 @@ export const deliverBackgroundTerminal = Effect.fn("TaskTool.deliverBackgroundTe
   const terminal = current
 
   if (delivery) {
-    const existing = yield* input.sessions.getPart({
-      sessionID: terminal.parentSessionID,
-      messageID: terminal.delivery.messageID,
-      partID: terminal.delivery.partID,
-    })
-    if (!existing) {
+    const deliver = Effect.gen(function* () {
+      const existing = yield* input.sessions.getPart({
+        sessionID: terminal.parentSessionID,
+        messageID: terminal.delivery.messageID,
+        partID: terminal.delivery.partID,
+      })
+      if (existing) return
       const parent = yield* input.sessions.get(terminal.parentSessionID)
       const parentAgent = parent.agent ?? "build"
       const activeTasks = (yield* input.executions.listRunning(terminal.parentSessionID))
@@ -206,7 +207,31 @@ export const deliverBackgroundTerminal = Effect.fn("TaskTool.deliverBackgroundTe
         ],
       })
       if (input.afterAdmit) yield* input.afterAdmit({ activeTasks, event, parentAgent })
+    })
+    if (
+      (yield* input.executions.heartbeatDelivery({
+        sessionID: terminal.sessionID,
+        generation: terminal.generation,
+        token: delivery.token,
+      })) !== "owned"
+    ) {
+      return false
     }
+    const watch = Effect.gen(function* () {
+      while (true) {
+        yield* Effect.sleep(Duration.millis(Math.max(10, Math.floor(input.executions.leaseMillis / 3))))
+        if (
+          (yield* input.executions.heartbeatDelivery({
+            sessionID: terminal.sessionID,
+            generation: terminal.generation,
+            token: delivery.token,
+          })) !== "owned"
+        ) {
+          return false
+        }
+      }
+    })
+    if (!(yield* Effect.raceFirst(deliver.pipe(Effect.as(true)), watch))) return false
     if (
       !(yield* input.executions.completeDelivery({
         sessionID: terminal.sessionID,
@@ -242,7 +267,26 @@ export const deliverBackgroundTerminal = Effect.fn("TaskTool.deliverBackgroundTe
       }
     }
   })
-  yield* Effect.raceFirst(input.ops.wake(terminal.parentSessionID), watch)
+  const wakeExit = yield* Effect.raceFirst(input.ops.wake(terminal.parentSessionID), watch).pipe(Effect.exit)
+  if (Exit.isFailure(wakeExit)) {
+    const error = Cause.squash(wakeExit.cause)
+    if (Provider.ModelNotFoundError.isInstance(error)) {
+      yield* Effect.logWarning("background task wake skipped because the parent model is unavailable", {
+        sessionID: terminal.parentSessionID,
+        providerID: error.providerID,
+        modelID: error.modelID,
+      })
+      yield* input.executions
+        .completeWake({
+          sessionID: terminal.sessionID,
+          generation: terminal.generation,
+          token: wake.token,
+        })
+        .pipe(Effect.asVoid, Effect.catchCause(() => Effect.void))
+      return true
+    }
+    return yield* Effect.failCause(wakeExit.cause)
+  }
   return yield* input.executions.completeWake({
     sessionID: terminal.sessionID,
     generation: terminal.generation,
@@ -507,13 +551,35 @@ export const TaskTool = Tool.define(
       const model: TaskModel =
         explicitModel || params.variant === undefined ? selectedModel : { ...selectedModel, variant: params.variant }
 
-      if (params.variant !== undefined && normalizeVariant(params.variant) !== undefined) {
-        const resolved = yield* provider
-          .getModel(model.providerID, model.modelID)
-          .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
-        if (resolved?.variants && !(params.variant in resolved.variants)) {
+      yield* ctx.metadata({
+        title: params.description,
+        metadata: {
+          parentSessionId: ctx.sessionID,
+          ...(session ? { sessionId: session.id } : {}),
+          model: {
+            modelID: model.modelID,
+            providerID: model.providerID,
+            ...(model.variant !== undefined ? { variant: model.variant } : {}),
+          },
+          backgroundTaskGeneration: undefined,
+          ...(runInBackground ? { background: true } : {}),
+        },
+      })
+
+      const resolvesSelectedModel =
+        params.model !== undefined || params.variant !== undefined || (!session && next.model !== undefined)
+      if (resolvesSelectedModel) {
+        const resolved = yield* provider.getModel(model.providerID, model.modelID)
+        const requestedVariant =
+          params.variant !== undefined ? params.variant : !session && next.model !== undefined ? next.variant : undefined
+        if (
+          requestedVariant !== undefined &&
+          normalizeVariant(requestedVariant) !== undefined &&
+          resolved.variants &&
+          !(requestedVariant in resolved.variants)
+        ) {
           return yield* Effect.fail(
-            new Error(`Invalid variant: ${params.variant}. ${formatModel(model)} does not provide that variant.`),
+            new Error(`Invalid variant: ${requestedVariant}. ${formatModel(model)} does not provide that variant.`),
           )
         }
       }

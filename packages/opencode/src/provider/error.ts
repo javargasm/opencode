@@ -102,10 +102,10 @@ export type ParsedStreamError =
 export function parseStreamError(input: unknown): ParsedStreamError | undefined {
   const raw = json(input)
   const body = typeof raw?.message === "string" ? (json(raw.message) ?? raw) : raw
-  if (!body) return
+  if (!body || body.type !== "error") return
 
   const responseBody = JSON.stringify(body)
-  const error = body.type === "error" ? body.error : body.error ?? body
+  const error = body.error ?? body
 
   switch (error?.code) {
     case "context_length_exceeded":

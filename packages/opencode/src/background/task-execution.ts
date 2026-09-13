@@ -89,6 +89,11 @@ export interface Interface {
   readonly listRunning: (parentSessionID?: SessionID) => Effect.Effect<Info[]>
   readonly pendingTerminals: (sessionID?: SessionID) => Effect.Effect<Info[]>
   readonly claimDelivery: (input: { sessionID: SessionID; generation: string }) => Effect.Effect<LeaseClaim | undefined>
+  readonly heartbeatDelivery: (input: {
+    sessionID: SessionID
+    generation: string
+    token: string
+  }) => Effect.Effect<"owned" | "lost">
   readonly completeDelivery: (input: {
     sessionID: SessionID
     generation: string
@@ -581,7 +586,6 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
           .from(BackgroundTaskExecutionTable)
           .where(
             and(
-              eq(BackgroundTaskExecutionTable.owner_id, ownerID),
               sql`${BackgroundTaskExecutionTable.state} <> 'running'`,
               or(
                 and(
@@ -667,6 +671,31 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
         )
       },
     )
+
+    const heartbeatDelivery: Interface["heartbeatDelivery"] = Effect.fn(
+      "BackgroundTaskExecution.heartbeatDelivery",
+    )(function* (input) {
+      const time = now()
+      const renewed = yield* db
+        .update(BackgroundTaskExecutionTable)
+        // Leave enough headroom for a heartbeat that is scheduled just before the
+        // delivery effect starts. This prevents a second runtime from reclaiming
+        // the lease while the first effect is already in flight.
+        .set({ delivery_lease_expires_at: time + leaseMillis * 3, time_updated: time })
+        .where(
+          and(
+            eq(BackgroundTaskExecutionTable.session_id, input.sessionID),
+            eq(BackgroundTaskExecutionTable.generation, input.generation),
+            eq(BackgroundTaskExecutionTable.delivery_owner_id, input.token),
+            isNull(BackgroundTaskExecutionTable.terminal_delivered_at),
+            gt(BackgroundTaskExecutionTable.delivery_lease_expires_at, time),
+          ),
+        )
+        .returning({ sessionID: BackgroundTaskExecutionTable.session_id })
+        .get()
+        .pipe(Effect.orDie)
+      return renewed ? "owned" : "lost"
+    })
 
     const claimWake: Interface["claimWake"] = Effect.fn("BackgroundTaskExecution.claimWake")(function* (input) {
       const time = now()
@@ -778,6 +807,7 @@ export function make(options?: { ownerID?: string; leaseMillis?: number; now?: (
       listRunning,
       pendingTerminals,
       claimDelivery,
+      heartbeatDelivery,
       completeDelivery,
       requireWake,
       claimWake,

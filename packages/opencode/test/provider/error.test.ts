@@ -21,4 +21,9 @@ describe("provider stream errors", () => {
         responseBody: JSON.stringify({ type: "error", error: { message } }),
       })
   })
+
+  test("ignores objects that are not provider error envelopes", () => {
+    expect(ProviderError.parseStreamError({ arbitrary: true, value: 42 })).toBeUndefined()
+    expect(ProviderError.parseStreamError({ error: { unexpected: "shape" } })).toBeUndefined()
+  })
 })

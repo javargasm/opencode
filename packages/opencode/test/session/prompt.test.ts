@@ -1022,7 +1022,7 @@ it.instance("failed subtask preserves metadata on error tool state", () =>
 
     expect(tool.state.error).toContain("Tool execution failed")
     expect(tool.state.metadata).toBeDefined()
-    expect(tool.state.metadata?.sessionId).toBeDefined()
+    expect(tool.state.metadata?.sessionId).toBeUndefined()
     expect(tool.state.metadata?.model).toEqual({
       providerID: ProviderV2.ID.make("test"),
       modelID: ModelV2.ID.make("missing-model"),

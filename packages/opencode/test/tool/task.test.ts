@@ -54,12 +54,27 @@ const ref = {
   modelID: ModelV2.ID.make("test-model"),
 }
 
+const primaryModel = ProviderTest.model({
+  providerID: ref.providerID,
+  id: ref.modelID,
+  variants: { high: {}, max: {} },
+})
 const provider = ProviderTest.fake({
-  model: ProviderTest.model({
-    providerID: ref.providerID,
-    id: ref.modelID,
-    variants: { high: {}, max: {} },
-  }),
+  model: primaryModel,
+  info: ProviderTest.info(
+    {
+      models: {
+        [primaryModel.id]: primaryModel,
+        override: ProviderTest.model({ providerID: ref.providerID, id: ModelV2.ID.make("override") }),
+        configured: ProviderTest.model({
+          providerID: ref.providerID,
+          id: ModelV2.ID.make("configured"),
+          variants: { high: {} },
+        }),
+      },
+    },
+    primaryModel,
+  ),
 })
 
 const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
@@ -928,6 +943,97 @@ describe("tool.task", () => {
       expect(asked).toBe(false)
       expect(yield* sessions.children(chat.id)).toHaveLength(0)
     }),
+  )
+
+  it.instance("rejects an explicit model that the provider does not provide before requesting permissions", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let asked = false
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            model: "test/missing-model",
+          },
+          {
+            ...taskContext(chat.id, assistant.id, stubOps()),
+            ask: () => Effect.sync(() => (asked = true)),
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(asked).toBe(false)
+      expect(yield* sessions.children(chat.id)).toHaveLength(0)
+    }),
+  )
+
+  it.instance(
+    "rejects an unavailable configured provider/model before creating a child session",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let asked = false
+
+        const exit = yield* def
+          .execute(
+            {
+              description: "inspect bug",
+              prompt: "look into the cache key path",
+              subagent_type: "general",
+            },
+            {
+              ...taskContext(chat.id, assistant.id, stubOps()),
+              ask: () => Effect.sync(() => (asked = true)),
+            },
+          )
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(asked).toBe(false)
+        expect(yield* sessions.children(chat.id)).toHaveLength(0)
+      }),
+    { config: { agent: { general: { model: "poc-provider/parent-model" } } } },
+  )
+
+  it.instance(
+    "rejects an invalid variant configured on the agent before creating a child session",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let asked = false
+
+        const exit = yield* def
+          .execute(
+            {
+              description: "inspect bug",
+              prompt: "look into the cache key path",
+              subagent_type: "general",
+            },
+            {
+              ...taskContext(chat.id, assistant.id, stubOps()),
+              ask: () => Effect.sync(() => (asked = true)),
+            },
+          )
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(asked).toBe(false)
+        expect(yield* sessions.children(chat.id)).toHaveLength(0)
+      }),
+    { config: { agent: { general: { model: "test/test-model", variant: "unsupported" } } } },
   )
 
   it.instance("requests model override permission even when task permission is bypassed", () =>
@@ -2748,7 +2854,7 @@ describe("tool.task", () => {
   )
 
   background.instance(
-    "does not deliver an expired terminal across runtimes, but its owner still wakes the parent",
+    "delivers an expired terminal and wakes its parent from the successor runtime",
     () =>
       Effect.gen(function* () {
         const sessions = yield* Session.Service
@@ -2807,16 +2913,6 @@ describe("tool.task", () => {
           state: "error",
           error: "Background task owner lease expired",
         })
-        expect(admissions).toBe(0)
-        expect(wakes).toBe(0)
-        expect(variant).toBeUndefined()
-
-        yield* startBackgroundTerminalPump({
-          executions: expired,
-          sessions,
-          ops: promptOps,
-          interval: "5 millis",
-        })
         yield* Deferred.await(woke).pipe(Effect.timeout("1 second"))
         yield* Effect.sleep("20 millis")
 
@@ -2868,7 +2964,7 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("recovers a wake only from the owning runtime without duplicating the terminal", () =>
+  background.instance("recovers a wake from a successor runtime without duplicating the terminal", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
@@ -2934,39 +3030,71 @@ describe("tool.task", () => {
       })
       yield* Effect.sleep("20 millis")
 
-      expect(admissions).toBe(1)
-      expect(wakes).toBe(0)
-      expect(yield* second.get(child.id)).toMatchObject({ wakeClaimedAt: undefined })
-
-      yield* startBackgroundTerminalPump({
-        executions: owner,
-        sessions,
-        ops: {
-          ...stubOps(),
-          wake: () =>
-            Effect.sync(() => {
-              wakes++
-            }).pipe(Effect.andThen(Deferred.succeed(woke, undefined)), Effect.asVoid),
-        },
-        interval: "5 millis",
-      })
       yield* Deferred.await(woke).pipe(Effect.timeout("1 second"))
       yield* Effect.sleep("20 millis")
 
       expect(admissions).toBe(1)
       expect(wakes).toBe(1)
-      expect(yield* owner.get(child.id)).toMatchObject({ wakeClaimedAt: expect.any(Number) })
+      expect(yield* second.get(child.id)).toMatchObject({ wakeClaimedAt: expect.any(Number) })
     }),
   )
 
-  background.instance("fences a stale terminal-pump delivery after same-runtime reclaim", () =>
+  background.instance("completes a wake when the parent model is unavailable", () =>
+    Effect.gen(function* () {
+      const executions = yield* BackgroundTaskExecution.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "missing model wake" })
+      const ownership = yield* executions.claim({
+        sessionID: child.id,
+        parentSessionID: chat.id,
+        generation: "missing-model-generation",
+        description: child.title,
+        parentMessageID: assistant.id,
+        wakeRequired: true,
+      })
+      const terminal = yield* executions.settle({
+        sessionID: child.id,
+        generation: ownership.info.generation,
+        state: "error",
+        error: "child failed",
+      })
+      if (!terminal) throw new Error("terminal execution missing")
+
+      const result = yield* deliverBackgroundTerminal({
+        executions,
+        sessions,
+        terminal,
+        ops: {
+          ...stubOps(),
+          wake: () =>
+            Effect.die(
+              new Provider.ModelNotFoundError({
+                providerID: ProviderV2.ID.make("poc-provider"),
+                modelID: ModelV2.ID.make("parent-model"),
+              }),
+            ),
+        },
+      })
+
+      expect(result).toBe(true)
+      expect(yield* executions.get(child.id)).toMatchObject({ wakeClaimedAt: expect.any(Number) })
+    }),
+  )
+
+  background.instance("keeps a slow terminal delivery lease alive across runtimes", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed("delivery parent")
       const child = yield* sessions.create({ parentID: chat.id, title: "delivery child" })
       let now = 1_000
       const executions = yield* BackgroundTaskExecution.make({
-        ownerID: "recovery",
+        ownerID: "delivery-a",
+        leaseMillis: 100,
+        now: () => now,
+      })
+      const successor = yield* BackgroundTaskExecution.make({
+        ownerID: "delivery-b",
         leaseMillis: 100,
         now: () => now,
       })
@@ -2987,9 +3115,7 @@ describe("tool.task", () => {
       if (!terminal) throw new Error("terminal execution missing")
 
       const firstStarted = yield* Deferred.make<void>()
-      const secondStarted = yield* Deferred.make<void>()
       const releaseFirst = yield* Deferred.make<void>()
-      const releaseSecond = yield* Deferred.make<void>()
       let prompts = 0
       const ops: TaskPromptOps = {
         ...stubOps(),
@@ -2999,25 +3125,20 @@ describe("tool.task", () => {
             if (prompts === 1) {
               yield* Deferred.succeed(firstStarted, undefined)
               yield* Deferred.await(releaseFirst)
-              return reply(input, "stale delivery")
+              return reply(input, "terminal delivery")
             }
-            yield* Deferred.succeed(secondStarted, undefined)
-            yield* Deferred.await(releaseSecond)
-            return reply(input, "replacement delivery")
+            return reply(input, "duplicate delivery")
           }),
       }
       const first = yield* deliverBackgroundTerminal({ executions, sessions, ops, terminal }).pipe(Effect.forkChild)
       yield* Deferred.await(firstStarted).pipe(Effect.timeout("1 second"))
       now = 1_101
-      const second = yield* deliverBackgroundTerminal({ executions, sessions, ops, terminal }).pipe(Effect.forkChild)
-      yield* Deferred.await(secondStarted).pipe(Effect.timeout("1 second"))
+      expect(yield* deliverBackgroundTerminal({ executions: successor, sessions, ops, terminal })).toBe(false)
+      expect(prompts).toBe(1)
 
       yield* Deferred.succeed(releaseFirst, undefined)
-      expect(yield* Fiber.join(first).pipe(Effect.timeout("1 second"))).toBe(false)
-      expect(yield* executions.get(child.id)).toMatchObject({ terminalDeliveredAt: undefined })
-
-      yield* Deferred.succeed(releaseSecond, undefined)
-      expect(yield* Fiber.join(second).pipe(Effect.timeout("1 second"))).toBe(true)
+      expect(yield* Fiber.join(first).pipe(Effect.timeout("1 second"))).toBe(true)
+      expect(prompts).toBe(1)
       expect(yield* executions.get(child.id)).toMatchObject({ terminalDeliveredAt: expect.any(Number) })
     }),
   )
@@ -3181,7 +3302,9 @@ describe("tool.task", () => {
       expect(prompts).toBe(1)
       expect(wakes).toBe(1)
 
-      now = 1_021
+      // Delivery heartbeats reserve three lease intervals so an in-flight prompt
+      // cannot be reclaimed between scheduler ticks; advance beyond that renewal.
+      now = 1_061
       yield* Effect.all([Deferred.await(deliveryReclaimed), Deferred.await(wakeReclaimed)], {
         concurrency: "unbounded",
       }).pipe(Effect.timeout("1 second"))

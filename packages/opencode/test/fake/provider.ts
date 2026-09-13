@@ -58,9 +58,10 @@ export namespace ProviderTest {
             if (providerID === row.id) return Effect.succeed(row)
             return Effect.die(new Error(`Unknown test provider: ${providerID}`))
           }),
-          getModel: Effect.fn("TestProvider.getModel")((providerID, modelID) => {
-            if (providerID === row.id && modelID === mdl.id) return Effect.succeed(mdl)
-            return Effect.die(new Error(`Unknown test model: ${providerID}/${modelID}`))
+          getModel: Effect.fn("TestProvider.getModel")(function* (providerID, modelID) {
+            const model = providerID === row.id ? row.models[modelID] : undefined
+            if (model) return model
+            return yield* Effect.fail(new Provider.ModelNotFoundError({ providerID, modelID }))
           }),
           getLanguage: Effect.fn("TestProvider.getLanguage")(() =>
             Effect.die(new Error("ProviderTest.getLanguage not configured")),
